@@ -5,12 +5,14 @@
 //! 2. Builds an egraph with GVN and applies rewrite rules
 //! 3. Elaborates (extracts) the best version back into the CFG
 
+use crate::pattern::*;
+use crate::rewrite_integration::*;
 use crate::support::*;
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
 
-const MATCHES_LIMIT: usize = 5;
-const ECLASS_ENODE_LIMIT: usize = 5;
+const _MATCHES_LIMIT: usize = 5;
+const _ECLASS_ENODE_LIMIT: usize = 5;
 const REWRITE_LIMIT: usize = 5;
 
 /// Main egraph pass structure
@@ -26,6 +28,9 @@ pub struct EgraphPass {
 
     /// Statistics collected during the pass
     pub stats: Stats,
+
+    /// Pattern-based rewrite engine
+    rewrite_engine: RewriteEngine,
 }
 
 impl EgraphPass {
@@ -35,6 +40,7 @@ impl EgraphPass {
             layout,
             domtree,
             stats: Stats::default(),
+            rewrite_engine: RewriteEngine::with_standard_library(),
         }
     }
 
@@ -56,6 +62,12 @@ impl EgraphPass {
 
         // Print statistics
         self.stats.print_summary();
+        self.rewrite_engine.print_stats();
+    }
+
+    /// Add a custom rewrite rule to the engine
+    pub fn add_rewrite_rule(&mut self, rule: Rewrite) {
+        self.rewrite_engine.add_rule(rule);
     }
 
     /// Remove pure operations from layout and build egraph
@@ -134,6 +146,7 @@ impl EgraphPass {
                             domtree: &self.domtree,
                             rewrite_depth: 0,
                             subsume_values: HashSet::new(),
+                            rewrite_engine: &mut self.rewrite_engine,
                         };
 
                         if rewritten_inst.opcode.is_pure() {
@@ -164,7 +177,7 @@ impl EgraphPass {
         // - Verifying that all referenced values exist
         // - Checking type consistency
 
-        println!("\n Egraph verification passed: egraph structure is valid");
+        println!("\n✓ Egraph verification passed: egraph structure is valid");
     }
 }
 
@@ -181,6 +194,7 @@ struct OptimizeCtx<'a> {
     domtree: &'a DominatorTree,
     rewrite_depth: usize,
     subsume_values: HashSet<ValueId>,
+    rewrite_engine: &'a mut RewriteEngine,
 }
 
 impl<'a> OptimizeCtx<'a> {
@@ -196,95 +210,84 @@ impl<'a> OptimizeCtx<'a> {
         let inst = self.dfg.insts[&inst_id].clone();
         let key = (inst.ty, inst.clone());
 
-        // Check if this instruction already exists (GVN)
-        if let Some(&Some(existing_value)) = self.gvn_map.get(&key) {
-            self.stats.pure_inst_deduped += 1;
+        let result = self.dfg.first_result(inst_id);
+        let avail_block = self.get_available_block(inst_id);
 
-            // Map this instruction's result to the existing value
-            let result = self.dfg.first_result(inst_id);
-            self.value_to_opt_value.insert(result, existing_value);
+        match self.gvn_map.entry(key) {
+            ScopedEntry::Occupied(entry) => {
+                // Found existing instruction
+                self.stats.pure_inst_deduped += 1;
 
-            // Copy availability info
-            if let Some(&avail_block) = self.available_block.get(&existing_value) {
-                self.available_block.insert(result, avail_block);
+                if let Some(existing_value) = entry.get() {
+                    self.value_to_opt_value.insert(result, *existing_value);
+
+                    if let Some(&avail_block) = self.available_block.get(existing_value) {
+                        self.available_block.insert(result, avail_block);
+                    }
+
+                    println!("      GVN hit: merged with {:?}", existing_value);
+                    return *existing_value;
+                }
+
+                // Shouldn't reach here, but handle gracefully
+                self.value_to_opt_value.insert(result, result);
+                result
             }
 
-            println!("      GVN hit: reusing value {:?}", existing_value);
-            return existing_value;
+            ScopedEntry::Vacant(entry) => {
+                // New instruction - insert it
+                self.stats.pure_inst_insert_new += 1;
+
+                self.value_to_opt_value.insert(result, result);
+                self.available_block.insert(result, avail_block);
+
+                entry.insert(Some(result));
+
+                // Apply rewrite rules and create unions
+                let opt_result = self.apply_rewrites_and_union(result);
+
+                println!("      New instruction: v{:?}", result);
+
+                opt_result
+            }
         }
-
-        // New instruction - insert it
-        self.stats.pure_inst_insert_new += 1;
-        let result = self.dfg.first_result(inst_id);
-
-        // Compute where this value becomes available
-        let avail_block = self.get_available_block(inst_id);
-        self.available_block.insert(result, avail_block);
-
-        // Optimize the instruction (apply rewrite rules)
-        let opt_value = self.optimize_pure_enode(inst_id, result);
-
-        println!("      New inst, optimized to {:?}", opt_value);
-
-        // Insert into GVN map at the appropriate depth
-        let depth = self.depth_of_block_in_gvn_map(avail_block);
-        self.gvn_map.insert_at_depth(key, Some(opt_value), depth);
-
-        // Map original result to optimized value
-        self.value_to_opt_value.insert(result, opt_value);
-
-        opt_value
     }
 
-    /// Apply optimization rules to a pure instruction
+    /// Apply rewrite rules and create union nodes
     ///
-    /// This recursively applies rewrite rules and builds union nodes
-    /// to represent all equivalent forms of the expression.
-    fn optimize_pure_enode(&mut self, inst_id: InstId, orig_value: ValueId) -> ValueId {
-        // Check rewrite depth limit
-        if self.rewrite_depth > REWRITE_LIMIT {
+    /// This is the key integration point with the pattern-based rewrite system.
+    fn apply_rewrites_and_union(&mut self, value: ValueId) -> ValueId {
+        if self.rewrite_depth >= REWRITE_LIMIT {
             self.stats.rewrite_depth_limit += 1;
-            return orig_value;
+            return value;
         }
 
         self.rewrite_depth += 1;
         self.stats.rewrite_rule_invoked += 1;
 
-        // Apply rewrite rules (simplified - in real impl, call ISLE)
-        let mut optimized_values = Vec::new();
-        self.apply_rewrite_rules(inst_id, &mut optimized_values);
+        let mut union_value = value;
 
-        self.stats.rewrite_rule_results += optimized_values.len() as u64;
+        let rewrites = self.rewrite_engine.apply_rewrites(self.dfg, value);
 
-        // Limit number of rewrites
-        if optimized_values.len() > MATCHES_LIMIT {
-            optimized_values.truncate(MATCHES_LIMIT);
-        }
+        for rewritten in rewrites {
+            self.stats.rewrite_rule_results += 1;
 
-        // Deduplicate
-        optimized_values.sort_unstable();
-        optimized_values.dedup();
+            // Recursively optimize the rewritten value
+            let opt_value = if let ValueDef::Inst(rewritten_inst) = self.dfg.value_def(rewritten) {
+                // Check if we should process this rewrite
+                if self.subsume_values.contains(&rewritten) {
+                    self.stats.pure_inst_subsume += 1;
+                    rewritten
+                } else {
+                    self.subsume_values.insert(rewritten);
+                    self.insert_pure_enode(rewritten_inst)
+                }
+            } else {
+                rewritten
+            };
 
-        // Build union tree of all equivalent forms
-        let mut union_value = orig_value;
-        let mut eclass_size = self.eclass_size.get(&orig_value).copied().unwrap_or(0) + 1;
-
-        for opt_value in optimized_values {
-            if opt_value == orig_value {
-                continue;
-            }
-
-            // Check eclass size limit
-            let rhs_size = self.eclass_size.get(&opt_value).copied().unwrap_or(0) + 1;
-            if (eclass_size as usize) + (rhs_size as usize) > ECLASS_ENODE_LIMIT {
-                self.stats.eclass_size_limit += 1;
-                break;
-            }
-
-            // Create union node
+            // Create union between original and rewritten
             let new_union = self.dfg.make_union(union_value, opt_value);
-            eclass_size += rhs_size;
-            self.eclass_size.insert(new_union, eclass_size - 1);
             self.stats.union += 1;
 
             // Merge availability: use the block that dominates both
@@ -301,76 +304,6 @@ impl<'a> OptimizeCtx<'a> {
 
         self.rewrite_depth -= 1;
         union_value
-    }
-
-    /// Apply rewrite rules to an instruction (simplified)
-    ///
-    /// Only few rules added for now.
-    fn apply_rewrite_rules(&mut self, inst_id: InstId, results: &mut Vec<ValueId>) {
-        let inst = &self.dfg.insts[&inst_id];
-
-        match inst.opcode {
-            // x + 0 => x
-            Opcode::Add if inst.args.len() == 2 => {
-                if self.is_constant_zero(inst.args[1]) {
-                    // Use the optimized version of the argument
-                    let opt_arg = self
-                        .value_to_opt_value
-                        .get(&inst.args[0])
-                        .copied()
-                        .unwrap_or(inst.args[0]);
-                    results.push(opt_arg);
-                }
-            }
-
-            // x * 1 => x
-            Opcode::Mul if inst.args.len() == 2 => {
-                if self.is_constant_one(inst.args[1]) {
-                    // Use the optimized version of the argument
-                    let opt_arg = self
-                        .value_to_opt_value
-                        .get(&inst.args[0])
-                        .copied()
-                        .unwrap_or(inst.args[0]);
-                    results.push(opt_arg);
-                }
-            }
-
-            // x * 0 => 0
-            Opcode::Mul if inst.args.len() == 2 => {
-                if self.is_constant_zero(inst.args[1]) {
-                    // Use the optimized version of the zero argument
-                    let opt_arg = self
-                        .value_to_opt_value
-                        .get(&inst.args[1])
-                        .copied()
-                        .unwrap_or(inst.args[1]);
-                    results.push(opt_arg);
-                }
-            }
-
-            _ => {}
-        }
-    }
-
-    /// Check if a value is the constant 0
-    fn is_constant_zero(&self, value: ValueId) -> bool {
-        if let ValueDef::Inst(inst_id) = self.dfg.value_def(value) {
-            if let Some(inst) = self.dfg.insts.get(&inst_id) {
-                return inst.opcode == Opcode::Const && inst.immediate == Some(0);
-            }
-        }
-        false
-    }
-
-    /// Check if a value is the constant 1
-    fn is_constant_one(&self, value: ValueId) -> bool {
-        if let ValueDef::Inst(inst_id) = self.dfg.value_def(value) {
-            if let Some(inst) = self.dfg.insts.get(&inst_id) {
-                return inst.opcode == Opcode::Const && inst.immediate == Some(1);
-            }
-        }
-        false
     }
 
     /// Optimize a skeleton (side-effecting) instruction
@@ -443,17 +376,6 @@ impl<'a> OptimizeCtx<'a> {
             })
     }
 
-    /// Find the depth of a block in the GVN map stack
-    fn depth_of_block_in_gvn_map(&self, block: BlockId) -> usize {
-        self.gvn_map_blocks
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &b)| b == block)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    }
-
     /// Merge availability of two values (for union nodes)
     ///
     /// The union is available at whichever block dominates the other
@@ -485,12 +407,12 @@ mod tests {
         // First add: x = a + b
         let inst1 = Instruction::new(Opcode::Add, vec![a, b], Type::I32);
         let inst1_id = dfg.make_inst(inst1);
-        let x = dfg.make_inst_result(inst1_id, Type::I32);
+        let _x = dfg.make_inst_result(inst1_id, Type::I32);
 
         // Second add: y = a + b (should be deduplicated)
         let inst2 = Instruction::new(Opcode::Add, vec![a, b], Type::I32);
         let inst2_id = dfg.make_inst(inst2);
-        let y = dfg.make_inst_result(inst2_id, Type::I32);
+        let _y = dfg.make_inst_result(inst2_id, Type::I32);
 
         let mut layout = Layout::new();
         let mut block_data = Block::new(block);
@@ -506,5 +428,37 @@ mod tests {
         // After GVN, both adds should be deduplicated
         assert!(pass.stats.pure_inst_deduped > 0);
         println!("\n✓ GVN test passed");
+    }
+
+    #[test]
+    fn test_pattern_based_rewrites() {
+        let mut dfg = DataFlowGraph::new();
+        let block = BlockId(0);
+        let x = dfg.make_block_param(block, 0, Type::I32);
+
+        // Create: zero = const 0
+        let zero_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 0);
+        let zero_id = dfg.make_inst(zero_inst);
+        let zero = dfg.make_inst_result(zero_id, Type::I32);
+
+        // Create: y = x + 0
+        let add_inst = Instruction::new(Opcode::Add, vec![x, zero], Type::I32);
+        let add_id = dfg.make_inst(add_inst);
+        let _y = dfg.make_inst_result(add_id, Type::I32);
+
+        let mut layout = Layout::new();
+        let mut block_data = Block::new(block);
+        block_data.params = vec![x];
+        block_data.insts = vec![zero_id, add_id];
+        layout.add_block(block_data);
+
+        let domtree = DominatorTree::from_linear_blocks(&[block]);
+
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.run();
+
+        // Should have applied pattern-based rewrites
+        assert!(pass.stats.rewrite_rule_results > 0 || pass.stats.pure_inst_deduped > 0);
+        println!("\n✓ Pattern-based rewrite test passed");
     }
 }

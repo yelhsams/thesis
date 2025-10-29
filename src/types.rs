@@ -23,11 +23,10 @@ impl ValueId {
 /// Types of values
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
+    I8,
+    I16,
     I32,
     I64,
-    F32,
-    F64,
-    Ptr,
 }
 
 /// Mini-lang to test the egraph pass
@@ -81,8 +80,8 @@ impl Opcode {
     /// it has side effects
     pub fn is_mergeable(self) -> bool {
         // Some side-effecting ops can still be GVN'd if they're idempotent
-        // QUESTION! WHAT IS THE BEHAVIOR IN CRANELIFT?
-        matches!(self, Opcode::Load)
+        // TODO: make this only merge on traps with same condition
+        matches!(self, Opcode::Trap)
     }
 }
 
