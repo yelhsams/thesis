@@ -48,6 +48,11 @@ impl EgraphPass {
     pub fn run(&mut self) {
         println!("\n=== Starting Egraph Pass ===\n");
 
+        // Print initial state
+        println!("Initial IR (before optimization):");
+        println!("{}", "─".repeat(60));
+        println!("{}", self.layout.display(&self.dfg));
+
         // Phase 1: Remove pure instructions and build egraph
         self.remove_pure_and_optimize();
 
@@ -55,14 +60,47 @@ impl EgraphPass {
         println!("Pure instructions removed from layout");
         println!("Union nodes created for equivalent values\n");
 
+        // Print intermediate state showing unions
+        println!("After building egraph (with union nodes):");
+        println!("{}", "─".repeat(60));
+        self.print_egraph_state();
+
         // Phase 2: Extract best versions (elaboration)
         // In a full implementation, this would place instructions back
         // For now, we just verify the egraph
         self.verify_egraph();
 
-        // Print statistics
+        // Print final statistics
         self.stats.print_summary();
         self.rewrite_engine.print_stats();
+    }
+
+    /// Print the current state of the egraph including union nodes
+    fn print_egraph_state(&self) {
+        // Show all value definitions including unions
+        println!("Value definitions:");
+        let mut values: Vec<_> = self.dfg.value_defs.keys().copied().collect();
+        values.sort();
+
+        for value in values {
+            let def_str = self.dfg.display_value_def(value);
+            match self.dfg.value_def(value) {
+                ValueDef::Union(_, _) => {
+                    println!("  {} ← UNION NODE", def_str);
+                }
+                ValueDef::BlockParam(_, _) => {
+                    println!("  {} ← BLOCK PARAM", def_str);
+                }
+                ValueDef::Inst(_) => {
+                    println!("  {}", def_str);
+                }
+            }
+        }
+        println!();
+
+        // Show the layout (skeleton)
+        println!("Remaining skeleton (control flow):");
+        println!("{}", self.layout.display(&self.dfg));
     }
 
     /// Add a custom rewrite rule to the engine
@@ -246,7 +284,7 @@ impl<'a> OptimizeCtx<'a> {
                 // Apply rewrite rules and create unions
                 let opt_result = self.apply_rewrites_and_union(result);
 
-                println!("      New instruction: v{:?}", result);
+                println!("      New instruction: {:?}", result);
 
                 opt_result
             }
@@ -306,7 +344,7 @@ impl<'a> OptimizeCtx<'a> {
         union_value
     }
 
-    /// Optimize a skeleton (side-effecting) instruction
+    /// Optimize a skeleton instruction
     ///
     /// These instructions stay in the layout but can still benefit from:
     /// - GVN (if idempotent)
@@ -316,27 +354,40 @@ impl<'a> OptimizeCtx<'a> {
 
         let inst = self.dfg.insts[&inst_id].clone();
 
-        // Try to GVN if the operation is idempotent (e.g., pure loads)
+        // Try to GVN if the operation is idempotent
         if inst.opcode.is_mergeable() {
             let key = (inst.ty, inst.clone());
 
             match self.gvn_map.entry(key) {
                 ScopedEntry::Occupied(entry) => {
-                    // Found existing instruction - reuse its result
                     if let Some(existing_value) = entry.get() {
-                        self.stats.skeleton_inst_gvn += 1;
-                        let result = self.dfg.first_result(inst_id);
-                        self.value_to_opt_value.insert(result, *existing_value);
+                        // get value of the existing instruction
+                        if let ValueDef::Inst(existing_inst_id) =
+                            self.dfg.value_def(*existing_value)
+                        {
+                            if self.dfg.instructions_mergeable(inst_id, existing_inst_id) {
+                                self.stats.skeleton_inst_gvn += 1;
+                                let result = self.dfg.first_result(inst_id);
+                                self.value_to_opt_value.insert(result, *existing_value);
 
-                        if let Some(&avail_block) = self.available_block.get(existing_value) {
-                            self.available_block.insert(result, avail_block);
+                                if let Some(&avail_block) = self.available_block.get(existing_value)
+                                {
+                                    self.available_block.insert(result, avail_block);
+                                }
+
+                                println!(
+                                    "      Skeleton GVN hit: merged with {:?}",
+                                    existing_value
+                                );
+                                return;
+                            } else {
+                                println!("      Cannot merge: different conditions");
+                            }
                         }
-
-                        println!("      Skeleton GVN hit: merged with {:?}", existing_value);
                     }
                 }
                 ScopedEntry::Vacant(entry) => {
-                    // New skeleton instruction - record it
+                    // New instruction
                     let result = self.dfg.first_result(inst_id);
                     self.value_to_opt_value.insert(result, result);
                     self.available_block.insert(result, block);

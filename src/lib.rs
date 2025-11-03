@@ -1,3 +1,4 @@
+pub mod context_test_cases;
 pub mod egraph_pass;
 pub mod elaborate;
 pub mod example;
@@ -7,6 +8,7 @@ pub mod rewrite_integration;
 pub mod support;
 pub mod types;
 
+pub use context_test_cases::*;
 pub use egraph_pass::*;
 pub use elaborate::*;
 pub use example::*;

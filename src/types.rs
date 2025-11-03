@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 /// Basic block
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -36,13 +37,13 @@ pub enum Opcode {
     Add,
     Sub,
     Mul,
-    Div,
     And,
     Or,
     Xor,
     Const,
 
     // Side-effect ops
+    Div,
     Load,
     Store,
     Call,
@@ -60,7 +61,6 @@ impl Opcode {
             Opcode::Add
                 | Opcode::Sub
                 | Opcode::Mul
-                | Opcode::Div
                 | Opcode::And
                 | Opcode::Or
                 | Opcode::Xor
@@ -79,9 +79,9 @@ impl Opcode {
     /// Returns true if this operation can be merged (deduplicated) even though
     /// it has side effects
     pub fn is_mergeable(self) -> bool {
-        // Some side-effecting ops can still be GVN'd if they're idempotent
+        // TODO: must make sure that the divisor is not zero
         // TODO: make this only merge on traps with same condition
-        matches!(self, Opcode::Trap)
+        matches!(self, Opcode::Trap | Opcode::Div)
     }
 }
 
@@ -110,6 +110,17 @@ impl Instruction {
             args,
             ty,
             immediate: Some(imm),
+        }
+    }
+
+    pub fn can_merge_with(&self, other: &Instruction, dfg: &DataFlowGraph) -> bool {
+        if self.opcode != other.opcode || self.ty != other.ty {
+            return false;
+        }
+        match self.opcode {
+            Opcode::Trap => self.args.iter().zip(other.args.iter()).all(|(a, b)| a == b),
+            Opcode::Div => self.args[0] == other.args[0] && self.args[1] == other.args[1],
+            _ => false,
         }
     }
 }
@@ -250,6 +261,77 @@ impl DataFlowGraph {
     pub fn first_result(&self, inst: InstId) -> ValueId {
         self.inst_results[&inst][0]
     }
+
+    /// Check if two instructions are mergeable
+    pub fn instructions_mergeable(&self, inst1: InstId, inst2: InstId) -> bool {
+        let i1 = &self.insts[&inst1];
+        let i2 = &self.insts[&inst2];
+
+        i1.can_merge_with(i2, self)
+    }
+
+    /// Display an instruction in a human-readable format
+    pub fn display_inst(&self, inst_id: InstId) -> String {
+        let inst = &self.insts[&inst_id];
+        let results = self.inst_results(inst_id);
+
+        let mut s = String::new();
+
+        // Results (if any)
+        if !results.is_empty() {
+            for (i, &result) in results.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!("{}", result));
+            }
+            s.push_str(" = ");
+        }
+
+        // Opcode
+        s.push_str(&format!("{}", inst.opcode));
+
+        // Type (for most operations)
+        if !matches!(
+            inst.opcode,
+            Opcode::Branch | Opcode::CondBranch | Opcode::Return
+        ) {
+            s.push_str(&format!(".{}", inst.ty));
+        }
+
+        // Immediate (for constants)
+        if let Some(imm) = inst.immediate {
+            s.push_str(&format!(" {}", imm));
+        }
+
+        // Arguments (if any and not a constant)
+        if !inst.args.is_empty() && inst.opcode != Opcode::Const {
+            s.push(' ');
+            for (i, &arg) in inst.args.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!("{}", arg));
+            }
+        }
+
+        s
+    }
+
+    /// Display a value definition
+    pub fn display_value_def(&self, value: ValueId) -> String {
+        match self.value_def(value) {
+            ValueDef::Inst(inst_id) => {
+                format!("{} = {}", value, self.display_inst(inst_id))
+            }
+            ValueDef::BlockParam(block, index) => {
+                format!("{} = param {} of {}", value, index, block)
+            }
+            ValueDef::Union(left, right) => {
+                format!("{} = union({}, {})", value, left, right)
+            }
+        }
+    }
 }
 
 /// Control flow graph
@@ -274,6 +356,49 @@ impl Layout {
 
     pub fn entry_block(&self) -> Option<BlockId> {
         self.blocks.first().copied()
+    }
+
+    /// Display the entire CFG in a human-readable format
+    pub fn display(&self, dfg: &DataFlowGraph) -> String {
+        let mut s = String::new();
+
+        for &block_id in &self.blocks {
+            let block = &self.block_data[&block_id];
+
+            // Block header
+            s.push_str(&format!("{}:", block_id));
+
+            // Block parameters
+            if !block.params.is_empty() {
+                s.push('(');
+                for (i, &param) in block.params.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&format!("{}: {}", param, dfg.value_type(param)));
+                }
+                s.push(')');
+            }
+            s.push('\n');
+
+            // Instructions
+            for &inst_id in &block.insts {
+                // Skip terminator, we'll show it separately
+                if Some(inst_id) == block.terminator {
+                    continue;
+                }
+                s.push_str(&format!("    {}\n", dfg.display_inst(inst_id)));
+            }
+
+            // Terminator
+            if let Some(term_id) = block.terminator {
+                s.push_str(&format!("    {}\n", dfg.display_inst(term_id)));
+            }
+
+            s.push('\n');
+        }
+
+        s
     }
 }
 
@@ -308,5 +433,58 @@ impl Stats {
         println!("Union nodes created: {}", self.union);
         println!("Rewrite rules invoked: {}", self.rewrite_rule_invoked);
         println!("Rewrite results: {}", self.rewrite_rule_results);
+    }
+}
+
+impl fmt::Display for BlockId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "block{}", self.0)
+    }
+}
+
+impl fmt::Display for InstId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "inst{}", self.0)
+    }
+}
+
+impl fmt::Display for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "v{}", self.0)
+    }
+}
+
+impl fmt::Display for Opcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            Opcode::Add => "iadd",
+            Opcode::Sub => "isub",
+            Opcode::Mul => "imul",
+            Opcode::Div => "idiv",
+            Opcode::And => "and",
+            Opcode::Or => "or",
+            Opcode::Xor => "xor",
+            Opcode::Const => "iconst",
+            Opcode::Load => "load",
+            Opcode::Store => "store",
+            Opcode::Call => "call",
+            Opcode::Branch => "jump",
+            Opcode::CondBranch => "br_if",
+            Opcode::Return => "return",
+            Opcode::Trap => "trap",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let s = match self {
+            Type::I8 => "i8",
+            Type::I16 => "i16",
+            Type::I32 => "i32",
+            Type::I64 => "i64",
+        };
+        write!(f, "{}", s)
     }
 }
