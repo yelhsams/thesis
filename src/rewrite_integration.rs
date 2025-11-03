@@ -50,40 +50,97 @@ impl RewriteEngine {
     pub fn apply_rewrites(&mut self, dfg: &mut DataFlowGraph, value: ValueId) -> HashSet<ValueId> {
         let mut results = HashSet::new();
 
-        // Try each rule
+        let inst_info = if let ValueDef::Inst(inst_id) = dfg.value_def(value) {
+            Some((inst_id, dfg.insts[&inst_id].clone()))
+        } else {
+            None
+        };
+
         for rule in &self.library.rules.clone() {
             self.matches_attempted += 1;
 
-            // Try to match the LHS pattern
+            // LHS
             let matcher = PatternMatcher::new(dfg);
             if let Some(bindings) = matcher.match_pattern(&rule.lhs, value) {
                 self.matches_succeeded += 1;
 
                 // Check conditions
                 if !rule.check_conditions(&bindings) {
+                    println!("      Rule '{}' matched but conditions failed", rule.name);
                     continue;
                 }
 
-                // Apply the RHS pattern to produce a new value
+                // RHS
                 let mut applier = PatternApplier::new(dfg);
                 if let Some(new_value) = applier.apply_pattern(&rule.rhs, &bindings) {
+                    // Don't apply if it produces the same value
+                    if new_value == value {
+                        println!("      Rule '{}' produced same value, skipping", rule.name);
+                        continue;
+                    }
+
+                    // Don't apply if we already produced this value
+                    if results.contains(&new_value) {
+                        println!("      Rule '{}' produced duplicate, skipping", rule.name);
+                        continue;
+                    }
+
                     self.rewrites_applied += 1;
                     results.insert(new_value);
 
-                    println!(
-                        "  ✓ Applied rewrite '{}': v{} => v{}",
-                        rule.name, value.0, new_value.0
-                    );
-                }
-
-                // If bidirectional, also try RHS => LHS
-                if rule.bidirectional {
-                    // This is what Cranelift does, but left as TODO for now.
+                    // What actually changed
+                    if let Some((inst_id, ref inst)) = inst_info {
+                        println!(
+                            "      ✓ Applied '{}': {} => {}",
+                            rule.name,
+                            self.format_value_description(dfg, value),
+                            self.format_value_description(dfg, new_value)
+                        );
+                    } else {
+                        println!(
+                            "      ✓ Applied '{}': {} => {}",
+                            rule.name, value, new_value
+                        );
+                    }
                 }
             }
         }
 
         results
+    }
+
+    /// Format a value with its definition for readable output
+    fn format_value_description(&self, dfg: &DataFlowGraph, value: ValueId) -> String {
+        match dfg.value_def(value) {
+            ValueDef::Inst(inst_id) => {
+                let inst = &dfg.insts[&inst_id];
+                match inst.opcode {
+                    Opcode::Const => {
+                        format!("{} (const {})", value, inst.immediate.unwrap_or(0))
+                    }
+                    Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div => {
+                        let left = inst
+                            .args
+                            .get(0)
+                            .map(|v| format!("{}", v))
+                            .unwrap_or("?".to_string());
+                        let right = inst
+                            .args
+                            .get(1)
+                            .map(|v| format!("{}", v))
+                            .unwrap_or("?".to_string());
+                        format!("{} ({} {} {})", value, inst.opcode, left, right)
+                    }
+                    _ => format!("{} ({:?})", value, inst.opcode),
+                }
+            }
+            ValueDef::BlockParam(block, idx) => {
+                format!("{} (param {} of {})", value, idx, block)
+            }
+            ValueDef::Union(left, right) => {
+                format!("{} (union {} ∪ {})", value, left, right)
+            }
+        }
     }
 
     /// Print statistics
