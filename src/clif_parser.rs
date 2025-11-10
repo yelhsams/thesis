@@ -1,0 +1,578 @@
+//! CLIF Parser - Parses Cranelift IR text format into our IR data structures
+
+use crate::clif_lexer::*;
+use crate::types::*;
+use std::collections::HashMap;
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+
+    // Mapping from value names (v0, v1, etc.) to ValueIds
+    value_map: HashMap<String, ValueId>,
+
+    // Mapping from block names (block0, block1, etc.) to BlockIds
+    block_map: HashMap<String, BlockId>,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            value_map: HashMap::new(),
+            block_map: HashMap::new(),
+        }
+    }
+
+    pub fn parse(&mut self) -> Result<(DataFlowGraph, Layout), String> {
+        let mut dfg = DataFlowGraph::new();
+        let mut layout = Layout::new();
+
+        // Parse function signature
+        self.parse_function_signature()?;
+
+        // Parse blocks
+        while !self.is_at_end() && !self.check(Token::RBrace) {
+            self.skip_newlines();
+            if self.is_at_end() || self.check(Token::RBrace) {
+                break;
+            }
+            self.parse_block(&mut dfg, &mut layout)?;
+        }
+
+        Ok((dfg, layout))
+    }
+
+    fn parse_function_signature(&mut self) -> Result<(), String> {
+        self.expect_keyword("function")?;
+
+        // Function name
+        if let Token::FuncName(_name) = self.peek() {
+            self.advance();
+        } else {
+            return Err(format!("Expected function name, got {:?}", self.peek()));
+        }
+
+        // Parameters
+        self.expect(Token::LParen)?;
+        if !self.check(Token::RParen) {
+            self.parse_param_list()?;
+        }
+        self.expect(Token::RParen)?;
+
+        // Return type (optional)
+        if self.check(Token::Arrow) {
+            self.advance();
+            self.parse_type()?;
+        }
+
+        self.expect(Token::LBrace)?;
+        self.skip_newlines();
+
+        Ok(())
+    }
+
+    fn parse_param_list(&mut self) -> Result<(), String> {
+        loop {
+            self.parse_type()?;
+
+            if !self.check(Token::Comma) {
+                break;
+            }
+            self.advance();
+        }
+        Ok(())
+    }
+
+    fn parse_block(&mut self, dfg: &mut DataFlowGraph, layout: &mut Layout) -> Result<(), String> {
+        // Parse block name
+        let block_name = if let Token::BlockName(name) = self.peek() {
+            let name = name.clone();
+            self.advance();
+            name
+        } else {
+            return Err(format!("Expected block name, got {:?}", self.peek()));
+        };
+
+        // Extract block number
+        let block_num = block_name
+            .trim_start_matches("block")
+            .parse::<u32>()
+            .map_err(|_| format!("Invalid block name: {}", block_name))?;
+        let block_id = BlockId(block_num);
+
+        self.block_map.insert(block_name.clone(), block_id);
+
+        // Parse block parameters
+        let mut block_params = Vec::new();
+        if self.check(Token::LParen) {
+            self.advance();
+
+            if !self.check(Token::RParen) {
+                loop {
+                    let (param_name, param_type) = self.parse_value_with_type()?;
+                    let param_value =
+                        dfg.make_block_param(block_id, block_params.len(), param_type);
+                    self.value_map.insert(param_name, param_value);
+                    block_params.push(param_value);
+
+                    if !self.check(Token::Comma) {
+                        break;
+                    }
+                    self.advance();
+                }
+            }
+
+            self.expect(Token::RParen)?;
+        }
+
+        self.expect(Token::Colon)?;
+        self.skip_newlines();
+
+        // Create block
+        let mut block = Block::new(block_id);
+        block.params = block_params;
+
+        // Parse instructions
+        while !self.is_at_end() && !self.check_block_start() && !self.check(Token::RBrace) {
+            self.skip_newlines();
+            if self.is_at_end() || self.check_block_start() || self.check(Token::RBrace) {
+                break;
+            }
+
+            let inst_id = self.parse_instruction(dfg, block_id)?;
+            block.insts.push(inst_id);
+
+            // Check if this is a terminator
+            let inst = &dfg.insts[&inst_id];
+            if inst.opcode.is_terminator() {
+                block.terminator = Some(inst_id);
+                break;
+            }
+
+            self.skip_newlines();
+        }
+
+        layout.add_block(block);
+        Ok(())
+    }
+
+    fn parse_instruction(
+        &mut self,
+        dfg: &mut DataFlowGraph,
+        _block_id: BlockId,
+    ) -> Result<InstId, String> {
+        // Check if this is a value-producing instruction
+        let has_result = if let Token::Value(_) = self.peek() {
+            if self.peek_ahead(1) == Token::Equals {
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let result_name = if has_result {
+            let name = if let Token::Value(n) = self.peek() {
+                n.clone()
+            } else {
+                unreachable!()
+            };
+            self.advance(); // consume value name
+            self.expect(Token::Equals)?;
+            Some(name)
+        } else {
+            None
+        };
+
+        // Parse opcode
+        let opcode_str = if let Token::Opcode(op) = self.peek() {
+            op.clone()
+        } else {
+            return Err(format!("Expected opcode, got {:?}", self.peek()));
+        };
+        self.advance();
+
+        let opcode = self.parse_opcode(&opcode_str)?;
+
+        // Parse type suffix (e.g., .i32)
+        let ty = if self.check(Token::Dot) {
+            self.advance();
+            self.parse_type()?
+        } else {
+            Type::I32 // default
+        };
+
+        // Parse arguments
+        let (args, immediate) = self.parse_instruction_args(dfg, &opcode)?;
+
+        // Create instruction
+        let inst = if let Some(imm) = immediate {
+            Instruction::with_imm(opcode, args, ty, imm)
+        } else {
+            Instruction::new(opcode, args, ty)
+        };
+
+        let inst_id = dfg.make_inst(inst);
+
+        // Create result value if needed
+        if let Some(name) = result_name {
+            let result_value = dfg.make_inst_result(inst_id, ty);
+            self.value_map.insert(name, result_value);
+        }
+
+        Ok(inst_id)
+    }
+
+    fn parse_instruction_args(
+        &mut self,
+        dfg: &DataFlowGraph,
+        opcode: &Opcode,
+    ) -> Result<(Vec<ValueId>, Option<i64>), String> {
+        let mut args = Vec::new();
+        let mut immediate = None;
+
+        // Special handling for different instruction types
+        match opcode {
+            Opcode::Const => {
+                // iconst takes just an immediate value
+                if let Token::Integer(n) = self.peek() {
+                    immediate = Some(n);
+                    self.advance();
+                }
+            }
+
+            Opcode::Branch => {
+                // jump block(args)
+                let block_name = self.parse_block_ref()?;
+
+                // Parse jump arguments
+                if self.check(Token::LParen) {
+                    self.advance();
+                    if !self.check(Token::RParen) {
+                        loop {
+                            let value = self.parse_value_ref()?;
+                            args.push(value);
+
+                            if !self.check(Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                }
+            }
+
+            Opcode::CondBranch => {
+                // brif cond, block1(args), block2(args)
+                let cond = self.parse_value_ref()?;
+                args.push(cond);
+
+                self.expect(Token::Comma)?;
+
+                // Then block
+                let _then_block = self.parse_block_ref()?;
+                if self.check(Token::LParen) {
+                    self.advance();
+                    if !self.check(Token::RParen) {
+                        loop {
+                            let value = self.parse_value_ref()?;
+                            args.push(value);
+
+                            if !self.check(Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                }
+
+                self.expect(Token::Comma)?;
+
+                // Else block
+                let _else_block = self.parse_block_ref()?;
+                if self.check(Token::LParen) {
+                    self.advance();
+                    if !self.check(Token::RParen) {
+                        loop {
+                            let value = self.parse_value_ref()?;
+                            args.push(value);
+
+                            if !self.check(Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                }
+            }
+
+            Opcode::Return => {
+                // return value (optional)
+                if !self.check(Token::Newline) && !self.is_at_end() {
+                    let value = self.parse_value_ref()?;
+                    args.push(value);
+                }
+            }
+
+            _ => {
+                // Binary/unary operations: parse value arguments
+                if !self.check(Token::Newline) && !self.is_at_end() {
+                    loop {
+                        // Check if we're at a comment
+                        if self.check(Token::Newline) {
+                            break;
+                        }
+
+                        let value = self.parse_value_ref()?;
+                        args.push(value);
+
+                        if !self.check(Token::Comma) {
+                            break;
+                        }
+                        self.advance();
+                    }
+                }
+            }
+        }
+
+        Ok((args, immediate))
+    }
+
+    fn parse_value_ref(&mut self) -> Result<ValueId, String> {
+        if let Token::Value(name) = self.peek() {
+            let name = name.clone();
+            self.advance();
+
+            self.value_map
+                .get(&name)
+                .copied()
+                .ok_or_else(|| format!("Undefined value: {}", name))
+        } else {
+            Err(format!("Expected value, got {:?}", self.peek()))
+        }
+    }
+
+    fn parse_block_ref(&mut self) -> Result<BlockId, String> {
+        if let Token::BlockName(name) = self.peek() {
+            let name = name.clone();
+            self.advance();
+
+            // If block doesn't exist yet, create it
+            if !self.block_map.contains_key(&name) {
+                let block_num = name
+                    .trim_start_matches("block")
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid block name: {}", name))?;
+                let block_id = BlockId(block_num);
+                self.block_map.insert(name.clone(), block_id);
+            }
+
+            Ok(self.block_map[&name])
+        } else {
+            Err(format!("Expected block name, got {:?}", self.peek()))
+        }
+    }
+
+    fn parse_value_with_type(&mut self) -> Result<(String, Type), String> {
+        let name = if let Token::Value(n) = self.peek() {
+            n.clone()
+        } else {
+            return Err(format!("Expected value name, got {:?}", self.peek()));
+        };
+        self.advance();
+
+        self.expect(Token::Colon)?;
+
+        let ty = self.parse_type()?;
+
+        Ok((name, ty))
+    }
+
+    fn parse_type(&mut self) -> Result<Type, String> {
+        if let Token::Type(ty) = self.peek() {
+            let result = match ty.as_str() {
+                "i8" => Type::I8,
+                "i16" => Type::I16,
+                "i32" => Type::I32,
+                "i64" => Type::I64,
+                _ => return Err(format!("Unknown type: {}", ty)),
+            };
+            self.advance();
+            Ok(result)
+        } else {
+            Err(format!("Expected type, got {:?}", self.peek()))
+        }
+    }
+
+    fn parse_opcode(&self, opcode_str: &str) -> Result<Opcode, String> {
+        match opcode_str {
+            "iadd" => Ok(Opcode::Add),
+            "isub" => Ok(Opcode::Sub),
+            "imul" => Ok(Opcode::Mul),
+            "idiv" => Ok(Opcode::Div),
+            "band" | "and" => Ok(Opcode::And),
+            "bor" | "or" => Ok(Opcode::Or),
+            "bxor" | "xor" => Ok(Opcode::Xor),
+            "iconst" => Ok(Opcode::Const),
+            "load" => Ok(Opcode::Load),
+            "store" => Ok(Opcode::Store),
+            "call" => Ok(Opcode::Call),
+            "jump" => Ok(Opcode::Branch),
+            "brif" | "br_if" => Ok(Opcode::CondBranch),
+            "return" => Ok(Opcode::Return),
+            "trap" => Ok(Opcode::Trap),
+            _ => Err(format!("Unknown opcode: {}", opcode_str)),
+        }
+    }
+
+    fn check_block_start(&self) -> bool {
+        matches!(self.peek(), Token::BlockName(_))
+    }
+
+    fn expect_keyword(&mut self, keyword: &str) -> Result<(), String> {
+        match self.peek() {
+            Token::Function if keyword == "function" => {
+                self.advance();
+                Ok(())
+            }
+            Token::Block if keyword == "block" => {
+                self.advance();
+                Ok(())
+            }
+            _ => Err(format!(
+                "Expected keyword '{}', got {:?}",
+                keyword,
+                self.peek()
+            )),
+        }
+    }
+
+    fn expect(&mut self, expected: Token) -> Result<(), String> {
+        if self.peek() == expected {
+            self.advance();
+            Ok(())
+        } else {
+            Err(format!("Expected {:?}, got {:?}", expected, self.peek()))
+        }
+    }
+
+    fn check(&self, token: Token) -> bool {
+        if self.is_at_end() {
+            return false;
+        }
+        std::mem::discriminant(&self.peek()) == std::mem::discriminant(&token)
+    }
+
+    fn skip_newlines(&mut self) {
+        while !self.is_at_end() && self.peek() == Token::Newline {
+            self.advance();
+        }
+    }
+
+    fn peek(&self) -> Token {
+        if self.is_at_end() {
+            Token::Eof
+        } else {
+            self.tokens[self.pos].clone()
+        }
+    }
+
+    fn peek_ahead(&self, n: usize) -> Token {
+        if self.pos + n >= self.tokens.len() {
+            Token::Eof
+        } else {
+            self.tokens[self.pos + n].clone()
+        }
+    }
+
+    fn advance(&mut self) {
+        if !self.is_at_end() {
+            self.pos += 1;
+        }
+    }
+
+    fn is_at_end(&self) -> bool {
+        self.pos >= self.tokens.len() || self.peek() == Token::Eof
+    }
+}
+
+/// Parse CLIF text into IR
+pub fn parse_clif(input: &str) -> Result<(DataFlowGraph, Layout), String> {
+    let mut lexer = Lexer::new(input);
+    let tokens = lexer.tokenize()?;
+
+    let mut parser = Parser::new(tokens);
+    parser.parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_function() {
+        let input = r#"
+function %test(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 1
+    v2 = iadd.i32 v0, v1
+    return v2
+}
+"#;
+
+        let result = parse_clif(input);
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
+
+        let (dfg, layout) = result.unwrap();
+        assert_eq!(layout.blocks.len(), 1);
+
+        let block = &layout.block_data[&BlockId(0)];
+        assert_eq!(block.params.len(), 1);
+        assert!(block.insts.len() >= 2); // At least iconst and iadd
+    }
+
+    #[test]
+    fn test_conditional_branch() {
+        let input = r#"
+function %test(i32) -> i32 {
+block0(v0: i32):
+    brif v0, block1(v0), block2(v0)
+
+block1(v1: i32):
+    v2 = iconst.i32 1
+    return v2
+
+block2(v3: i32):
+    v4 = iconst.i32 0
+    return v4
+}
+"#;
+
+        let result = parse_clif(input);
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
+
+        let (dfg, layout) = result.unwrap();
+        assert_eq!(layout.blocks.len(), 3);
+    }
+
+    #[test]
+    fn test_with_comments() {
+        let input = r#"
+function %test(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 1 ; this is a constant
+    v2 = iadd.i32 v0, v1 ; add them
+    return v2
+}
+"#;
+
+        let result = parse_clif(input);
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
+    }
+}

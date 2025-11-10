@@ -1,3 +1,5 @@
+pub mod clif_lexer;
+pub mod clif_parser;
 pub mod context_test_cases;
 pub mod egraph_pass;
 pub mod elaborate;
@@ -8,6 +10,8 @@ pub mod rewrite_integration;
 pub mod support;
 pub mod types;
 
+pub use clif_lexer::*;
+pub use clif_parser::*;
 pub use context_test_cases::*;
 pub use egraph_pass::*;
 pub use elaborate::*;

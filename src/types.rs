@@ -1,3 +1,7 @@
+//! IR Types with CLIF Display Support
+//!
+//! This is an extended version of types.rs that includes CLIF pretty-printing methods.
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -79,8 +83,6 @@ impl Opcode {
     /// Returns true if this operation can be merged (deduplicated) even though
     /// it has side effects
     pub fn is_mergeable(self) -> bool {
-        // TODO: must make sure that the divisor is not zero
-        // TODO: make this only merge on traps with same condition
         matches!(self, Opcode::Trap | Opcode::Div)
     }
 }
@@ -113,7 +115,7 @@ impl Instruction {
         }
     }
 
-    pub fn can_merge_with(&self, other: &Instruction, dfg: &DataFlowGraph) -> bool {
+    pub fn can_merge_with(&self, other: &Instruction, _dfg: &DataFlowGraph) -> bool {
         if self.opcode != other.opcode || self.ty != other.ty {
             return false;
         }
@@ -257,7 +259,6 @@ impl DataFlowGraph {
     }
 
     /// Returns the first SSA value produced by the given instruction.
-    /// QUESTION: Doesn't handle multiple results.
     pub fn first_result(&self, inst: InstId) -> ValueId {
         self.inst_results[&inst][0]
     }
@@ -270,7 +271,7 @@ impl DataFlowGraph {
         i1.can_merge_with(i2, self)
     }
 
-    /// Display an instruction in a human-readable format
+    /// Display an instruction in CLIF format
     pub fn display_inst(&self, inst_id: InstId) -> String {
         let inst = &self.insts[&inst_id];
         let results = self.inst_results(inst_id);
@@ -291,7 +292,7 @@ impl DataFlowGraph {
         // Opcode
         s.push_str(&format!("{}", inst.opcode));
 
-        // Type (for most operations)
+        // Type suffix (except for control flow)
         if !matches!(
             inst.opcode,
             Opcode::Branch | Opcode::CondBranch | Opcode::Return
@@ -299,13 +300,13 @@ impl DataFlowGraph {
             s.push_str(&format!(".{}", inst.ty));
         }
 
-        // Immediate (for constants)
-        if let Some(imm) = inst.immediate {
-            s.push_str(&format!(" {}", imm));
-        }
-
-        // Arguments (if any and not a constant)
-        if !inst.args.is_empty() && inst.opcode != Opcode::Const {
+        // For constants, show immediate value
+        if inst.opcode == Opcode::Const {
+            if let Some(imm) = inst.immediate {
+                s.push_str(&format!(" {}", imm));
+            }
+        } else if !inst.args.is_empty() {
+            // For other instructions, show arguments
             s.push(' ');
             for (i, &arg) in inst.args.iter().enumerate() {
                 if i > 0 {
@@ -358,46 +359,61 @@ impl Layout {
         self.blocks.first().copied()
     }
 
-    /// Display the entire CFG in a human-readable format
-    pub fn display(&self, dfg: &DataFlowGraph) -> String {
+    /// Display the entire function in CLIF format
+    pub fn display(
+        &self,
+        dfg: &DataFlowGraph,
+        func_name: &str,
+        sig_params: &[Type],
+        sig_return: Option<Type>,
+    ) -> String {
         let mut s = String::new();
 
-        for &block_id in &self.blocks {
+        // Function signature
+        s.push_str("function %");
+        s.push_str(func_name);
+        s.push('(');
+        for (i, ty) in sig_params.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("{}", ty));
+        }
+        s.push(')');
+
+        if let Some(ret_ty) = sig_return {
+            s.push_str(" -> ");
+            s.push_str(&format!("{}", ret_ty));
+        }
+
+        s.push_str(" {\n");
+
+        // Blocks
+        for (idx, &block_id) in self.blocks.iter().enumerate() {
             let block = &self.block_data[&block_id];
 
-            // Block header
-            s.push_str(&format!("{}:", block_id));
-
-            // Block parameters
-            if !block.params.is_empty() {
-                s.push('(');
-                for (i, &param) in block.params.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    s.push_str(&format!("{}: {}", param, dfg.value_type(param)));
-                }
-                s.push(')');
+            // Blank line before block (except first)
+            if idx > 0 {
+                s.push('\n');
             }
-            s.push('\n');
+
+            // Block header
+            s.push_str(&format!("{}(", block_id));
+            for (i, &param) in block.params.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                s.push_str(&format!("{}: {}", param, dfg.value_type(param)));
+            }
+            s.push_str("):\n");
 
             // Instructions
             for &inst_id in &block.insts {
-                // Skip terminator, we'll show it separately
-                if Some(inst_id) == block.terminator {
-                    continue;
-                }
                 s.push_str(&format!("    {}\n", dfg.display_inst(inst_id)));
             }
-
-            // Terminator
-            if let Some(term_id) = block.terminator {
-                s.push_str(&format!("    {}\n", dfg.display_inst(term_id)));
-            }
-
-            s.push('\n');
         }
 
+        s.push_str("}\n");
         s
     }
 }
@@ -424,7 +440,7 @@ pub struct Stats {
 
 impl Stats {
     pub fn print_summary(&self) {
-        println!("=== Egraph Pass Statistics ===");
+        println!("\n=== Egraph Pass Statistics ===");
         println!("Pure instructions processed: {}", self.pure_inst);
         println!("  - Deduplicated: {}", self.pure_inst_deduped);
         println!("  - New: {}", self.pure_inst_insert_new);
@@ -436,6 +452,7 @@ impl Stats {
     }
 }
 
+// Display implementations
 impl fmt::Display for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "block{}", self.0)
@@ -461,15 +478,15 @@ impl fmt::Display for Opcode {
             Opcode::Sub => "isub",
             Opcode::Mul => "imul",
             Opcode::Div => "idiv",
-            Opcode::And => "and",
-            Opcode::Or => "or",
-            Opcode::Xor => "xor",
+            Opcode::And => "band",
+            Opcode::Or => "bor",
+            Opcode::Xor => "bxor",
             Opcode::Const => "iconst",
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Call => "call",
             Opcode::Branch => "jump",
-            Opcode::CondBranch => "br_if",
+            Opcode::CondBranch => "brif",
             Opcode::Return => "return",
             Opcode::Trap => "trap",
         };

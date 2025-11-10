@@ -51,7 +51,12 @@ impl EgraphPass {
         // Print initial state
         println!("Initial IR (before optimization):");
         println!("{}", "─".repeat(60));
-        println!("{}", self.layout.display(&self.dfg));
+        let (func_name, sig_params, sig_return) = self.get_function_signature();
+        println!(
+            "{}",
+            self.layout
+                .display(&self.dfg, &func_name, &sig_params, sig_return)
+        );
 
         // Phase 1: Remove pure instructions and build egraph
         self.remove_pure_and_optimize();
@@ -73,6 +78,31 @@ impl EgraphPass {
         // Print final statistics
         self.stats.print_summary();
         self.rewrite_engine.print_stats();
+    }
+
+    /// Extract function signature from entry block
+    fn get_function_signature(&self) -> (String, Vec<Type>, Option<Type>) {
+        let func_name = "test".to_string();
+
+        // Get parameter types from entry block
+        let sig_params: Vec<Type> = if let Some(entry_block) = self.layout.entry_block() {
+            if let Some(block_data) = self.layout.block_data.get(&entry_block) {
+                block_data
+                    .params
+                    .iter()
+                    .map(|&param| self.dfg.value_type(param))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Try to infer return type from return instructions
+        let sig_return = None; // Could be enhanced to find return instructions
+
+        (func_name, sig_params, sig_return)
     }
 
     /// Print the current state of the egraph including union nodes
@@ -100,7 +130,12 @@ impl EgraphPass {
 
         // Show the layout (skeleton)
         println!("Remaining skeleton (control flow):");
-        println!("{}", self.layout.display(&self.dfg));
+        let (func_name, sig_params, sig_return) = self.get_function_signature();
+        println!(
+            "{}",
+            self.layout
+                .display(&self.dfg, &func_name, &sig_params, sig_return)
+        );
     }
 
     /// Add a custom rewrite rule to the engine
