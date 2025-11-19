@@ -135,40 +135,75 @@ impl EgraphPass {
 
     /// Rebuild the layout to only include necessary instructions
     fn rebuild_layout(&mut self, canonical_map: &HashMap<ValueId, ValueId>) {
-        let mut removed_count = 0;
+        println!("Rebuilding layout with canonical values...");
 
-        // For each block, filter out redundant pure instructions
+        // For each block, rebuild its instruction list
         for &block_id in &self.layout.blocks.clone() {
-            let block = self.layout.block_data.get_mut(&block_id).unwrap();
+            let block_data = self.layout.block_data.get(&block_id).unwrap();
+            let mut needed_values = HashSet::new();
+            let mut skeleton_insts = Vec::new();
 
-            block.insts.retain(|&inst_id| {
+            // First pass: collect skeleton instructions and the values they use
+            for &inst_id in &block_data.insts {
                 let inst = &self.dfg.insts[&inst_id];
 
-                // Keep all skeleton (non-pure) instructions
                 if !inst.opcode.is_pure() {
-                    return true;
-                }
+                    // This is a skeleton instruction - keep it
+                    skeleton_insts.push(inst_id);
 
-                // For pure instructions, check if the result is its own canonical
-                if let Some(&result) = self.dfg.inst_results.get(&inst_id).and_then(|v| v.first()) {
-                    let canonical = canonical_map.get(&result).copied().unwrap_or(result);
-
-                    // Keep the instruction if its result IS the canonical representative
-                    // Remove it if its result has been replaced by a different canonical
-                    if result == canonical {
-                        true
-                    } else {
-                        removed_count += 1;
-                        false
+                    // Mark all its arguments as needed
+                    for &arg in &inst.args {
+                        needed_values.insert(arg);
                     }
-                } else {
-                    // No result, keep it (shouldn't happen for pure ops)
-                    true
                 }
-            });
+            }
+
+            // Second pass: for each needed value, find the instruction that produces it
+            let mut pure_insts_to_add = Vec::new();
+            let mut work_queue: Vec<ValueId> = needed_values.iter().copied().collect();
+            let mut processed = HashSet::new();
+
+            while let Some(value) = work_queue.pop() {
+                if !processed.insert(value) {
+                    continue;
+                }
+
+                // Find the instruction that defines this value
+                if let ValueDef::Inst(inst_id) = self.dfg.value_def(value) {
+                    let inst = &self.dfg.insts[&inst_id];
+
+                    // Only add pure instructions (skeleton ones are already added)
+                    if inst.opcode.is_pure() {
+                        pure_insts_to_add.push(inst_id);
+
+                        // This instruction's arguments are also needed
+                        for &arg in &inst.args {
+                            if !processed.contains(&arg) {
+                                work_queue.push(arg);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Combine pure and skeleton instructions
+            // Put pure instructions first, then skeleton (topological order handled implicitly)
+            let mut new_insts = pure_insts_to_add;
+            new_insts.extend(skeleton_insts);
+
+            // Update the block
+            let block = self.layout.block_data.get_mut(&block_id).unwrap();
+            let original_count = block.insts.len();
+            block.insts = new_insts;
+            let new_count = block.insts.len();
+
+            println!(
+                "  Block {}: {} insts -> {} insts",
+                block_id.0, original_count, new_count
+            );
         }
 
-        println!("Removed {} redundant instructions\n", removed_count);
+        println!();
     }
 
     /// Find the canonical (simplest/cheapest) representative of a value
