@@ -31,6 +31,9 @@ pub struct EgraphPass {
 
     /// Pattern-based rewrite engine
     rewrite_engine: RewriteEngine,
+
+    /// GVN mapping from original values to optimized values
+    gvn_mapping: HashMap<ValueId, ValueId>,
 }
 
 impl EgraphPass {
@@ -41,6 +44,7 @@ impl EgraphPass {
             domtree,
             stats: Stats::default(),
             rewrite_engine: RewriteEngine::with_standard_library(),
+            gvn_mapping: HashMap::new(),
         }
     }
 
@@ -70,15 +74,211 @@ impl EgraphPass {
         println!("{}", "─".repeat(60));
         self.print_egraph_state();
 
-        // Phase 2: Extract best versions (elaboration)
-        // In a full implementation, this would place instructions back
-        // For now, we just verify the egraph
-        self.verify_egraph();
+        let canonical_map = self.extract_best_values();
+        self.rebuild_layout(&canonical_map);
+
+        // TODO: Implement this
+        // self.verify_egraph();
 
         // Print final statistics
         self.stats.print_summary();
         self.rewrite_engine.print_stats();
     }
+
+    /// Extract the best (cheapest) representative from each equivalence class
+    /// and update all instructions to use those representatives
+    fn extract_best_values(&mut self) -> HashMap<ValueId, ValueId> {
+        println!("Finding canonical representatives for all values...\n");
+
+        // Build a map from each value to its canonical representative
+        let mut canonical_map: HashMap<ValueId, ValueId> = HashMap::new();
+
+        // Get all values
+        let all_values: Vec<ValueId> = self.dfg.value_defs.keys().copied().collect();
+
+        for value in all_values {
+            let canonical = self.find_canonical(value, &mut canonical_map);
+            canonical_map.insert(value, canonical);
+        }
+
+        // Update all instructions to use canonical representatives
+        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+        let mut updated_count = 0;
+
+        for inst_id in all_insts {
+            let mut inst = self.dfg.insts[&inst_id].clone();
+            let mut changed = false;
+
+            // Update each argument to use its canonical representative
+            for arg in &mut inst.args {
+                if let Some(&canonical) = canonical_map.get(arg) {
+                    if canonical != *arg {
+                        *arg = canonical;
+                        changed = true;
+                    }
+                }
+            }
+
+            if changed {
+                self.dfg.insts.insert(inst_id, inst);
+                updated_count += 1;
+            }
+        }
+
+        println!(
+            "\nExtraction complete: updated {} instructions\n",
+            updated_count
+        );
+
+        canonical_map
+    }
+
+    /// Rebuild the layout to only include necessary instructions
+    fn rebuild_layout(&mut self, canonical_map: &HashMap<ValueId, ValueId>) {
+        let mut removed_count = 0;
+
+        // For each block, filter out redundant pure instructions
+        for &block_id in &self.layout.blocks.clone() {
+            let block = self.layout.block_data.get_mut(&block_id).unwrap();
+
+            block.insts.retain(|&inst_id| {
+                let inst = &self.dfg.insts[&inst_id];
+
+                // Keep all skeleton (non-pure) instructions
+                if !inst.opcode.is_pure() {
+                    return true;
+                }
+
+                // For pure instructions, check if the result is its own canonical
+                if let Some(&result) = self.dfg.inst_results.get(&inst_id).and_then(|v| v.first()) {
+                    let canonical = canonical_map.get(&result).copied().unwrap_or(result);
+
+                    // Keep the instruction if its result IS the canonical representative
+                    // Remove it if its result has been replaced by a different canonical
+                    if result == canonical {
+                        true
+                    } else {
+                        removed_count += 1;
+                        false
+                    }
+                } else {
+                    // No result, keep it (shouldn't happen for pure ops)
+                    true
+                }
+            });
+        }
+
+        println!("Removed {} redundant instructions\n", removed_count);
+    }
+
+    /// Find the canonical (simplest/cheapest) representative of a value
+    /// by following union nodes and choosing the simplest form
+    fn find_canonical(&self, value: ValueId, cache: &mut HashMap<ValueId, ValueId>) -> ValueId {
+        // Check cache first
+        if let Some(&cached) = cache.get(&value) {
+            return cached;
+        }
+
+        // First apply GVN mapping if this value was merged
+        let gvn_value = self.gvn_mapping.get(&value).copied().unwrap_or(value);
+
+        // Collect all values that are equivalent to this one through unions
+        let mut equiv_class = vec![gvn_value];
+        let mut visited = HashSet::new();
+        visited.insert(gvn_value);
+
+        // BFS to find all equivalent values
+        let mut queue = vec![gvn_value];
+        while let Some(current) = queue.pop() {
+            // Check if any union nodes reference this value
+            for (&other_value, def) in &self.dfg.value_defs {
+                if visited.contains(&other_value) {
+                    continue;
+                }
+
+                if let ValueDef::Union(left, right) = def {
+                    // If this union mentions current, add both sides to the equiv class
+                    if *left == current || *right == current {
+                        visited.insert(other_value);
+                        visited.insert(*left);
+                        visited.insert(*right);
+                        equiv_class.push(other_value);
+                        equiv_class.push(*left);
+                        equiv_class.push(*right);
+                        queue.push(other_value);
+                        queue.push(*left);
+                        queue.push(*right);
+                    }
+                }
+            }
+        }
+
+        // Find the simplest value in the equivalence class
+        let mut canonical = value;
+        for &v in &equiv_class {
+            if self.is_simpler_than(v, canonical) {
+                canonical = v;
+            }
+        }
+
+        cache.insert(value, canonical);
+        canonical
+    }
+
+    /// Check if v1 is simpler than v2
+    fn is_simpler_than(&self, v1: ValueId, v2: ValueId) -> bool {
+        let def1 = self.dfg.value_def(v1);
+        let def2 = self.dfg.value_def(v2);
+
+        match (def1, def2) {
+            // Block parameters are simplest
+            (ValueDef::BlockParam(_, _), ValueDef::BlockParam(_, _)) => false,
+            (ValueDef::BlockParam(_, _), _) => true,
+            (_, ValueDef::BlockParam(_, _)) => false,
+
+            // Union nodes are not canonical - skip them
+            (ValueDef::Union(_, _), _) => false,
+            (_, ValueDef::Union(_, _)) => true,
+
+            // Compare instructions
+            (ValueDef::Inst(inst1), ValueDef::Inst(inst2)) => {
+                let i1 = &self.dfg.insts[&inst1];
+                let i2 = &self.dfg.insts[&inst2];
+
+                // Constants are simpler than non-constants
+                if i1.opcode == Opcode::Const && i2.opcode != Opcode::Const {
+                    return true;
+                }
+                if i2.opcode == Opcode::Const && i1.opcode != Opcode::Const {
+                    return false;
+                }
+
+                // Fewer arguments is simpler
+                if i1.args.len() < i2.args.len() {
+                    return true;
+                }
+                if i2.args.len() < i1.args.len() {
+                    return false;
+                }
+
+                // Cheaper opcode is simpler
+                use crate::elaborate::{CostModel, DefaultCostModel};
+                let cost_model = DefaultCostModel;
+                let cost1 = cost_model.cost_of_opcode(i1.opcode);
+                let cost2 = cost_model.cost_of_opcode(i2.opcode);
+
+                cost1 < cost2
+            }
+        }
+    }
+
+    // TODO: Implement this
+    // fn verify_egraph(&self) {
+    //     // We could add other verification checks here, such as:
+    //     // - Checking for circular references in union nodes
+    //     // - Verifying that all referenced values exist
+    //     // - Checking type consistency
+    // }
 
     /// Extract function signature from entry block
     fn get_function_signature(&self) -> (String, Vec<Type>, Option<Type>) {
@@ -238,19 +438,8 @@ impl EgraphPass {
                 }
             }
         }
-    }
-
-    fn verify_egraph(&self) {
-        // In an egraph, instruction arguments can reference union nodes
-        // This is actually the expected behavior - union nodes represent
-        // equivalent expressions that can be used interchangeably.
-
-        // We could add other verification checks here, such as:
-        // - Checking for circular references in union nodes
-        // - Verifying that all referenced values exist
-        // - Checking type consistency
-
-        println!("\n✓ Egraph verification passed: egraph structure is valid");
+        // Save the GVN mapping for use in extraction
+        self.gvn_mapping = value_to_opt_value;
     }
 }
 

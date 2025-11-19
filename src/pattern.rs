@@ -572,12 +572,62 @@ impl RewriteLibrary {
         );
 
         rules.push(
+            Rewrite::new("add-zero-right")
+                .match_pattern(Pattern::op(
+                    Opcode::Add,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
             Rewrite::new("mul-zero")
                 .match_pattern(Pattern::op(
                     Opcode::Mul,
                     vec![Pattern::var("x"), Pattern::constant(0)],
                 ))
                 .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("mul-zero-left")
+                .match_pattern(Pattern::op(
+                    Opcode::Mul,
+                    vec![Pattern::constant(0), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("mul-one")
+                .match_pattern(Pattern::op(
+                    Opcode::Mul,
+                    vec![Pattern::var("x"), Pattern::constant(1)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("mul-one-left")
+                .match_pattern(Pattern::op(
+                    Opcode::Mul,
+                    vec![Pattern::constant(1), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("sub-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Sub,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
                 .build(),
         );
 
@@ -789,12 +839,221 @@ impl RewriteLibrary {
         );
 
         rules.push(
+            Rewrite::new("and-zero-left")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::constant(0), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("and-all-ones")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::var("x"), Pattern::constant(-1)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("and-all-ones-left")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::constant(-1), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-zero-left")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::constant(0), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
             Rewrite::new("or-neg-one")
                 .match_pattern(Pattern::op(
                     Opcode::Or,
                     vec![Pattern::var("x"), Pattern::constant(-1)],
                 ))
                 .produce(Pattern::constant(-1))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-neg-one-left")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::constant(-1), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(-1))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("xor-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Xor,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("xor-zero-left")
+                .match_pattern(Pattern::op(
+                    Opcode::Xor,
+                    vec![Pattern::constant(0), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        // Zero subtracted from zero
+        rules.push(
+            Rewrite::new("zero-sub-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Sub,
+                    vec![Pattern::constant(0), Pattern::constant(0)],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        // Additional comparison patterns
+        rules.push(
+            Rewrite::new("sgt-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Sgt,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("sge-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Sge,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(1))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ult-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Ult,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ule-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Ule,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(1))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ugt-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Ugt,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("uge-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Uge,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(1))
+                .build(),
+        );
+
+        // Commutative operations
+        rules.push(
+            Rewrite::new("mul-commute")
+                .match_pattern(Pattern::op(
+                    Opcode::Mul,
+                    vec![Pattern::var("x"), Pattern::var("y")],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Mul,
+                    vec![Pattern::var("y"), Pattern::var("x")],
+                ))
+                .bidirectional()
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("and-commute")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::var("x"), Pattern::var("y")],
+                ))
+                .produce(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::var("y"), Pattern::var("x")],
+                ))
+                .bidirectional()
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-commute")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::var("x"), Pattern::var("y")],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::var("y"), Pattern::var("x")],
+                ))
+                .bidirectional()
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("xor-commute")
+                .match_pattern(Pattern::op(
+                    Opcode::Xor,
+                    vec![Pattern::var("x"), Pattern::var("y")],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Xor,
+                    vec![Pattern::var("y"), Pattern::var("x")],
+                ))
+                .bidirectional()
                 .build(),
         );
 
