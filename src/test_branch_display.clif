@@ -1,0 +1,17 @@
+function %test_branches(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 10
+    v2 = icmp.eq.i32 v0, v1
+    brif v2, block1(v0), block2(v0)
+
+block1(v3: i32):
+    v4 = iadd.i32 v3, v1
+    jump block3(v4)
+
+block2(v5: i32):
+    v6 = imul.i32 v5, v1
+    jump block3(v6)
+
+block3(v7: i32):
+    return v7
+}

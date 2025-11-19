@@ -29,6 +29,9 @@ impl Parser {
         let mut dfg = DataFlowGraph::new();
         let mut layout = Layout::new();
 
+        // Skip leading newlines
+        self.skip_newlines();
+
         // Parse function signature
         self.parse_function_signature()?;
 
@@ -195,6 +198,23 @@ impl Parser {
         };
         self.advance();
 
+        let mut opcode = self.parse_opcode(&opcode_str)?;
+
+        // For icmp, check if there's a comparison condition after a dot
+        if opcode_str == "icmp" && self.check(Token::Dot) {
+            self.advance();
+            if let Token::Opcode(cond) = self.peek() {
+                let cond_str = cond.clone();
+                self.advance();
+                opcode = self.parse_comparison_condition(&cond_str)?;
+            } else {
+                return Err(format!(
+                    "Expected comparison condition after 'icmp.', got {:?}",
+                    self.peek()
+                ));
+            }
+        }
+
         let opcode = self.parse_opcode(&opcode_str)?;
 
         // Parse type suffix (e.g., .i32)
@@ -206,10 +226,12 @@ impl Parser {
         };
 
         // Parse arguments
-        let (args, immediate) = self.parse_instruction_args(dfg, &opcode)?;
+        let (args, immediate, branch_info) = self.parse_instruction_args(dfg, &opcode)?;
 
         // Create instruction
-        let inst = if let Some(imm) = immediate {
+        let inst = if let Some(branch_info) = branch_info {
+            Instruction::with_branch(opcode, args, ty, branch_info)
+        } else if let Some(imm) = immediate {
             Instruction::with_imm(opcode, args, ty, imm)
         } else {
             Instruction::new(opcode, args, ty)
@@ -230,9 +252,10 @@ impl Parser {
         &mut self,
         dfg: &DataFlowGraph,
         opcode: &Opcode,
-    ) -> Result<(Vec<ValueId>, Option<i64>), String> {
+    ) -> Result<(Vec<ValueId>, Option<i64>, Option<BranchInfo>), String> {
         let mut args = Vec::new();
         let mut immediate = None;
+        let mut branch_info = None;
 
         // Special handling for different instruction types
         match opcode {
@@ -244,9 +267,25 @@ impl Parser {
                 }
             }
 
+            Opcode::AddImm | Opcode::MulImm | Opcode::ShlImm => {
+                // Immediate variants: value, immediate
+                // e.g., iadd_imm v0, 10
+                let value = self.parse_value_ref()?;
+                args.push(value);
+
+                self.expect(Token::Comma)?;
+
+                if let Token::Integer(n) = self.peek() {
+                    immediate = Some(n);
+                    self.advance();
+                } else {
+                    return Err(format!("Expected integer immediate, got {:?}", self.peek()));
+                }
+            }
+
             Opcode::Branch => {
                 // jump block(args)
-                let block_name = self.parse_block_ref()?;
+                let target_block = self.parse_block_ref()?;
 
                 // Parse jump arguments
                 if self.check(Token::LParen) {
@@ -264,6 +303,7 @@ impl Parser {
                     }
                     self.expect(Token::RParen)?;
                 }
+                branch_info = Some(BranchInfo::Jump(target_block));
             }
 
             Opcode::CondBranch => {
@@ -274,14 +314,15 @@ impl Parser {
                 self.expect(Token::Comma)?;
 
                 // Then block
-                let _then_block = self.parse_block_ref()?;
+                let then_block = self.parse_block_ref()?;
+                let mut then_args_count = 0;
                 if self.check(Token::LParen) {
                     self.advance();
                     if !self.check(Token::RParen) {
                         loop {
                             let value = self.parse_value_ref()?;
                             args.push(value);
-
+                            then_args_count += 1;
                             if !self.check(Token::Comma) {
                                 break;
                             }
@@ -294,13 +335,15 @@ impl Parser {
                 self.expect(Token::Comma)?;
 
                 // Else block
-                let _else_block = self.parse_block_ref()?;
+                let else_block = self.parse_block_ref()?;
+                let mut else_args_count = 0;
                 if self.check(Token::LParen) {
                     self.advance();
                     if !self.check(Token::RParen) {
                         loop {
                             let value = self.parse_value_ref()?;
                             args.push(value);
+                            else_args_count += 1;
 
                             if !self.check(Token::Comma) {
                                 break;
@@ -310,6 +353,12 @@ impl Parser {
                     }
                     self.expect(Token::RParen)?;
                 }
+                branch_info = Some(BranchInfo::Conditional(
+                    then_block,
+                    then_args_count,
+                    else_block,
+                    else_args_count,
+                ));
             }
 
             Opcode::Return => {
@@ -341,7 +390,7 @@ impl Parser {
             }
         }
 
-        Ok((args, immediate))
+        Ok((args, immediate, branch_info))
     }
 
     fn parse_value_ref(&mut self) -> Result<ValueId, String> {
@@ -416,10 +465,21 @@ impl Parser {
             "isub" => Ok(Opcode::Sub),
             "imul" => Ok(Opcode::Mul),
             "idiv" => Ok(Opcode::Div),
+            "iadd_imm" => Ok(Opcode::AddImm),
+            "imul_imm" => Ok(Opcode::MulImm),
+            "ishl_imm" => Ok(Opcode::ShlImm),
             "band" | "and" => Ok(Opcode::And),
             "bor" | "or" => Ok(Opcode::Or),
             "bxor" | "xor" => Ok(Opcode::Xor),
+            "ishl" => Ok(Opcode::Shl),
+            "ushr" => Ok(Opcode::Ushr),
+            "sshr" => Ok(Opcode::Sshr),
+            "bnot" => Ok(Opcode::Bnot),
+            "ineg" => Ok(Opcode::Ineg),
+            "icmp" => Ok(Opcode::Eq), // Will be refined with condition suffix
             "iconst" => Ok(Opcode::Const),
+            "uextend" => Ok(Opcode::Uextend),
+            "sextend" => Ok(Opcode::Sextend),
             "load" => Ok(Opcode::Load),
             "store" => Ok(Opcode::Store),
             "call" => Ok(Opcode::Call),
@@ -428,6 +488,22 @@ impl Parser {
             "return" => Ok(Opcode::Return),
             "trap" => Ok(Opcode::Trap),
             _ => Err(format!("Unknown opcode: {}", opcode_str)),
+        }
+    }
+
+    fn parse_comparison_condition(&self, cond: &str) -> Result<Opcode, String> {
+        match cond {
+            "eq" => Ok(Opcode::Eq),
+            "ne" => Ok(Opcode::Ne),
+            "slt" => Ok(Opcode::Slt),
+            "sle" => Ok(Opcode::Sle),
+            "sgt" => Ok(Opcode::Sgt),
+            "sge" => Ok(Opcode::Sge),
+            "ult" => Ok(Opcode::Ult),
+            "ule" => Ok(Opcode::Ule),
+            "ugt" => Ok(Opcode::Ugt),
+            "uge" => Ok(Opcode::Uge),
+            _ => Err(format!("Unknown comparison condition: {}", cond)),
         }
     }
 
@@ -498,7 +574,7 @@ impl Parser {
     }
 
     fn is_at_end(&self) -> bool {
-        self.pos >= self.tokens.len() || self.peek() == Token::Eof
+        self.pos >= self.tokens.len()
     }
 }
 

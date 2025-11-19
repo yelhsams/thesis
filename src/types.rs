@@ -45,6 +45,26 @@ pub enum Opcode {
     Or,
     Xor,
     Const,
+    AddImm,
+    MulImm,
+    ShlImm,
+    Shl,
+    Ushr,
+    Sshr,
+    Bnot,
+    Ineg,
+    Eq,
+    Ne,
+    Slt,
+    Sle,
+    Sgt,
+    Sge,
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+    Uextend,
+    Sextend,
 
     // Side-effect ops
     Div,
@@ -69,6 +89,26 @@ impl Opcode {
                 | Opcode::Or
                 | Opcode::Xor
                 | Opcode::Const
+                | Opcode::AddImm
+                | Opcode::MulImm
+                | Opcode::ShlImm
+                | Opcode::Shl
+                | Opcode::Ushr
+                | Opcode::Sshr
+                | Opcode::Bnot
+                | Opcode::Ineg
+                | Opcode::Eq
+                | Opcode::Ne
+                | Opcode::Slt
+                | Opcode::Sle
+                | Opcode::Sgt
+                | Opcode::Sge
+                | Opcode::Ult
+                | Opcode::Ule
+                | Opcode::Ugt
+                | Opcode::Uge
+                | Opcode::Uextend
+                | Opcode::Sextend
         )
     }
 
@@ -87,13 +127,24 @@ impl Opcode {
     }
 }
 
+/// Branch target information for control flow instructions
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BranchInfo {
+    /// Unconditional jump: target block
+    Jump(BlockId),
+    /// Conditional branch: (then_block, then_args_count, else_block, else_args_count)
+    /// Note: first arg in instruction is the condition
+    Conditional(BlockId, usize, BlockId, usize),
+}
+
 /// Instruction
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Instruction {
     pub opcode: Opcode,
     pub args: Vec<ValueId>,
     pub ty: Type,
-    pub immediate: Option<i64>, // For constants
+    pub immediate: Option<i64>,          // For constants
+    pub branch_info: Option<BranchInfo>, // For branch/brif instructions
 }
 
 impl Instruction {
@@ -103,6 +154,7 @@ impl Instruction {
             args,
             ty,
             immediate: None,
+            branch_info: None,
         }
     }
 
@@ -112,6 +164,22 @@ impl Instruction {
             args,
             ty,
             immediate: Some(imm),
+            branch_info: None,
+        }
+    }
+
+    pub fn with_branch(
+        opcode: Opcode,
+        args: Vec<ValueId>,
+        ty: Type,
+        branch_info: BranchInfo,
+    ) -> Self {
+        Self {
+            opcode,
+            args,
+            ty,
+            immediate: None,
+            branch_info: Some(branch_info),
         }
     }
 
@@ -305,6 +373,59 @@ impl DataFlowGraph {
             if let Some(imm) = inst.immediate {
                 s.push_str(&format!(" {}", imm));
             }
+        } else if inst.opcode == Opcode::Branch {
+            // For jump instructions, show target block with arguments
+            if let Some(BranchInfo::Jump(block_id)) = &inst.branch_info {
+                s.push_str(&format!(" block{}", block_id.0));
+                if !inst.args.is_empty() {
+                    s.push('(');
+                    for (i, &arg) in inst.args.iter().enumerate() {
+                        if i > 0 {
+                            s.push_str(", ");
+                        }
+                        s.push_str(&format!("{}", arg));
+                    }
+                    s.push(')');
+                }
+            }
+        } else if inst.opcode == Opcode::CondBranch {
+            // For conditional branches, show condition, then block, and else block
+            if let Some(BranchInfo::Conditional(then_block, then_count, else_block, else_count)) =
+                &inst.branch_info
+            {
+                // First arg is the condition
+                if !inst.args.is_empty() {
+                    s.push_str(&format!(" {}", inst.args[0]));
+                    s.push_str(", ");
+
+                    // Then block
+                    s.push_str(&format!("block{}", then_block.0));
+                    if *then_count > 0 {
+                        s.push('(');
+                        for i in 0..*then_count {
+                            if i > 0 {
+                                s.push_str(", ");
+                            }
+                            s.push_str(&format!("{}", inst.args[1 + i]));
+                        }
+                        s.push(')');
+                    }
+                    s.push_str(", ");
+
+                    // Else block
+                    s.push_str(&format!("block{}", else_block.0));
+                    if *else_count > 0 {
+                        s.push('(');
+                        for i in 0..*else_count {
+                            if i > 0 {
+                                s.push_str(", ");
+                            }
+                            s.push_str(&format!("{}", inst.args[1 + then_count + i]));
+                        }
+                        s.push(')');
+                    }
+                }
+            }
         } else if !inst.args.is_empty() {
             // For other instructions, show arguments
             s.push(' ');
@@ -482,6 +603,26 @@ impl fmt::Display for Opcode {
             Opcode::Or => "bor",
             Opcode::Xor => "bxor",
             Opcode::Const => "iconst",
+            Opcode::AddImm => "iadd_imm",
+            Opcode::MulImm => "imul_imm",
+            Opcode::ShlImm => "ishl_imm",
+            Opcode::Shl => "ishl",
+            Opcode::Ushr => "ushr",
+            Opcode::Sshr => "sshr",
+            Opcode::Bnot => "bnot",
+            Opcode::Ineg => "ineg",
+            Opcode::Eq => "icmp.eq",
+            Opcode::Ne => "icmp.ne",
+            Opcode::Slt => "icmp.slt",
+            Opcode::Sle => "icmp.sle",
+            Opcode::Sgt => "icmp.sgt",
+            Opcode::Sge => "icmp.sge",
+            Opcode::Ult => "icmp.ult",
+            Opcode::Ule => "icmp.ule",
+            Opcode::Ugt => "icmp.ugt",
+            Opcode::Uge => "icmp.uge",
+            Opcode::Uextend => "uextend",
+            Opcode::Sextend => "sextend",
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Call => "call",

@@ -646,6 +646,172 @@ impl RewriteLibrary {
                 .build(),
         );
 
+        // Shift optimizations
+        rules.push(
+            Rewrite::new("shl-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Shl,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ushr-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Ushr,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("sshr-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::Sshr,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        // Bitwise NOT optimizations
+        rules.push(
+            Rewrite::new("bnot-bnot")
+                .match_pattern(Pattern::op(
+                    Opcode::Bnot,
+                    vec![Pattern::op(Opcode::Bnot, vec![Pattern::var("x")])],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        // Negation optimizations
+        rules.push(
+            Rewrite::new("ineg-ineg")
+                .match_pattern(Pattern::op(
+                    Opcode::Ineg,
+                    vec![Pattern::op(Opcode::Ineg, vec![Pattern::var("x")])],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ineg-zero")
+                .match_pattern(Pattern::op(Opcode::Ineg, vec![Pattern::constant(0)]))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        // Comparison simplifications
+        rules.push(
+            Rewrite::new("eq-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Eq,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(1))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("ne-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Ne,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("slt-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Slt,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("sle-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Sle,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(1))
+                .build(),
+        );
+
+        // Bitwise optimizations
+        rules.push(
+            Rewrite::new("and-self")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::var("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("xor-self")
+                .match_pattern(Pattern::op(
+                    Opcode::Xor,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("and-zero")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![Pattern::var("x"), Pattern::constant(0)],
+                ))
+                .produce(Pattern::constant(0))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("or-neg-one")
+                .match_pattern(Pattern::op(
+                    Opcode::Or,
+                    vec![Pattern::var("x"), Pattern::constant(-1)],
+                ))
+                .produce(Pattern::constant(-1))
+                .build(),
+        );
+
+        // Strength reduction: shift by constant -> multiply/divide
+        rules.push(
+            Rewrite::new("shl-by-one")
+                .match_pattern(Pattern::op(
+                    Opcode::Shl,
+                    vec![Pattern::var("x"), Pattern::constant(1)],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Add,
+                    vec![Pattern::var("x"), Pattern::var("x")],
+                ))
+                .build(),
+        );
+
         Self { rules }
     }
 

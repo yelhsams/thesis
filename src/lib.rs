@@ -8,6 +8,7 @@ pub mod pattern;
 pub mod pattern_examples;
 pub mod rewrite_integration;
 pub mod support;
+pub mod test_branch_display;
 pub mod types;
 
 pub use clif_lexer::*;
