@@ -531,6 +531,7 @@ impl RewriteLibrary {
         let mut rules = Vec::new();
 
         // Arithmetic identities
+        // x + 0 => x
         rules.push(
             Rewrite::new("add-zero")
                 .match_pattern(Pattern::op(
@@ -541,6 +542,7 @@ impl RewriteLibrary {
                 .build(),
         );
 
+        // 0 + x => x
         rules.push(
             Rewrite::new("add-zero-left")
                 .match_pattern(Pattern::op(
@@ -655,7 +657,7 @@ impl RewriteLibrary {
                 .build(),
         );
 
-        // Constant folding (example with conditions)
+        // Constant folding
         rules.push(
             Rewrite::new("const-fold-add")
                 .match_pattern(Pattern::op(
@@ -671,7 +673,6 @@ impl RewriteLibrary {
                             bindings.get_constant(&VarId::new("b")),
                         ) {
                             // Store the result for the applier to use
-                            // (This is a bit hacky - in practice you'd want a better way)
                             true
                         } else {
                             false

@@ -7,21 +7,21 @@ pub enum Token {
     // Keywords
     Function,
     Block,
-    
+
     // Types
     Type(String), // i8, i16, i32, i64
-    
+
     // Identifiers
     FuncName(String),  // %name
     Value(String),     // v0, v1, etc.
     BlockName(String), // block0, block1, etc.
-    
+
     // Opcodes
     Opcode(String),
-    
+
     // Literals
     Integer(i64),
-    
+
     // Punctuation
     LParen,
     RParen,
@@ -30,9 +30,9 @@ pub enum Token {
     Comma,
     Colon,
     Equals,
-    Arrow,      // ->
+    Arrow,
     Dot,
-    
+
     // Special
     Newline,
     Eof,
@@ -76,20 +76,20 @@ impl Lexer {
             pos: 0,
         }
     }
-    
+
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
-        
+
         loop {
             self.skip_whitespace_except_newline();
-            
+
             if self.is_at_end() {
                 tokens.push(Token::Eof);
                 break;
             }
-            
+
             let token = self.next_token()?;
-            
+
             // Skip consecutive newlines (keep only one)
             if token == Token::Newline {
                 if tokens.last() != Some(&Token::Newline) {
@@ -99,19 +99,19 @@ impl Lexer {
                 tokens.push(token);
             }
         }
-        
+
         Ok(tokens)
     }
-    
+
     fn next_token(&mut self) -> Result<Token, String> {
         // Skip comments
         if self.peek() == ';' {
             self.skip_comment();
             return Ok(Token::Newline);
         }
-        
+
         let ch = self.peek();
-        
+
         match ch {
             '\n' => {
                 self.advance();
@@ -196,7 +196,7 @@ impl Lexer {
             _ => Err(format!("Unexpected character: '{}'", ch)),
         }
     }
-    
+
     fn read_identifier(&mut self) -> String {
         let mut s = String::new();
         while !self.is_at_end() {
@@ -210,25 +210,25 @@ impl Lexer {
         }
         s
     }
-    
+
     fn read_integer(&mut self) -> Result<Token, String> {
         let mut s = String::new();
-        
+
         if self.peek() == '-' {
             s.push('-');
             self.advance();
         }
-        
+
         while !self.is_at_end() && self.peek().is_ascii_digit() {
             s.push(self.peek());
             self.advance();
         }
-        
+
         s.parse::<i64>()
             .map(Token::Integer)
             .map_err(|e| format!("Invalid integer: {}", e))
     }
-    
+
     fn skip_whitespace_except_newline(&mut self) {
         while !self.is_at_end() {
             let ch = self.peek();
@@ -239,13 +239,13 @@ impl Lexer {
             }
         }
     }
-    
+
     fn skip_comment(&mut self) {
         while !self.is_at_end() && self.peek() != '\n' {
             self.advance();
         }
     }
-    
+
     fn starts_with(&self, prefix: &str) -> bool {
         let chars: Vec<char> = prefix.chars().collect();
         for (i, &ch) in chars.iter().enumerate() {
@@ -255,7 +255,7 @@ impl Lexer {
         }
         true
     }
-    
+
     fn peek(&self) -> char {
         if self.is_at_end() {
             '\0'
@@ -263,7 +263,7 @@ impl Lexer {
             self.input[self.pos]
         }
     }
-    
+
     fn peek_ahead(&self, n: usize) -> char {
         if self.pos + n >= self.input.len() {
             '\0'
@@ -271,13 +271,13 @@ impl Lexer {
             self.input[self.pos + n]
         }
     }
-    
+
     fn advance(&mut self) {
         if !self.is_at_end() {
             self.pos += 1;
         }
     }
-    
+
     fn is_at_end(&self) -> bool {
         self.pos >= self.input.len()
     }
@@ -286,13 +286,13 @@ impl Lexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_basic_tokens() {
         let input = "function %f(i32) -> i32 {";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
-        
+
         assert_eq!(tokens[0], Token::Function);
         assert_eq!(tokens[1], Token::FuncName("f".to_string()));
         assert_eq!(tokens[2], Token::LParen);
@@ -302,13 +302,13 @@ mod tests {
         assert_eq!(tokens[6], Token::Type("i32".to_string()));
         assert_eq!(tokens[7], Token::LBrace);
     }
-    
+
     #[test]
     fn test_block_and_instruction() {
         let input = "block0(v0: i32):\n    v1 = iconst.i32 42";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
-        
+
         assert_eq!(tokens[0], Token::BlockName("block0".to_string()));
         assert_eq!(tokens[1], Token::LParen);
         assert_eq!(tokens[2], Token::Value("v0".to_string()));
@@ -321,15 +321,18 @@ mod tests {
         assert_eq!(tokens[9], Token::Equals);
         assert_eq!(tokens[10], Token::Opcode("iconst".to_string()));
     }
-    
+
     #[test]
     fn test_comment() {
         let input = "v1 = iconst.i32 1 ; this is a comment\nv2 = iadd v0, v1";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
-        
+
         // Comment should be converted to newline
-        let iadd_pos = tokens.iter().position(|t| matches!(t, Token::Opcode(s) if s == "iadd")).unwrap();
+        let iadd_pos = tokens
+            .iter()
+            .position(|t| matches!(t, Token::Opcode(s) if s == "iadd"))
+            .unwrap();
         assert!(iadd_pos > 0);
     }
 }
