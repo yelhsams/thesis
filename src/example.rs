@@ -1,14 +1,46 @@
 //! Complete example demonstrating the greenfield egraph pass
 //!
-//! This shows how to build a simple function, run the egraph pass,
+//! This shows how to parse CLIF IR, run the egraph pass,
 //! and see the optimization in action.
 
+use crate::clif_parser::*;
 use crate::egraph_pass::*;
 use crate::elaborate::*;
 use crate::support::*;
 use crate::types::*;
 
+/// Helper function to print optimization results
+fn print_optimization_result(
+    title: &str,
+    input: &str,
+    dfg: &DataFlowGraph,
+    layout: &Layout,
+    func_name: &str,
+    sig_params: &[Type],
+    sig_return: Option<Type>,
+) {
+    println!("\n{}", "=".repeat(70));
+    println!("{}", title);
+    println!("{}", "=".repeat(70));
+
+    println!("\nORIGINAL CLIF:");
+    println!("{}", "-".repeat(70));
+    println!("{}", input.trim());
+
+    println!("\n{}", "-".repeat(70));
+    println!("OPTIMIZED CLIF:");
+    println!("{}", "-".repeat(70));
+    let optimized = layout.display(dfg, func_name, sig_params, sig_return);
+    println!("{}", optimized);
+
+    println!("{}", "=".repeat(70));
+}
+
 /// Example 1: Simple algebraic optimization
+///
+/// Demonstrates:
+///   (x + 0) => x
+///   (x * 1) => x
 ///
 /// Original code:
 ///   x = param
@@ -20,67 +52,37 @@ use crate::types::*;
 ///   x = param
 ///   return x
 pub fn example_algebraic_simplification() {
-    let mut dfg = DataFlowGraph::new();
-    let mut layout = Layout::new();
+    let clif_input = r#"
+function %algebraic_simplify(i32) -> i32 {
+block0(v0: i32):
+    ; y = x + 0 (should simplify to x)
+    v1 = iconst.i32 0
+    v2 = iadd.i32 v0, v1
+    ; z = y * 1 (should simplify to y, which is x)
+    v3 = iconst.i32 1
+    v4 = imul.i32 v2, v3
+    return v4
+}
+"#;
 
-    // Create single block
-    let block_id = BlockId(0);
-    let mut block = Block::new(block_id);
+    println!("Example 1: Algebraic Simplification");
+    println!("===================================");
+    println!("Demonstrates: (x + 0) => x, (x * 1) => x\n");
 
-    // Block parameter: x
-    let x = dfg.make_block_param(block_id, 0, Type::I32);
-    block.params.push(x);
-
-    println!("Building IR:");
-    println!("  block0(x: i32):");
-
-    // Instruction: y = x + 0
-    let zero = {
-        let inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 0);
-        let inst_id = dfg.make_inst(inst);
-        println!("    v{} = iconst 0", inst_id.0);
-        block.insts.push(inst_id);
-        dfg.make_inst_result(inst_id, Type::I32)
-    };
-
-    let add_inst = Instruction::new(Opcode::Add, vec![x, zero], Type::I32);
-    let add_id = dfg.make_inst(add_inst);
-    let y = dfg.make_inst_result(add_id, Type::I32);
-    println!(
-        "    v{} = iadd x, v{}",
-        add_id.0,
-        dfg.insts.keys().next().unwrap().0
-    );
-    block.insts.push(add_id);
-
-    // Instruction: z = y * 1
-    let one = {
-        let inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 1);
-        let inst_id = dfg.make_inst(inst);
-        println!("    v{} = iconst 1", inst_id.0);
-        block.insts.push(inst_id);
-        dfg.make_inst_result(inst_id, Type::I32)
-    };
-
-    let mul_inst = Instruction::new(Opcode::Mul, vec![y, one], Type::I32);
-    let mul_id = dfg.make_inst(mul_inst);
-    let z = dfg.make_inst_result(mul_id, Type::I32);
-    println!("    v{} = imul v{}, v{}", mul_id.0, y.0, one.0);
-    block.insts.push(mul_id);
-
-    // Return z
-    let ret_inst = Instruction::new(Opcode::Return, vec![z], Type::I32);
-    let ret_id = dfg.make_inst(ret_inst);
-    println!("    return v{}", z.0);
-    block.terminator = Some(ret_id);
-    block.insts.push(ret_id);
-
-    layout.add_block(block);
-
-    // Run egraph pass
-    let domtree = DominatorTree::from_linear_blocks(&[block_id]);
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
+
+    print_optimization_result(
+        "Algebraic Simplification Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "algebraic_simplify",
+        &[Type::I32],
+        Some(Type::I32),
+    );
 
     println!("\n✓ After optimization, y and z should both simplify to x");
     println!("  (x + 0) => x");
@@ -88,6 +90,8 @@ pub fn example_algebraic_simplification() {
 }
 
 /// Example 2: GVN (Global Value Numbering)
+///
+/// Demonstrates deduplication of identical expressions.
 ///
 /// Original code:
 ///   x = param
@@ -102,201 +106,262 @@ pub fn example_algebraic_simplification() {
 ///   a = x + y
 ///   c = a + a  // b merged with a
 pub fn example_gvn() {
-    let mut dfg = DataFlowGraph::new();
-    let mut layout = Layout::new();
+    let clif_input = r#"
+function %gvn_test(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    ; a = x + y
+    v2 = iadd.i32 v0, v1
+    ; b = x + y (duplicate - should be merged with a)
+    v3 = iadd.i32 v0, v1
+    ; c = a + b (after GVN: c = a + a)
+    v4 = iadd.i32 v2, v3
+    return v4
+}
+"#;
 
-    let block_id = BlockId(0);
-    let mut block = Block::new(block_id);
+    println!("Example 2: Global Value Numbering (GVN)");
+    println!("=======================================");
+    println!("Demonstrates: Deduplication of identical expressions\n");
 
-    // Parameters
-    let x = dfg.make_block_param(block_id, 0, Type::I32);
-    let y = dfg.make_block_param(block_id, 1, Type::I32);
-    block.params.extend(&[x, y]);
-
-    println!("Building IR:");
-    println!("  block0(x: i32, y: i32):");
-
-    // a = x + y
-    let add1_inst = Instruction::new(Opcode::Add, vec![x, y], Type::I32);
-    let add1_id = dfg.make_inst(add1_inst);
-    let a = dfg.make_inst_result(add1_id, Type::I32);
-    println!("    v{} = iadd x, y", add1_id.0);
-    block.insts.push(add1_id);
-
-    // b = x + y (duplicate)
-    let add2_inst = Instruction::new(Opcode::Add, vec![x, y], Type::I32);
-    let add2_id = dfg.make_inst(add2_inst);
-    let b = dfg.make_inst_result(add2_id, Type::I32);
-    println!("    v{} = iadd x, y  // duplicate!", add2_id.0);
-    block.insts.push(add2_id);
-
-    // c = a + b
-    let add3_inst = Instruction::new(Opcode::Add, vec![a, b], Type::I32);
-    let add3_id = dfg.make_inst(add3_inst);
-    let c = dfg.make_inst_result(add3_id, Type::I32);
-    println!("    v{} = iadd v{}, v{}", add3_id.0, a.0, b.0);
-    block.insts.push(add3_id);
-
-    // Return c
-    let ret_inst = Instruction::new(Opcode::Return, vec![c], Type::I32);
-    let ret_id = dfg.make_inst(ret_inst);
-    println!("    return v{}", c.0);
-    block.terminator = Some(ret_id);
-    block.insts.push(ret_id);
-
-    layout.add_block(block);
-
-    let domtree = DominatorTree::from_linear_blocks(&[block_id]);
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
-    println!("\n✓ The second 'iadd x, y' should be deduplicated");
+    print_optimization_result(
+        "GVN Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "gvn_test",
+        &[Type::I32, Type::I32],
+        Some(Type::I32),
+    );
+
+    println!("\n✓ The second 'iadd v0, v1' should be deduplicated");
     println!("  b merged with a via GVN");
 }
 
 /// Example 3: Union nodes and cost-based extraction
 ///
 /// Shows how the egraph represents multiple equivalent forms
-/// and chooses the best one.
+/// and chooses the best one based on cost.
+///
+/// x + x (cost 1) vs x * 2 (cost 2)
+/// The elaborator should choose the cheaper form.
 pub fn example_union_and_extraction() {
-    let mut dfg = DataFlowGraph::new();
-    let mut layout = Layout::new();
+    let clif_input = r#"
+function %cost_extraction(i32) -> i32 {
+block0(v0: i32):
+    ; x + x (cost 1 - addition is cheaper)
+    v1 = iadd.i32 v0, v0
+    ; x * 2 (cost 2 - multiplication is more expensive)
+    v2 = iconst.i32 2
+    v3 = imul.i32 v0, v2
+    ; Return the first form; rewrite rules will create union
+    ; and elaborator will pick the cheaper equivalent
+    return v1
+}
+"#;
 
-    let block_id = BlockId(0);
-    let mut block = Block::new(block_id);
+    println!("Example 3: Union Nodes and Cost-Based Extraction");
+    println!("=================================================");
+    println!("Demonstrates: Multiple equivalent forms with cost-based selection\n");
+    println!("Cost model: iadd=1, imul=2\n");
 
-    let x = dfg.make_block_param(block_id, 0, Type::I32);
-    block.params.push(x);
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
 
-    println!("Building IR with equivalent expressions:");
-    println!("  block0(x: i32):");
+    // First run the pass to build the egraph
+    let mut pass = EgraphPass::new(dfg, layout, domtree);
+    pass.run();
 
-    // Create: x + x (cost 1)
-    let add_inst = Instruction::new(Opcode::Add, vec![x, x], Type::I32);
-    let add_id = dfg.make_inst(add_inst);
-    let add_val = dfg.make_inst_result(add_id, Type::I32);
-    println!("    v{} = iadd x, x  // cost 1", add_id.0);
-    block.insts.push(add_id);
-
-    // Create: x * 2 (cost 2)
-    let two = {
-        let inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 2);
-        let inst_id = dfg.make_inst(inst);
-        block.insts.push(inst_id);
-        dfg.make_inst_result(inst_id, Type::I32)
-    };
-
-    let mul_inst = Instruction::new(Opcode::Mul, vec![x, two], Type::I32);
-    let mul_id = dfg.make_inst(mul_inst);
-    let mul_val = dfg.make_inst_result(mul_id, Type::I32);
-    println!("    v{} = imul x, 2  // cost 2", mul_id.0);
-    block.insts.push(mul_id);
-
-    // Create union: these are semantically equivalent
-    let union = dfg.make_union(add_val, mul_val);
-    println!(
-        "    v{} = union(v{}, v{})  // equivalent expressions",
-        union.0, add_val.0, mul_val.0
+    print_optimization_result(
+        "Cost-Based Extraction Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "cost_extraction",
+        &[Type::I32],
+        Some(Type::I32),
     );
 
-    // Use the union
-    let ret_inst = Instruction::new(Opcode::Return, vec![union], Type::I32);
-    let ret_id = dfg.make_inst(ret_inst);
-    block.terminator = Some(ret_id);
-    block.insts.push(ret_id);
-
-    layout.add_block(block);
-
-    println!("\nRunning elaboration to pick best form...");
-
-    let domtree = DominatorTree::from_linear_blocks(&[block_id]);
-    let mut stats = Stats::default();
-    let mut elaborator = Elaborator::new(&mut dfg, &domtree, &mut stats);
-    elaborator.elaborate(&layout);
-
-    // Check which was chosen
-    let best = elaborator.get_best_inst(union);
     println!("\n✓ Elaborator should choose 'iadd' (cost 1) over 'imul' (cost 2)");
-    if let Some(inst_id) = best {
-        let inst = &dfg.insts[&inst_id];
-        println!("  Selected: {:?}", inst.opcode);
-    }
+    println!("  When x + x and x * 2 are in the same equivalence class,");
+    println!("  the cheaper addition is selected.");
 }
 
 /// Example 4: Scoped GVN (dominance-aware)
 ///
 /// Shows how GVN respects dominance through scoped hash maps.
+/// Values computed in dominating blocks can be reused in dominated blocks.
+///
+/// block0:
+///   a = x + y
+///   jump block1
+/// block1:
+///   b = x + y  // can reuse 'a' since block0 dominates block1
+///   return b
 pub fn example_scoped_gvn() {
-    let mut dfg = DataFlowGraph::new();
-    let mut layout = Layout::new();
+    let clif_input = r#"
+function %scoped_gvn(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    ; a = x + y (computed in entry block)
+    v2 = iadd.i32 v0, v1
+    jump block1
 
-    // Block 0 (entry)
-    let block0 = BlockId(0);
-    let mut block0_data = Block::new(block0);
-    let x = dfg.make_block_param(block0, 0, Type::I32);
-    let y = dfg.make_block_param(block0, 1, Type::I32);
-    block0_data.params.extend(&[x, y]);
+block1():
+    ; b = x + y (should merge with v2 from dominating block0)
+    v3 = iadd.i32 v0, v1
+    return v3
+}
+"#;
 
-    println!("Building CFG with multiple blocks:");
-    println!("  block0(x: i32, y: i32):");
+    println!("Example 4: Scoped GVN (Dominance-Aware)");
+    println!("=======================================");
+    println!("Demonstrates: GVN across blocks respecting dominance\n");
 
-    // a = x + y in block0
-    let add1_inst = Instruction::new(Opcode::Add, vec![x, y], Type::I32);
-    let add1_id = dfg.make_inst(add1_inst);
-    let _a = dfg.make_inst_result(add1_id, Type::I32);
-    println!("    v{} = iadd x, y", add1_id.0);
-    block0_data.insts.push(add1_id);
-
-    // Branch to block1
-    let br_inst = Instruction::new(Opcode::Branch, vec![], Type::I32);
-    let br_id = dfg.make_inst(br_inst);
-    println!("    jump block1");
-    block0_data.terminator = Some(br_id);
-    block0_data.insts.push(br_id);
-
-    layout.add_block(block0_data);
-
-    // Block 1 (child of block0)
-    let block1 = BlockId(1);
-    let mut block1_data = Block::new(block1);
-
-    println!("  block1:");
-
-    // b = x + y in block1 (should merge with a via scoped GVN)
-    let add2_inst = Instruction::new(Opcode::Add, vec![x, y], Type::I32);
-    let add2_id = dfg.make_inst(add2_inst);
-    let b = dfg.make_inst_result(add2_id, Type::I32);
-    println!(
-        "    v{} = iadd x, y  // should merge with block0's iadd",
-        add2_id.0
-    );
-    block1_data.insts.push(add2_id);
-
-    let ret_inst = Instruction::new(Opcode::Return, vec![b], Type::I32);
-    let ret_id = dfg.make_inst(ret_inst);
-    println!("    return v{}", b.0);
-    block1_data.terminator = Some(ret_id);
-    block1_data.insts.push(ret_id);
-
-    layout.add_block(block1_data);
-
-    let domtree = DominatorTree::from_linear_blocks(&[block0, block1]);
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
-    println!("\n✓ GVN should merge both 'iadd x, y' across blocks");
+    print_optimization_result(
+        "Scoped GVN Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "scoped_gvn",
+        &[Type::I32, Type::I32],
+        Some(Type::I32),
+    );
+
+    println!("\n✓ GVN should merge both 'iadd v0, v1' across blocks");
     println!("  Scoped hashmap ensures dominance is respected");
+    println!("  block1's 'v3 = iadd v0, v1' reuses v2 from block0");
+}
+
+/// Example 5: Strength Reduction
+///
+/// Demonstrates strength reduction where expensive operations
+/// are replaced with cheaper equivalents.
+///
+/// x * 2 => x + x (mul costs 2, add costs 1)
+pub fn example_strength_reduction() {
+    let clif_input = r#"
+function %strength_reduce(i32) -> i32 {
+block0(v0: i32):
+    ; x * 2 can be strength-reduced to x + x
+    v1 = iconst.i32 2
+    v2 = imul.i32 v0, v1
+    ; Use the result
+    v3 = iadd.i32 v2, v2
+    return v3
+}
+"#;
+
+    println!("Example 5: Strength Reduction");
+    println!("=============================");
+    println!("Demonstrates: x * 2 => x + x (cheaper equivalent)\n");
+
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let mut pass = EgraphPass::new(dfg, layout, domtree);
+    pass.run();
+
+    print_optimization_result(
+        "Strength Reduction Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "strength_reduce",
+        &[Type::I32],
+        Some(Type::I32),
+    );
+
+    println!("\n✓ Multiplication by 2 should be replaced with addition");
+    println!("  x * 2 => x + x (strength reduction)");
+}
+
+/// Example 6: Conditional Branch Optimization
+///
+/// Shows how self-comparisons can be optimized.
+/// x == x is always true.
+pub fn example_conditional_optimization() {
+    let clif_input = r#"
+function %self_compare(i32) -> i32 {
+block0(v0: i32):
+    ; x == x is always true
+    v1 = icmp.eq.i32 v0, v0
+    brif v1, block1, block2
+
+block1():
+    ; This branch is always taken
+    v2 = iconst.i32 42
+    return v2
+
+block2():
+    ; This branch is never taken (dead code)
+    v3 = iconst.i32 99
+    return v3
+}
+"#;
+
+    println!("Example 6: Conditional Branch Optimization");
+    println!("==========================================");
+    println!("Demonstrates: x == x => true (self-comparison)\n");
+
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let mut pass = EgraphPass::new(dfg, layout, domtree);
+    pass.run();
+
+    print_optimization_result(
+        "Self-Comparison Result",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "self_compare",
+        &[Type::I32],
+        Some(Type::I32),
+    );
+
+    println!("\n✓ Self-comparison 'v0 == v0' should simplify to true");
+    println!("  This enables dead code elimination of the false branch");
 }
 
 /// Run all examples
 pub fn run_all_examples() {
     println!("\n");
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║           E-GRAPH OPTIMIZATION PASS DEMONSTRATION                    ║");
+    println!("║                                                                      ║");
+    println!("║  This demo shows various compiler optimizations implemented using    ║");
+    println!("║  e-graphs (equivalence graphs) with pattern-based rewrite rules.     ║");
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
+    println!("\n");
 
     example_algebraic_simplification();
-    example_gvn();
-    example_union_and_extraction();
-    example_scoped_gvn();
+    println!("\n{}\n", "─".repeat(70));
 
+    example_gvn();
+    println!("\n{}\n", "─".repeat(70));
+
+    example_union_and_extraction();
+    println!("\n{}\n", "─".repeat(70));
+
+    example_scoped_gvn();
+    println!("\n{}\n", "─".repeat(70));
+
+    example_strength_reduction();
+    println!("\n{}\n", "─".repeat(70));
+
+    example_conditional_optimization();
+
+    println!("\n");
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║                     ALL EXAMPLES COMPLETED                           ║");
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!("\n");
 }
 
@@ -306,9 +371,58 @@ mod tests {
 
     #[test]
     fn test_all_examples() {
+        // Test that all examples parse and run without panicking
         example_algebraic_simplification();
         example_gvn();
         example_union_and_extraction();
         example_scoped_gvn();
+        example_strength_reduction();
+        example_conditional_optimization();
+    }
+
+    #[test]
+    fn test_algebraic_simplification_clif_parse() {
+        let clif_input = r#"
+function %test(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = iadd.i32 v0, v1
+    return v2
+}
+"#;
+        let result = parse_clif(clif_input);
+        assert!(result.is_ok(), "CLIF parsing should succeed");
+    }
+
+    #[test]
+    fn test_gvn_clif_parse() {
+        let clif_input = r#"
+function %test(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iadd.i32 v0, v1
+    v3 = iadd.i32 v0, v1
+    v4 = iadd.i32 v2, v3
+    return v4
+}
+"#;
+        let result = parse_clif(clif_input);
+        assert!(result.is_ok(), "CLIF parsing should succeed");
+    }
+
+    #[test]
+    fn test_multi_block_clif_parse() {
+        let clif_input = r#"
+function %test(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iadd.i32 v0, v1
+    jump block1
+
+block1():
+    v3 = iadd.i32 v0, v1
+    return v3
+}
+"#;
+        let result = parse_clif(clif_input);
+        assert!(result.is_ok(), "Multi-block CLIF parsing should succeed");
     }
 }
