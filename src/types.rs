@@ -10,7 +10,7 @@ use std::fmt;
 pub struct BlockId(pub u32);
 
 /// Instruction
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InstId(pub u32);
 
 /// Value (SSA value)

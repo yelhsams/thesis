@@ -134,7 +134,7 @@ impl EgraphPass {
     }
 
     /// Rebuild the layout to only include necessary instructions
-    fn rebuild_layout(&mut self, canonical_map: &HashMap<ValueId, ValueId>) {
+    fn rebuild_layout(&mut self, _canonical_map: &HashMap<ValueId, ValueId>) {
         println!("Rebuilding layout with canonical values...");
 
         // For each block, rebuild its instruction list
@@ -159,7 +159,8 @@ impl EgraphPass {
             }
 
             // Second pass: for each needed value, find the instruction that produces it
-            let mut pure_insts_to_add = Vec::new();
+            // We collect all pure instructions needed and their dependencies
+            let mut pure_insts_set = HashSet::new();
             let mut work_queue: Vec<ValueId> = needed_values.iter().copied().collect();
             let mut processed = HashSet::new();
 
@@ -174,7 +175,7 @@ impl EgraphPass {
 
                     // Only add pure instructions (skeleton ones are already added)
                     if inst.opcode.is_pure() {
-                        pure_insts_to_add.push(inst_id);
+                        pure_insts_set.insert(inst_id);
 
                         // This instruction's arguments are also needed
                         for &arg in &inst.args {
@@ -186,8 +187,12 @@ impl EgraphPass {
                 }
             }
 
+            // Third pass: topologically sort pure instructions
+            // An instruction must come after all instructions that define its arguments
+            let pure_insts_to_add = self.topological_sort_instructions(&pure_insts_set);
+
             // Combine pure and skeleton instructions
-            // Put pure instructions first, then skeleton (topological order handled implicitly)
+            // Pure instructions (in dependency order) first, then skeleton
             let mut new_insts = pure_insts_to_add;
             new_insts.extend(skeleton_insts);
 
@@ -204,6 +209,66 @@ impl EgraphPass {
         }
 
         println!();
+    }
+
+    /// Topologically sort instructions so that definitions come before uses
+    fn topological_sort_instructions(&self, inst_set: &HashSet<InstId>) -> Vec<InstId> {
+        // Build a map from value to the instruction that defines it
+        let mut value_to_inst: HashMap<ValueId, InstId> = HashMap::new();
+        for &inst_id in inst_set {
+            if let Some(result) = self.dfg.inst_results(inst_id).first() {
+                value_to_inst.insert(*result, inst_id);
+            }
+        }
+
+        // Build dependency graph: for each instruction, which instructions must come before it?
+        let mut in_degree: HashMap<InstId, usize> = HashMap::new();
+        let mut dependents: HashMap<InstId, Vec<InstId>> = HashMap::new();
+
+        for &inst_id in inst_set {
+            in_degree.entry(inst_id).or_insert(0);
+            dependents.entry(inst_id).or_insert_with(Vec::new);
+
+            let inst = &self.dfg.insts[&inst_id];
+            for &arg in &inst.args {
+                // If the argument is defined by an instruction in our set, add dependency
+                if let Some(&defining_inst) = value_to_inst.get(&arg) {
+                    if inst_set.contains(&defining_inst) && defining_inst != inst_id {
+                        *in_degree.entry(inst_id).or_insert(0) += 1;
+                        dependents.entry(defining_inst).or_insert_with(Vec::new).push(inst_id);
+                    }
+                }
+            }
+        }
+
+        // Kahn's algorithm for topological sort
+        let mut result = Vec::new();
+        let mut queue: Vec<InstId> = in_degree
+            .iter()
+            .filter(|(_, &degree)| degree == 0)
+            .map(|(&inst_id, _)| inst_id)
+            .collect();
+
+        // Sort the initial queue by InstId for deterministic output
+        queue.sort();
+
+        while let Some(inst_id) = queue.pop() {
+            result.push(inst_id);
+
+            if let Some(deps) = dependents.get(&inst_id) {
+                for &dependent in deps {
+                    if let Some(degree) = in_degree.get_mut(&dependent) {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            queue.push(dependent);
+                            queue.sort(); // Keep sorted for determinism
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
 
     /// Find the canonical (simplest/cheapest) representative of a value
