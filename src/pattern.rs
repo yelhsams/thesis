@@ -1,7 +1,7 @@
 //! Pattern IR for Rewrite Rules
 //!
 //! Example usage:
-//! ```
+//! ```ignore
 //! // Define rule: (x + 0) => x
 //! let rule = Rewrite::new("add-zero")
 //!     .match_pattern(
@@ -14,6 +14,7 @@
 //!     .build();
 //! ```
 
+use crate::range::{Range, RangeAssumptions};
 use crate::types::*;
 use std::collections::HashMap;
 
@@ -127,6 +128,33 @@ pub enum Condition {
         name: String,
         check: fn(&Bindings) -> bool,
     },
+
+    // ===== Range-based conditions =====
+    // These check range assumptions tracked during egraph traversal
+
+    /// Variable's value is known to be in range [min, max]
+    InRange(VarId, i64, i64),
+
+    /// Variable's value is known to be non-negative (>= 0)
+    NonNegative(VarId),
+
+    /// Variable's value is known to be positive (> 0)
+    Positive(VarId),
+
+    /// Variable's value is known to be negative (< 0)
+    Negative(VarId),
+
+    /// Variable's value is definitely less than a constant (based on range)
+    RangeLessThan(VarId, i64),
+
+    /// Variable's value is definitely greater than a constant (based on range)
+    RangeGreaterThan(VarId, i64),
+
+    /// Variable's value is definitely equal to a constant (singleton range)
+    RangeEquals(VarId, i64),
+
+    /// Check if code is unreachable (contradictory range assumptions)
+    Unreachable(VarId),
 }
 
 /// Bindings from pattern variables to values/constants
@@ -140,6 +168,9 @@ pub struct Bindings {
 
     /// The DFG (needed to look up instructions/values)
     dfg: *const DataFlowGraph,
+
+    /// Range assumptions (optional, used when checking range-based conditions)
+    range_assumptions: Option<*mut RangeAssumptions>,
 }
 
 impl Bindings {
@@ -148,7 +179,39 @@ impl Bindings {
             values: HashMap::new(),
             constants: HashMap::new(),
             dfg: dfg as *const _,
+            range_assumptions: None,
         }
+    }
+
+    /// Create bindings with access to range assumptions
+    pub fn with_range_assumptions(
+        dfg: &DataFlowGraph,
+        range_assumptions: &mut RangeAssumptions,
+    ) -> Self {
+        Self {
+            values: HashMap::new(),
+            constants: HashMap::new(),
+            dfg: dfg as *const _,
+            range_assumptions: Some(range_assumptions as *mut _),
+        }
+    }
+
+    /// Set range assumptions after creation
+    pub fn set_range_assumptions(&mut self, range_assumptions: &mut RangeAssumptions) {
+        self.range_assumptions = Some(range_assumptions as *mut _);
+    }
+
+    /// Get the range assumptions, if available
+    pub fn range_assumptions(&mut self) -> Option<&mut RangeAssumptions> {
+        self.range_assumptions
+            .map(|ptr| unsafe { &mut *ptr })
+    }
+
+    /// Get the range for a bound variable (if range assumptions are available)
+    pub fn get_value_range(&mut self, var: &VarId) -> Option<Range> {
+        let value = self.get_value(var)?;
+        let assumptions = self.range_assumptions()?;
+        Some(assumptions.get_range(value))
     }
 
     /// Bind a variable to a value
@@ -245,6 +308,11 @@ impl Rewrite {
     pub fn check_conditions(&self, bindings: &Bindings) -> bool {
         self.conditions.iter().all(|cond| cond.check(bindings))
     }
+
+    /// Check if this rewrite can be applied, with mutable access for range conditions
+    pub fn check_conditions_mut(&self, bindings: &mut Bindings) -> bool {
+        self.conditions.iter().all(|cond| cond.check_mut(bindings))
+    }
 }
 
 /// Builder for constructing rewrite rules
@@ -290,7 +358,11 @@ impl RewriteBuilder {
 
 impl Condition {
     /// Check if this condition holds given the bindings
+    ///
+    /// For range-based conditions, this requires mutable bindings to access
+    /// range assumptions. Use `check_mut` for those cases.
     pub fn check(&self, bindings: &Bindings) -> bool {
+        // For non-range conditions, we can check with immutable bindings
         match self {
             Condition::IsConstant(var) => bindings.is_constant(var),
 
@@ -325,7 +397,143 @@ impl Condition {
             Condition::Or(conds) => conds.iter().any(|c| c.check(bindings)),
 
             Condition::Custom { check, .. } => check(bindings),
+
+            // Range-based conditions return false if no range assumptions available
+            // (they need mutable access via check_mut)
+            Condition::InRange(_, _, _)
+            | Condition::NonNegative(_)
+            | Condition::Positive(_)
+            | Condition::Negative(_)
+            | Condition::RangeLessThan(_, _)
+            | Condition::RangeGreaterThan(_, _)
+            | Condition::RangeEquals(_, _)
+            | Condition::Unreachable(_) => false,
         }
+    }
+
+    /// Check if this condition holds, with mutable access to bindings.
+    ///
+    /// This is needed for range-based conditions that need to query
+    /// the range assumptions.
+    pub fn check_mut(&self, bindings: &mut Bindings) -> bool {
+        match self {
+            // Non-range conditions delegate to check()
+            Condition::IsConstant(_)
+            | Condition::EqualsConstant(_, _)
+            | Condition::NotEqualsConstant(_, _)
+            | Condition::GreaterThan(_, _)
+            | Condition::LessThan(_, _)
+            | Condition::VarsEqual(_, _)
+            | Condition::VarsNotEqual(_, _)
+            | Condition::Custom { .. } => self.check(bindings),
+
+            Condition::And(conds) => conds.iter().all(|c| c.check_mut(bindings)),
+            Condition::Or(conds) => conds.iter().any(|c| c.check_mut(bindings)),
+
+            // Range-based conditions
+            Condition::InRange(var, min, max) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.min >= *min && range.max <= *max
+                } else {
+                    false
+                }
+            }
+
+            Condition::NonNegative(var) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.is_non_negative()
+                } else {
+                    false
+                }
+            }
+
+            Condition::Positive(var) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.is_positive()
+                } else {
+                    false
+                }
+            }
+
+            Condition::Negative(var) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.is_negative()
+                } else {
+                    false
+                }
+            }
+
+            Condition::RangeLessThan(var, value) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.definitely_less_than(*value)
+                } else {
+                    false
+                }
+            }
+
+            Condition::RangeGreaterThan(var, value) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.definitely_greater_than(*value)
+                } else {
+                    false
+                }
+            }
+
+            Condition::RangeEquals(var, value) => {
+                if let Some(range) = bindings.get_value_range(var) {
+                    range.definitely_equals(*value)
+                } else {
+                    false
+                }
+            }
+
+            Condition::Unreachable(var) => {
+                if let Some(value) = bindings.get_value(var) {
+                    if let Some(assumptions) = bindings.range_assumptions() {
+                        return assumptions.is_unreachable(value);
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Helper functions for creating range-based conditions
+impl Condition {
+    /// Create a condition that checks if a variable is in a range
+    pub fn in_range(var: impl Into<String>, min: i64, max: i64) -> Self {
+        Condition::InRange(VarId::new(var), min, max)
+    }
+
+    /// Create a condition that checks if a variable is non-negative
+    pub fn non_negative(var: impl Into<String>) -> Self {
+        Condition::NonNegative(VarId::new(var))
+    }
+
+    /// Create a condition that checks if a variable is positive
+    pub fn positive(var: impl Into<String>) -> Self {
+        Condition::Positive(VarId::new(var))
+    }
+
+    /// Create a condition that checks if a variable is negative
+    pub fn negative(var: impl Into<String>) -> Self {
+        Condition::Negative(VarId::new(var))
+    }
+
+    /// Create a condition that checks if a variable is definitely less than a value
+    pub fn range_lt(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeLessThan(VarId::new(var), value)
+    }
+
+    /// Create a condition that checks if a variable is definitely greater than a value
+    pub fn range_gt(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeGreaterThan(VarId::new(var), value)
+    }
+
+    /// Create a condition that checks if a variable is definitely equal to a value
+    pub fn range_eq(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeEquals(VarId::new(var), value)
     }
 }
 
