@@ -6,6 +6,7 @@ pub mod elaborate;
 pub mod example;
 pub mod pattern;
 pub mod pattern_examples;
+pub mod range;
 pub mod rewrite_integration;
 pub mod support;
 pub mod types;
