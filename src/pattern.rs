@@ -14,6 +14,7 @@
 //!     .build();
 //! ```
 
+use crate::range::{Range, RangeAssumptions};
 use crate::types::*;
 use std::collections::HashMap;
 
@@ -127,6 +128,22 @@ pub enum Condition {
         name: String,
         check: fn(&Bindings) -> bool,
     },
+
+    InRange(VarId, i64, i64),
+
+    NonNegative(VarId),
+
+    Positive(VarId),
+
+    Negative(VarId),
+
+    RangeLessThan(VarId, i64),
+
+    RangeGreaterThan(VarId, i64),
+
+    RangeEquals(VarId, i64),
+
+    Unreachable(VarId),
 }
 
 /// Bindings from pattern variables to values/constants
@@ -140,6 +157,8 @@ pub struct Bindings {
 
     /// The DFG (needed to look up instructions/values)
     dfg: *const DataFlowGraph,
+
+    range_assumptions: Option<*const RangeAssumptions>,
 }
 
 impl Bindings {
@@ -148,7 +167,33 @@ impl Bindings {
             values: HashMap::new(),
             constants: HashMap::new(),
             dfg: dfg as *const _,
+            range_assumptions: None,
         }
+    }
+
+    pub fn with_range_assumptions(
+        dfg: &DataFlowGraph,
+        range_assumptions: &RangeAssumptions,
+    ) -> Self {
+        Self {
+            values: HashMap::new(),
+            constants: HashMap::new(),
+            dfg: dfg as *const _,
+            range_assumptions: Some(range_assumptions as *const _),
+        }
+    }
+
+    pub fn set_range_assumptions(&mut self, range_assumptions: &RangeAssumptions) {
+        self.range_assumptions = Some(range_assumptions as *const _);
+    }
+
+    pub fn range_assumptions(&self) -> Option<&RangeAssumptions> {
+        self.range_assumptions.map(|ptr| unsafe { &*ptr })
+    }
+
+    pub fn get_value_range(&self, var: &VarId) -> Option<Range> {
+        let value = self.get_value(var)?;
+        Some(self.range_assumptions()?.get_range(value))
     }
 
     /// Bind a variable to a value
@@ -245,6 +290,10 @@ impl Rewrite {
     pub fn check_conditions(&self, bindings: &Bindings) -> bool {
         self.conditions.iter().all(|cond| cond.check(bindings))
     }
+
+    pub fn check_conditions_mut(&self, bindings: &mut Bindings) -> bool {
+        self.conditions.iter().all(|cond| cond.check_mut(bindings))
+    }
 }
 
 /// Builder for constructing rewrite rules
@@ -325,7 +374,72 @@ impl Condition {
             Condition::Or(conds) => conds.iter().any(|c| c.check(bindings)),
 
             Condition::Custom { check, .. } => check(bindings),
+            Condition::InRange(var, min, max) => bindings
+                .get_value_range(var)
+                .map(|r| r.min >= *min && r.max <= *max)
+                .unwrap_or(false),
+
+            Condition::NonNegative(var) => bindings
+                .get_value_range(var)
+                .map(|r| r.is_non_negative())
+                .unwrap_or(false),
+
+            Condition::Positive(var) => bindings
+                .get_value_range(var)
+                .map(|r| r.is_positive())
+                .unwrap_or(false),
+
+            Condition::Negative(var) => bindings
+                .get_value_range(var)
+                .map(|r| r.is_negative())
+                .unwrap_or(false),
+
+            Condition::RangeLessThan(var, value) => bindings
+                .get_value_range(var)
+                .map(|r| r.definitely_less_than(*value))
+                .unwrap_or(false),
+
+            Condition::RangeGreaterThan(var, value) => bindings
+                .get_value_range(var)
+                .map(|r| r.definitely_greater_than(*value))
+                .unwrap_or(false),
+
+            Condition::RangeEquals(var, value) => bindings
+                .get_value_range(var)
+                .map(|r| r.definitely_equals(*value))
+                .unwrap_or(false),
+
+            Condition::Unreachable(var) => bindings
+                .get_value(var)
+                .and_then(|v| bindings.range_assumptions().map(|a| a.is_unreachable(v)))
+                .unwrap_or(false),
         }
+    }
+
+    pub fn check_mut(&self, bindings: &mut Bindings) -> bool {
+        self.check(bindings)
+    }
+
+    pub fn in_range(var: impl Into<String>, min: i64, max: i64) -> Self {
+        Condition::InRange(VarId::new(var), min, max)
+    }
+    pub fn non_negative(var: impl Into<String>) -> Self {
+        Condition::NonNegative(VarId::new(var))
+    }
+    pub fn positive(var: impl Into<String>) -> Self {
+        Condition::Positive(VarId::new(var))
+    }
+    pub fn negative(var: impl Into<String>) -> Self {
+        Condition::Negative(VarId::new(var))
+    }
+    pub fn range_lt(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeLessThan(VarId::new(var), value)
+    }
+    pub fn range_gt(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeGreaterThan(VarId::new(var), value)
+    }
+    pub fn range_eq(var: impl Into<String>, value: i64) -> Self {
+        Condition::RangeEquals(VarId::new(var), value)
     }
 }
 

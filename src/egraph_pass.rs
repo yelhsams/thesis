@@ -6,6 +6,7 @@
 //! 3. Elaborates (extracts) the best version back into the CFG
 
 use crate::pattern::*;
+use crate::range::{learn_from_comparison, RangeAssumptions};
 use crate::rewrite_integration::*;
 use crate::support::*;
 use crate::types::*;
@@ -34,6 +35,8 @@ pub struct EgraphPass {
 
     /// GVN mapping from original values to optimized values
     gvn_mapping: HashMap<ValueId, ValueId>,
+
+    pub range_assumptions: RangeAssumptions,
 }
 
 impl EgraphPass {
@@ -45,7 +48,17 @@ impl EgraphPass {
             stats: Stats::default(),
             rewrite_engine: RewriteEngine::with_standard_library(),
             gvn_mapping: HashMap::new(),
+            range_assumptions: RangeAssumptions::new(),
         }
+    }
+
+    pub fn assume_range(&mut self, value: ValueId, min: i64, max: i64) {
+        self.range_assumptions
+            .assume_range(value, crate::range::Range::new(min, max));
+    }
+
+    pub fn get_range(&mut self, value: ValueId) -> crate::range::Range {
+        self.range_assumptions.get_range(value)
     }
 
     /// Run the complete egraph pass
@@ -467,6 +480,63 @@ impl EgraphPass {
 
         let remat_values: HashSet<ValueId> = HashSet::new();
 
+        let mut branch_conditions: HashMap<BlockId, Vec<(ValueId, Option<i64>, Opcode, bool)>> =
+            HashMap::new();
+
+        // Pre-compute branch conditions for each block by scanning all blocks
+        for &block_id in &self.layout.blocks {
+            let block = &self.layout.block_data[&block_id];
+            for &inst_id in &block.insts {
+                let inst = &self.dfg.insts[&inst_id];
+                if inst.opcode == Opcode::CondBranch {
+                    if let Some(BranchInfo::Conditional(then_block, _, else_block, _)) =
+                        &inst.branch_info
+                    {
+                        // Get the condition value (first arg)
+                        if !inst.args.is_empty() {
+                            let cond_value = inst.args[0];
+
+                            // Try to find if the condition is a comparison
+                            if let ValueDef::Inst(cond_inst_id) = self.dfg.value_def(cond_value) {
+                                let cond_inst = &self.dfg.insts[&cond_inst_id];
+                                if cond_inst.opcode.is_comparison() {
+                                    // Get the LHS and see if RHS is a constant
+                                    let lhs = cond_inst.args.get(0).copied();
+                                    let rhs_const = cond_inst.args.get(1).and_then(|&rhs| {
+                                        if let ValueDef::Inst(rhs_inst) = self.dfg.value_def(rhs) {
+                                            let rhs_inst = &self.dfg.insts[&rhs_inst];
+                                            if rhs_inst.opcode == Opcode::Const {
+                                                return rhs_inst.immediate;
+                                            }
+                                        }
+                                        None
+                                    });
+
+                                    if let Some(lhs) = lhs {
+                                        // For then block, condition is true
+                                        branch_conditions.entry(*then_block).or_default().push((
+                                            lhs,
+                                            rhs_const,
+                                            cond_inst.opcode,
+                                            true,
+                                        ));
+
+                                        // For else block, condition is false
+                                        branch_conditions.entry(*else_block).or_default().push((
+                                            lhs,
+                                            rhs_const,
+                                            cond_inst.opcode,
+                                            false,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let root = self.layout.entry_block().unwrap();
 
         enum StackEntry {
@@ -488,6 +558,21 @@ impl EgraphPass {
 
                     gvn_map.increment_depth();
                     gvn_map_blocks.push(block);
+
+                    // Push scope for range assumptions
+                    self.range_assumptions.push_scope();
+
+                    // Learn range facts from branch conditions that lead to this block
+                    if let Some(conditions) = branch_conditions.get(&block) {
+                        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+                            let facts =
+                                learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
+                            for (value, range) in facts {
+                                println!("    Learning range fact: {:?} in {}", value, range);
+                                self.range_assumptions.assume_range(value, range);
+                            }
+                        }
+                    }
 
                     let block_data = self.layout.block_data[&block].clone();
                     for &param in &block_data.params {
@@ -523,6 +608,7 @@ impl EgraphPass {
                             rewrite_depth: 0,
                             subsume_values: HashSet::new(),
                             rewrite_engine: &mut self.rewrite_engine,
+                            range_assumptions: &mut self.range_assumptions,
                         };
 
                         if rewritten_inst.opcode.is_pure() {
@@ -538,6 +624,7 @@ impl EgraphPass {
                 StackEntry::Pop => {
                     gvn_map.decrement_depth();
                     gvn_map_blocks.pop();
+                    self.range_assumptions.pop_scope();
                 }
             }
         }
@@ -560,6 +647,7 @@ struct OptimizeCtx<'a> {
     rewrite_depth: usize,
     subsume_values: HashSet<ValueId>,
     rewrite_engine: &'a mut RewriteEngine,
+    range_assumptions: &'a mut RangeAssumptions,
 }
 
 impl<'a> OptimizeCtx<'a> {

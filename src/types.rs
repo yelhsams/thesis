@@ -125,6 +125,23 @@ impl Opcode {
     pub fn is_mergeable(self) -> bool {
         matches!(self, Opcode::Trap | Opcode::Div)
     }
+
+    /// Returns true if this is a comparison operation
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Opcode::Eq
+                | Opcode::Ne
+                | Opcode::Slt
+                | Opcode::Sle
+                | Opcode::Sgt
+                | Opcode::Sge
+                | Opcode::Ult
+                | Opcode::Ule
+                | Opcode::Ugt
+                | Opcode::Uge
+        )
+    }
 }
 
 /// Branch target information for control flow instructions

@@ -19,6 +19,7 @@ pub use elaborate::*;
 pub use example::*;
 pub use pattern::*;
 pub use pattern_examples::*;
+pub use range::*;
 pub use rewrite_integration::*;
 pub use support::*;
 pub use types::*;
