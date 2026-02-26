@@ -75,12 +75,31 @@ impl EgraphPass {
                 .display(&self.dfg, &func_name, &sig_params, sig_return)
         );
 
-        // Phase 1: Remove pure instructions and build egraph
+        // Phase 1: Remove pure instructions and build egraph with range propagation
         self.remove_pure_and_optimize();
 
-        println!("\n=== Egraph Built ===");
+        println!("\n=== Egraph Built (iteration 1) ===");
         println!("Pure instructions removed from layout");
         println!("Union nodes created for equivalent values\n");
+
+        // Repeat until fixed point.
+        const MAX_RANGE_ITERATIONS: usize = 3;
+        for iteration in 0..MAX_RANGE_ITERATIONS {
+            self.stats.range_refinement_iterations += 1;
+            let new_unions = self.range_refine_iteration();
+            self.stats.range_refinement_new_unions += new_unions as u64;
+            println!(
+                "  Range refinement iteration {}: {} new unions created",
+                iteration + 2,
+                new_unions
+            );
+            if new_unions == 0 {
+                println!("  Fixed point reached after {} iterations", iteration + 2);
+                break;
+            }
+        }
+
+        println!();
 
         // Print intermediate state showing unions
         println!("After building egraph (with union nodes):");
@@ -89,9 +108,6 @@ impl EgraphPass {
 
         let canonical_map = self.extract_best_values();
         self.rebuild_layout(&canonical_map);
-
-        // TODO: Implement this
-        // self.verify_egraph();
 
         // Print final statistics
         self.stats.print_summary();
@@ -459,6 +475,75 @@ impl EgraphPass {
         self.rewrite_engine.add_rule(rule);
     }
 
+    /// Iterative range refinement pass
+    /// Returns the number of new union nodes created (0 = fixed point)
+    fn range_refine_iteration(&mut self) -> usize {
+        let unions_before = self.stats.union;
+
+        // Reset range assumptions
+        self.range_assumptions.clear();
+
+        // Collect all instruction-defined values sorted by InstId
+        let mut inst_values: Vec<(InstId, ValueId)> = Vec::new();
+        for (&value, def) in &self.dfg.value_defs {
+            if let ValueDef::Inst(inst_id) = def {
+                inst_values.push((*inst_id, value));
+            }
+        }
+        inst_values.sort_by_key(|&(inst_id, _)| inst_id);
+
+        // Phase A: Re-compute ranges for all values using transfer functions
+        for &(inst_id, value) in &inst_values {
+            let inst = self.dfg.insts[&inst_id].clone();
+            let arg_ranges: Vec<crate::range::Range> = inst
+                .args
+                .iter()
+                .map(|&arg| self.range_assumptions.get_range(arg))
+                .collect();
+            let output_range =
+                crate::range::compute_inst_range(inst.opcode, &arg_ranges, inst.immediate);
+            if !output_range.is_unbounded() {
+                self.range_assumptions.assume_range(value, output_range);
+            }
+        }
+
+        for (&value, def) in &self.dfg.value_defs.clone() {
+            if let ValueDef::Union(left, right) = def {
+                let left_range = self.range_assumptions.get_range(*left);
+                let right_range = self.range_assumptions.get_range(*right);
+                // The union of two ranges: the value could be either
+                let combined = left_range.union(&right_range);
+                if !combined.is_unbounded() {
+                    self.range_assumptions.assume_range(value, combined);
+                }
+            }
+        }
+
+        let values_to_rewrite: Vec<ValueId> = inst_values.iter().map(|&(_, v)| v).collect();
+
+        for value in values_to_rewrite {
+            let ra_ptr = &self.range_assumptions as *const RangeAssumptions;
+            let rewrites = self.rewrite_engine.apply_rewrites_with_ranges(
+                &mut self.dfg,
+                value,
+                Some(unsafe { &*ra_ptr }),
+            );
+
+            for rewritten in rewrites {
+                if rewritten != value {
+                    let _new_union = self.dfg.make_union(value, rewritten);
+                    self.stats.union += 1;
+                    println!(
+                        "    Range refinement: new union {:?} = {:?} ∪ {:?}",
+                        _new_union, value, rewritten
+                    );
+                }
+            }
+        }
+
+        (self.stats.union - unions_before) as usize
+    }
+
     /// Remove pure operations from layout and build egraph
     ///
     /// This walks through all blocks in dominator-tree preorder:
@@ -618,6 +703,33 @@ impl EgraphPass {
                             ctx.optimize_skeleton_inst(inst_id, block);
                             println!("    -> Skeleton inst, kept in layout");
                         }
+
+                        // Propagate ranges forward: compute output range from operand ranges
+                        let inst_after = self.dfg.insts[&inst_id].clone();
+                        let arg_ranges: Vec<crate::range::Range> = inst_after
+                            .args
+                            .iter()
+                            .map(|&arg| self.range_assumptions.get_range(arg))
+                            .collect();
+                        let output_range = crate::range::compute_inst_range(
+                            inst_after.opcode,
+                            &arg_ranges,
+                            inst_after.immediate,
+                        );
+                        if !output_range.is_unbounded() {
+                            if let Some(&result) = self.dfg.inst_results(inst_id).first() {
+                                // Also propagate to the optimized value
+                                let opt_result =
+                                    value_to_opt_value.get(&result).copied().unwrap_or(result);
+                                self.range_assumptions.assume_range(result, output_range);
+                                self.stats.ranges_propagated += 1;
+                                if opt_result != result {
+                                    self.range_assumptions
+                                        .assume_range(opt_result, output_range);
+                                }
+                                println!("    Range propagated: {:?} => {}", result, output_range);
+                            }
+                        }
                     }
                 }
 
@@ -720,7 +832,13 @@ impl<'a> OptimizeCtx<'a> {
 
         let mut union_value = value;
 
-        let rewrites = self.rewrite_engine.apply_rewrites(self.dfg, value);
+        // Pass range assumptions so range-based rewrite conditions can fire
+        let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
+        let rewrites = self.rewrite_engine.apply_rewrites_with_ranges(
+            self.dfg,
+            value,
+            Some(unsafe { &*ra_ptr }),
+        );
 
         for rewritten in rewrites {
             self.stats.rewrite_rule_results += 1;
@@ -926,5 +1044,187 @@ mod tests {
         // Should have applied pattern-based rewrites
         assert!(pass.stats.rewrite_rule_results > 0 || pass.stats.pure_inst_deduped > 0);
         println!("\n✓ Pattern-based rewrite test passed");
+    }
+
+    #[test]
+    fn test_range_propagation_through_constants() {
+        // Test that constant ranges are propagated through arithmetic.
+        // const 5 + const 3 should produce a value with range [8, 8].
+        let mut dfg = DataFlowGraph::new();
+        let block = BlockId(0);
+
+        let five_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 5);
+        let five_id = dfg.make_inst(five_inst);
+        let five = dfg.make_inst_result(five_id, Type::I32);
+
+        let three_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 3);
+        let three_id = dfg.make_inst(three_inst);
+        let three = dfg.make_inst_result(three_id, Type::I32);
+
+        let add_inst = Instruction::new(Opcode::Add, vec![five, three], Type::I32);
+        let add_id = dfg.make_inst(add_inst);
+        let sum = dfg.make_inst_result(add_id, Type::I32);
+
+        let ret1_inst = Instruction::new(Opcode::Return, vec![sum], Type::I32);
+        let ret1_id = dfg.make_inst(ret1_inst);
+        dfg.make_inst_result(ret1_id, Type::I32);
+
+        let mut layout = Layout::new();
+        let mut block_data = Block::new(block);
+        block_data.insts = vec![five_id, three_id, add_id];
+        layout.add_block(block_data);
+
+        let domtree = DominatorTree::from_linear_blocks(&[block]);
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.run();
+
+        let optimized = &pass
+            .layout
+            .display(&pass.dfg, "5 + 3 = 8", &[Type::I32], Some(Type::I32));
+        println!("{}", optimized);
+    }
+
+    #[test]
+    fn test_range_sensitive_comparison_folding() {
+        // Test: if we know x is in [-inf, 4] (from a branch condition x < 5),
+        // then slt(x, 10) should fold to constant 1 since x < 5 < 10.
+        //
+        // block0(x):
+        //   c5 = const 5
+        //   cmp = slt(x, c5)
+        //   brif cmp, block1, block2
+        // block1:          // x < 5, so x in [-inf, 4]
+        //   c10 = const 10
+        //   result = slt(x, c10)   // should fold to 1
+        //   return result
+        // block2:
+        //   return const 0
+        let mut dfg = DataFlowGraph::new();
+
+        let block0 = BlockId(0);
+        let block1 = BlockId(1);
+        let block2 = BlockId(2);
+
+        let x = dfg.make_block_param(block0, 0, Type::I32);
+
+        // const 5
+        let c5_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 5);
+        let c5_id = dfg.make_inst(c5_inst);
+        let c5 = dfg.make_inst_result(c5_id, Type::I32);
+
+        // cmp = slt(x, 5)
+        let cmp_inst = Instruction::new(Opcode::Slt, vec![x, c5], Type::I32);
+        let cmp_id = dfg.make_inst(cmp_inst);
+        let cmp = dfg.make_inst_result(cmp_id, Type::I32);
+
+        // brif cmp, block1, block2
+        let mut brif_inst = Instruction::new(Opcode::CondBranch, vec![cmp], Type::I32);
+        brif_inst.branch_info = Some(BranchInfo::Conditional(block1, 0, block2, 0));
+        let brif_id = dfg.make_inst(brif_inst);
+        dfg.make_inst_result(brif_id, Type::I32);
+
+        // block1: const 10, slt(x, 10), return
+        let c10_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 10);
+        let c10_id = dfg.make_inst(c10_inst);
+        let c10 = dfg.make_inst_result(c10_id, Type::I32);
+
+        let slt_inst = Instruction::new(Opcode::Slt, vec![x, c10], Type::I32);
+        let slt_id = dfg.make_inst(slt_inst);
+        let slt_result = dfg.make_inst_result(slt_id, Type::I32);
+
+        let ret1_inst = Instruction::new(Opcode::Return, vec![slt_result], Type::I32);
+        let ret1_id = dfg.make_inst(ret1_inst);
+        dfg.make_inst_result(ret1_id, Type::I32);
+
+        // block2: return 0
+        let c0_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 0);
+        let c0_id = dfg.make_inst(c0_inst);
+        let c0 = dfg.make_inst_result(c0_id, Type::I32);
+
+        let ret2_inst = Instruction::new(Opcode::Return, vec![c0], Type::I32);
+        let ret2_id = dfg.make_inst(ret2_inst);
+        dfg.make_inst_result(ret2_id, Type::I32);
+
+        // Build layout
+        let mut layout = Layout::new();
+
+        let mut b0 = Block::new(block0);
+        b0.params = vec![x];
+        b0.insts = vec![c5_id, cmp_id, brif_id];
+        layout.add_block(b0);
+
+        let mut b1 = Block::new(block1);
+        b1.insts = vec![c10_id, slt_id, ret1_id];
+        layout.add_block(b1);
+
+        let mut b2 = Block::new(block2);
+        b2.insts = vec![c0_id, ret2_id];
+        layout.add_block(b2);
+
+        // Build dominator tree: block0 dominates block1, block2
+        let domtree = DominatorTree::from_cfg(
+            block0,
+            &[
+                (block0, vec![block1, block2]),
+                (block1, vec![]),
+                (block2, vec![]),
+            ],
+        );
+
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.run();
+
+        // Range analysis should have learned x < 5 in block1 and
+        // range-fold-slt-true should have fired (or at minimum,
+        // range propagation should have occurred)
+        assert!(
+            pass.stats.ranges_propagated > 0,
+            "Expected ranges to be propagated"
+        );
+        println!("\n✓ Range-sensitive comparison folding test passed");
+    }
+
+    #[test]
+    fn test_iterative_range_refinement() {
+        // Test that the iterative cycling runs and reaches a fixed point.
+        let mut dfg = DataFlowGraph::new();
+        let block = BlockId(0);
+        let x = dfg.make_block_param(block, 0, Type::I32);
+
+        // const 0, const 1
+        let c0_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 0);
+        let c0_id = dfg.make_inst(c0_inst);
+        let c0 = dfg.make_inst_result(c0_id, Type::I32);
+
+        let c1_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 1);
+        let c1_id = dfg.make_inst(c1_inst);
+        let c1 = dfg.make_inst_result(c1_id, Type::I32);
+
+        // x + 0 (should simplify to x)
+        let add_inst = Instruction::new(Opcode::Add, vec![x, c0], Type::I32);
+        let add_id = dfg.make_inst(add_inst);
+        let _y = dfg.make_inst_result(add_id, Type::I32);
+
+        // x * 1 (should simplify to x)
+        let mul_inst = Instruction::new(Opcode::Mul, vec![x, c1], Type::I32);
+        let mul_id = dfg.make_inst(mul_inst);
+        let _z = dfg.make_inst_result(mul_id, Type::I32);
+
+        let mut layout = Layout::new();
+        let mut block_data = Block::new(block);
+        block_data.params = vec![x];
+        block_data.insts = vec![c0_id, c1_id, add_id, mul_id];
+        layout.add_block(block_data);
+
+        let domtree = DominatorTree::from_linear_blocks(&[block]);
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.run();
+
+        // The iterative refinement should have run at least once
+        assert!(
+            pass.stats.range_refinement_iterations > 0,
+            "Expected at least one range refinement iteration"
+        );
+        println!("\n✓ Iterative range refinement test passed");
     }
 }

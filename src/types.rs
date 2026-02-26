@@ -574,6 +574,9 @@ pub struct Stats {
     pub elaborate_visit_node: u64,
     pub elaborate_memoize_hit: u64,
     pub elaborate_memoize_miss: u64,
+    pub range_refinement_iterations: u64,
+    pub range_refinement_new_unions: u64,
+    pub ranges_propagated: u64,
 }
 
 impl Stats {
@@ -587,6 +590,18 @@ impl Stats {
         println!("Union nodes created: {}", self.union);
         println!("Rewrite rules invoked: {}", self.rewrite_rule_invoked);
         println!("Rewrite results: {}", self.rewrite_rule_results);
+        if self.range_refinement_iterations > 0 || self.ranges_propagated > 0 {
+            println!("Range analysis:");
+            println!("  - Ranges propagated: {}", self.ranges_propagated);
+            println!(
+                "  - Refinement iterations: {}",
+                self.range_refinement_iterations
+            );
+            println!(
+                "  - New unions from refinement: {}",
+                self.range_refinement_new_unions
+            );
+        }
     }
 }
 

@@ -1186,6 +1186,163 @@ impl RewriteLibrary {
                 .build(),
         );
 
+        // ===== Range-sensitive rewrite rules =====
+        // These rules only fire when range analysis can prove preconditions.
+
+        // Signed division by power-of-2 -> unsigned right shift
+        // when x is known non-negative: sdiv(x, 2) => ushr(x, 1)
+        rules.push(
+            Rewrite::new("range-sdiv-pow2-to-ushr-1")
+                .match_pattern(Pattern::op(
+                    Opcode::Div,
+                    vec![Pattern::var("x"), Pattern::constant(2)],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Ushr,
+                    vec![Pattern::var("x"), Pattern::constant(1)],
+                ))
+                .when(Condition::non_negative("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("range-sdiv-pow2-to-ushr-2")
+                .match_pattern(Pattern::op(
+                    Opcode::Div,
+                    vec![Pattern::var("x"), Pattern::constant(4)],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Ushr,
+                    vec![Pattern::var("x"), Pattern::constant(2)],
+                ))
+                .when(Condition::non_negative("x"))
+                .build(),
+        );
+
+        rules.push(
+            Rewrite::new("range-sdiv-pow2-to-ushr-3")
+                .match_pattern(Pattern::op(
+                    Opcode::Div,
+                    vec![Pattern::var("x"), Pattern::constant(8)],
+                ))
+                .produce(Pattern::op(
+                    Opcode::Ushr,
+                    vec![Pattern::var("x"), Pattern::constant(3)],
+                ))
+                .when(Condition::non_negative("x"))
+                .build(),
+        );
+
+        // Known-true comparison elimination: slt(x, C) => 1
+        // when range proves x is definitely less than C.
+        // (These require range_lt/range_gt conditions.)
+        rules.push(
+            Rewrite::new("range-fold-slt-true")
+                .match_pattern(Pattern::op(
+                    Opcode::Slt,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(1))
+                .when(Condition::Custom {
+                    name: "x-range-lt-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_less_than(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-false comparison elimination: slt(x, C) => 0
+        // when range proves x >= C.
+        rules.push(
+            Rewrite::new("range-fold-slt-false")
+                .match_pattern(Pattern::op(
+                    Opcode::Slt,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(0))
+                .when(Condition::Custom {
+                    name: "x-range-ge-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_ge(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-true sle: sle(x, C) => 1 when x.max <= C
+        rules.push(
+            Rewrite::new("range-fold-sle-true")
+                .match_pattern(Pattern::op(
+                    Opcode::Sle,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(1))
+                .when(Condition::Custom {
+                    name: "x-range-le-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_le(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-false sle: sle(x, C) => 0 when x.min > C
+        rules.push(
+            Rewrite::new("range-fold-sle-false")
+                .match_pattern(Pattern::op(
+                    Opcode::Sle,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(0))
+                .when(Condition::Custom {
+                    name: "x-range-gt-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_greater_than(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Range-based constant propagation: if range is a singleton, replace with constant
+        // This is handled implicitly by compute_inst_range + the egraph,
+        // but we add explicit rules for key patterns:
+
+        // Redundant comparison after bounds check:
+        // If x is in [0, C-1] (from a branch condition), then slt(x, C) is always true
+        // This is already covered by range-fold-slt-true above.
+
+        // Non-negative x: sub(0, sub(0, x)) => x (double negate identity, but
+        // with the knowledge that abs(x) = x when x >= 0, we can simplify)
+
         Self { rules }
     }
 

@@ -149,6 +149,96 @@ impl Range {
     pub fn definitely_not_equals(&self, value: i64) -> bool {
         self.max < value || self.min > value
     }
+
+    // --- Range arithmetic (transfer functions) ---
+
+    /// Compute the range of (self + other), saturating on overflow.
+    pub fn add(&self, other: &Range) -> Range {
+        Range {
+            min: self.min.saturating_add(other.min),
+            max: self.max.saturating_add(other.max),
+        }
+    }
+
+    /// Compute the range of (self - other), saturating on overflow.
+    pub fn sub(&self, other: &Range) -> Range {
+        Range {
+            min: self.min.saturating_sub(other.max),
+            max: self.max.saturating_sub(other.min),
+        }
+    }
+
+    /// Compute the range of (self * other), saturating on overflow.
+    pub fn mul(&self, other: &Range) -> Range {
+        let products = [
+            self.min.saturating_mul(other.min),
+            self.min.saturating_mul(other.max),
+            self.max.saturating_mul(other.min),
+            self.max.saturating_mul(other.max),
+        ];
+        Range {
+            min: *products.iter().min().unwrap(),
+            max: *products.iter().max().unwrap(),
+        }
+    }
+
+    /// Compute the range of a bitwise AND. Conservative: if both non-negative,
+    /// result is in [0, min(self.max, other.max)].
+    pub fn bitand(&self, other: &Range) -> Range {
+        if self.is_non_negative() && other.is_non_negative() {
+            Range::new(0, self.max.min(other.max))
+        } else {
+            Range::unbounded()
+        }
+    }
+
+    /// Compute the range of a bitwise OR. Conservative.
+    pub fn bitor(&self, other: &Range) -> Range {
+        if self.is_non_negative() && other.is_non_negative() {
+            // Upper bound: next power of two above max of both, minus 1
+            let upper = self.max.max(other.max) as u64;
+            let bound = upper
+                .checked_next_power_of_two()
+                .unwrap_or(u64::MAX)
+                .saturating_sub(1)
+                .max(upper);
+            Range::new(0, bound.min(i64::MAX as u64) as i64)
+        } else {
+            Range::unbounded()
+        }
+    }
+
+    /// Compute the range of a negation (-self).
+    pub fn neg(&self) -> Range {
+        // -[a, b] = [-b, -a], with saturation for i64::MIN
+        Range {
+            min: 0i64.saturating_sub(self.max),
+            max: 0i64.saturating_sub(self.min),
+        }
+    }
+
+    /// Compute the range of a left shift by a constant amount.
+    pub fn shl_const(&self, amount: i64) -> Range {
+        if amount < 0 || amount >= 63 {
+            return Range::unbounded();
+        }
+        Range {
+            min: self.min.saturating_mul(1i64.wrapping_shl(amount as u32)),
+            max: self.max.saturating_mul(1i64.wrapping_shl(amount as u32)),
+        }
+    }
+
+    /// Compute the range of an arithmetic right shift by a constant.
+    pub fn sshr_const(&self, amount: i64) -> Range {
+        if amount < 0 || amount >= 63 {
+            return Range::unbounded();
+        }
+        let shift = amount as u32;
+        Range {
+            min: self.min >> shift,
+            max: self.max >> shift,
+        }
+    }
 }
 
 impl Default for Range {
@@ -330,6 +420,134 @@ pub struct RangeAssumptionsStats {
     pub total_assumptions: usize,
     pub current_depth: usize,
     pub unique_values: usize,
+}
+
+/// Compute the output range of an instruction given the ranges of its inputs.
+///
+/// This is the core transfer function that propagates range information
+/// forward through arithmetic and logical operations.
+pub fn compute_inst_range(
+    opcode: crate::types::Opcode,
+    arg_ranges: &[Range],
+    immediate: Option<i64>,
+) -> Range {
+    use crate::types::Opcode;
+
+    match opcode {
+        Opcode::Const => {
+            if let Some(imm) = immediate {
+                Range::singleton(imm)
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Add => {
+            if arg_ranges.len() == 2 {
+                arg_ranges[0].add(&arg_ranges[1])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Sub => {
+            if arg_ranges.len() == 2 {
+                arg_ranges[0].sub(&arg_ranges[1])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Mul => {
+            if arg_ranges.len() == 2 {
+                arg_ranges[0].mul(&arg_ranges[1])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::And => {
+            if arg_ranges.len() == 2 {
+                arg_ranges[0].bitand(&arg_ranges[1])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Or => {
+            if arg_ranges.len() == 2 {
+                arg_ranges[0].bitor(&arg_ranges[1])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Ineg => {
+            if arg_ranges.len() == 1 {
+                arg_ranges[0].neg()
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Shl => {
+            if arg_ranges.len() == 2 {
+                if let Some(amt) = arg_ranges[1].as_singleton() {
+                    arg_ranges[0].shl_const(amt)
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Sshr => {
+            if arg_ranges.len() == 2 {
+                if let Some(amt) = arg_ranges[1].as_singleton() {
+                    arg_ranges[0].sshr_const(amt)
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        // Comparisons always produce 0 or 1
+        Opcode::Eq
+        | Opcode::Ne
+        | Opcode::Slt
+        | Opcode::Sle
+        | Opcode::Sgt
+        | Opcode::Sge
+        | Opcode::Ult
+        | Opcode::Ule
+        | Opcode::Ugt
+        | Opcode::Uge => Range::new(0, 1),
+
+        // Division: conservative, but if divisor is a known positive constant
+        // and dividend is non-negative, we can narrow the range.
+        Opcode::Div => {
+            if arg_ranges.len() == 2 {
+                if let Some(divisor) = arg_ranges[1].as_singleton() {
+                    if divisor > 0 && arg_ranges[0].is_non_negative() {
+                        Range::new(arg_ranges[0].min / divisor, arg_ranges[0].max / divisor)
+                    } else if divisor != 0 {
+                        Range::unbounded()
+                    } else {
+                        Range::unbounded()
+                    }
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        _ => Range::unbounded(),
+    }
 }
 
 pub fn learn_from_comparison(
