@@ -409,6 +409,12 @@ mod tests {
         example_scoped_gvn();
         example_strength_reduction();
         example_conditional_optimization();
+        example_range_egraph_integration();
+    }
+
+    #[test]
+    fn test_range_egraph_integration() {
+        example_range_egraph_integration();
     }
 
     #[test]
