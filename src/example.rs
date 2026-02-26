@@ -296,6 +296,75 @@ block2():
     );
 }
 
+/// Example 7: Range-Aware Egraph Optimization
+///
+/// Demonstrates the integrated range analysis + egraph pass:
+/// 1. Branch conditions teach us that x < 10 in the true branch
+/// 2. Range propagation tracks that constants have singleton ranges
+/// 3. Range-sensitive rewrite rules fold comparisons using known ranges
+/// 4. Iterative cycling between egraph rewrites and range refinement
+///    finds optimizations that neither pass alone could discover
+///
+/// In the true branch of "if (x < 10)":
+///   - x is known to be in [-inf, 9]
+///   - slt(x, 100) can be folded to constant 1 (since 9 < 100)
+///   - The division x / 2 on a non-negative x could be turned to ushr
+pub fn example_range_egraph_integration() {
+    let clif_input = r#"
+function %range_egraph(i32) -> i32 {
+block0(v0: i32):
+    ; Compare x < 10
+    v1 = iconst.i32 10
+    v2 = icmp.slt.i32 v0, v1
+    brif v2, block1, block2
+
+block1():
+    ; In this block we know x < 10
+    ; This comparison should fold to 1 (x < 10 < 100)
+    v3 = iconst.i32 100
+    v4 = icmp.slt.i32 v0, v3
+    ; Also compute x + 5 where we know the sum is < 15
+    v5 = iconst.i32 5
+    v6 = iadd.i32 v0, v5
+    return v6
+
+block2():
+    ; Fallthrough: x >= 10
+    v7 = iconst.i32 0
+    return v7
+}
+"#;
+
+    println!("Example 7: Range-Aware Egraph Optimization");
+
+    let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
+    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let mut pass = EgraphPass::new(dfg, layout, domtree);
+    pass.run();
+
+    print_optimization_result(
+        "Range-Egraph Integration",
+        clif_input,
+        &pass.dfg,
+        &pass.layout,
+        "range_egraph",
+        &[Type::I32],
+        Some(Type::I32),
+    );
+
+    // Print range-specific stats
+    println!("Range integration stats:");
+    println!("  Ranges propagated: {}", pass.stats.ranges_propagated);
+    println!(
+        "  Refinement iterations: {}",
+        pass.stats.range_refinement_iterations
+    );
+    println!(
+        "  New unions from refinement: {}",
+        pass.stats.range_refinement_new_unions
+    );
+}
+
 /// Run all examples
 pub fn run_all_examples() {
     println!("\n");
@@ -318,6 +387,9 @@ pub fn run_all_examples() {
     println!("\n{}\n", "─".repeat(70));
 
     example_conditional_optimization();
+    println!("\n{}\n", "─".repeat(70));
+
+    example_range_egraph_integration();
 
     println!("\n");
     println!("All examples completed.");

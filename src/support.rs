@@ -58,6 +58,52 @@ impl DominatorTree {
         tree
     }
 
+    /// Build a dominator tree from an explicit CFG.
+    ///
+    /// `root` is the entry block.  `edges` maps each block to its
+    /// dominator-tree *children* (not CFG successors).  This is a
+    /// convenience for tests where the dominator tree shape is known.
+    pub fn from_cfg(root: BlockId, edges: &[(BlockId, Vec<BlockId>)]) -> Self {
+        let mut tree = Self::new();
+
+        let children_map: HashMap<BlockId, Vec<BlockId>> =
+            edges.iter().cloned().collect();
+
+        // Build idom + children from the explicit tree edges
+        fn walk(
+            block: BlockId,
+            parent: Option<BlockId>,
+            children_map: &HashMap<BlockId, Vec<BlockId>>,
+            tree: &mut DominatorTree,
+        ) {
+            if let Some(p) = parent {
+                tree.idom.insert(block, p);
+            }
+            let kids = children_map.get(&block).cloned().unwrap_or_default();
+            tree.children.insert(block, kids.clone());
+            for child in &kids {
+                walk(*child, Some(block), children_map, tree);
+            }
+        }
+
+        walk(root, None, &children_map, &mut tree);
+
+        // Compute dominator sets
+        let all_blocks: Vec<BlockId> = edges.iter().map(|(b, _)| *b).collect();
+        for &block in &all_blocks {
+            let mut doms = HashSet::new();
+            doms.insert(block);
+            let mut current = block;
+            while let Some(&idom) = tree.idom.get(&current) {
+                doms.insert(idom);
+                current = idom;
+            }
+            tree.dominators.insert(block, doms);
+        }
+
+        tree
+    }
+
     /// Check if block `a` dominates block `b`
     pub fn block_dominates(&self, a: BlockId, b: BlockId) -> bool {
         if a == b {

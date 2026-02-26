@@ -44,10 +44,23 @@ impl RewriteEngine {
         self.library.add_rule(rule);
     }
 
-    /// Try to apply all rewrite rules to a value
+    /// Try to apply all rewrite rules to a value (without range info)
     ///
     /// Returns a set of new equivalent values produced by rewrites
     pub fn apply_rewrites(&mut self, dfg: &mut DataFlowGraph, value: ValueId) -> HashSet<ValueId> {
+        self.apply_rewrites_with_ranges(dfg, value, None)
+    }
+
+    /// Try to apply all rewrite rules to a value, with optional range assumptions
+    ///
+    /// When range_assumptions is provided, range-based conditions (NonNegative,
+    /// Positive, InRange, etc.) can fire during rewrite rule matching.
+    pub fn apply_rewrites_with_ranges(
+        &mut self,
+        dfg: &mut DataFlowGraph,
+        value: ValueId,
+        range_assumptions: Option<&crate::range::RangeAssumptions>,
+    ) -> HashSet<ValueId> {
         let mut results = HashSet::new();
 
         let inst_info = if let ValueDef::Inst(inst_id) = dfg.value_def(value) {
@@ -61,8 +74,13 @@ impl RewriteEngine {
 
             // LHS
             let matcher = PatternMatcher::new(dfg);
-            if let Some(bindings) = matcher.match_pattern(&rule.lhs, value) {
+            if let Some(mut bindings) = matcher.match_pattern(&rule.lhs, value) {
                 self.matches_succeeded += 1;
+
+                // Attach range assumptions so range-based conditions can fire
+                if let Some(ra) = range_assumptions {
+                    bindings.set_range_assumptions(ra);
+                }
 
                 // Check conditions
                 if !rule.check_conditions(&bindings) {
