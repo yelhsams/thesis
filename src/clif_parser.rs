@@ -215,8 +215,6 @@ impl Parser {
             }
         }
 
-        let opcode = self.parse_opcode(&opcode_str)?;
-
         // Parse type suffix (e.g., .i32)
         let ty = if self.check(Token::Dot) {
             self.advance();

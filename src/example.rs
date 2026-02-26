@@ -307,8 +307,8 @@ block2():
 ///
 /// In the true branch of "if (x < 10)":
 ///   - x is known to be in [-inf, 9]
-///   - slt(x, 100) can be folded to constant 1 (since 9 < 100)
-///   - The division x / 2 on a non-negative x could be turned to ushr
+///   - slt(x, 100) is folded to constant 1 (since 9 < 100)
+///   - iconst 100 becomes dead code and is eliminated
 pub fn example_range_egraph_integration() {
     let clif_input = r#"
 function %range_egraph(i32) -> i32 {
@@ -323,10 +323,7 @@ block1():
     ; This comparison should fold to 1 (x < 10 < 100)
     v3 = iconst.i32 100
     v4 = icmp.slt.i32 v0, v3
-    ; Also compute x + 5 where we know the sum is < 15
-    v5 = iconst.i32 5
-    v6 = iadd.i32 v0, v5
-    return v6
+    return v4
 
 block2():
     ; Fallthrough: x >= 10
