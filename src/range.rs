@@ -358,6 +358,20 @@ impl RangeAssumptions {
             .unwrap_or(Range::unbounded())
     }
 
+    /// Query the range for a value in the root scope (depth 0).
+    ///
+    /// This returns what is known about `value` without any branch-local
+    /// assumptions. Useful for distinguishing globally-provable facts from
+    /// context-dependent ones.
+    pub fn root_range(&self, value: ValueId) -> Range {
+        self.scopes
+            .first()
+            .expect("at least one scope")
+            .get(&value)
+            .copied()
+            .unwrap_or(Range::unbounded())
+    }
+
     pub fn has_assumptions(&self, value: ValueId) -> bool {
         self.scopes
             .last()

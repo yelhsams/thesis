@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// Rewrite engine: applies pattern-based rewrites to the egraph
 pub struct RewriteEngine {
     /// The library of rewrite rules to apply
-    library: RewriteLibrary,
+    pub library: RewriteLibrary,
 
     /// Statistics
     pub matches_attempted: u64,

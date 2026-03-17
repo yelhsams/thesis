@@ -6,7 +6,7 @@
 //! 3. Elaborates (extracts) the best version back into the CFG
 
 use crate::pattern::*;
-use crate::range::{learn_from_comparison, RangeAssumptions};
+use crate::range::{learn_from_comparison, Range, RangeAssumptions};
 use crate::rewrite_integration::*;
 use crate::support::*;
 use crate::types::*;
@@ -811,6 +811,9 @@ impl<'a> OptimizeCtx<'a> {
                 // Apply rewrite rules and create unions
                 let opt_result = self.apply_rewrites_and_union(result);
 
+                // Second pass: create conditional unions for range-dependent rewrites
+                self.apply_conditional_rewrites_and_store(result);
+
                 println!("      New instruction: {:?}", result);
 
                 opt_result
@@ -875,6 +878,162 @@ impl<'a> OptimizeCtx<'a> {
 
         self.rewrite_depth -= 1;
         union_value
+    }
+
+    /// Returns `true` if the tightest known range for `value` in the current
+    /// scope is strictly tighter than it would be in the root scope (depth 0).
+    ///
+    /// This distinguishes branch-local assumptions (pushed by dominator-tree
+    /// traversal through conditional branches) from globally provable facts.
+    fn is_branch_local(&self, value: ValueId, range: &Range) -> bool {
+        if self.range_assumptions.depth() == 0 {
+            return false;
+        }
+        let root = self.range_assumptions.root_range(value);
+        // The current range is branch-local if it is strictly contained in
+        // the root range (i.e., the root range alone does not prove this fact).
+        !(root.min >= range.min && root.max <= range.max)
+    }
+
+    /// Inspect the current range-assumption scope and, for each rewrite rule
+    /// whose range-based conditions are satisfied only because of branch-local
+    /// assumptions, create a `ConditionalUnion` instead of an unconditional one.
+    ///
+    /// If the condition is globally provable (root scope suffices), no
+    /// conditional union is created — the unconditional path in
+    /// `apply_rewrites_and_union` already handled it.
+    fn apply_conditional_rewrites_and_store(&mut self, value: ValueId) {
+        // Only consider instruction-defined values.
+        let _inst_id = match self.dfg.value_def(value) {
+            ValueDef::Inst(id) => id,
+            _ => return,
+        };
+
+        let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
+        let ra = unsafe { &*ra_ptr };
+
+        // Iterate over all rewrite rules to find ones with range-based conditions.
+        for rule in &self.rewrite_engine.library.rules.clone() {
+            // Skip rules without range-based conditions.
+            let range_conditions = Self::collect_range_conditions(&rule.conditions);
+            if range_conditions.is_empty() {
+                continue;
+            }
+
+            // Try to match the LHS pattern.
+            let matcher = PatternMatcher::new(self.dfg);
+            let mut bindings = match matcher.match_pattern(&rule.lhs, value) {
+                Some(b) => b,
+                None => continue,
+            };
+            bindings.set_range_assumptions(ra);
+
+            // Check that all conditions hold.
+            if !rule.check_conditions(&bindings) {
+                continue;
+            }
+
+            // Determine which range facts are branch-local.
+            let mut branch_local_facts: Vec<(ValueId, Range)> = Vec::new();
+            let mut all_global = true;
+
+            for cond in &range_conditions {
+                if let Some((var, required_range)) = Self::condition_to_range_fact(cond, &bindings) {
+                    let current = ra.get_range(var);
+                    if self.is_branch_local(var, &required_range) {
+                        branch_local_facts.push((var, current));
+                        all_global = false;
+                    }
+                }
+            }
+
+            // If all conditions are globally provable, the unconditional path
+            // already handled this — skip.
+            if all_global {
+                continue;
+            }
+
+            // Apply the RHS to produce the rewritten value.
+            let mut applier = PatternApplier::new(self.dfg);
+            let new_value = match applier.apply_pattern(&rule.rhs, &bindings) {
+                Some(v) if v != value => v,
+                _ => continue,
+            };
+
+            // Build the AssumptionSet from only the branch-local facts.
+            let assumption_set = AssumptionSet {
+                assumptions: branch_local_facts,
+            };
+
+            let cu = self.dfg.make_conditional_union(value, new_value, assumption_set);
+            println!(
+                "Conditional union: lhs={:?} rhs={:?} under {:?}",
+                cu.lhs, cu.rhs, cu.condition.assumptions
+            );
+        }
+    }
+
+    /// Collect range-based conditions from a slice of conditions (flattening And).
+    fn collect_range_conditions(conditions: &[Condition]) -> Vec<Condition> {
+        let mut result = Vec::new();
+        for cond in conditions {
+            match cond {
+                Condition::InRange(..)
+                | Condition::NonNegative(..)
+                | Condition::Positive(..)
+                | Condition::Negative(..)
+                | Condition::RangeLessThan(..)
+                | Condition::RangeGreaterThan(..)
+                | Condition::RangeEquals(..)
+                | Condition::Unreachable(..) => {
+                    result.push(cond.clone());
+                }
+                Condition::And(inner) => {
+                    result.extend(Self::collect_range_conditions(inner));
+                }
+                _ => {}
+            }
+        }
+        result
+    }
+
+    /// Extract the `(ValueId, required Range)` from a range-based condition,
+    /// using the bindings to resolve the variable to a concrete ValueId.
+    fn condition_to_range_fact(
+        cond: &Condition,
+        bindings: &Bindings,
+    ) -> Option<(ValueId, Range)> {
+        match cond {
+            Condition::InRange(var, min, max) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::new(*min, *max)))
+            }
+            Condition::NonNegative(var) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::non_negative()))
+            }
+            Condition::Positive(var) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::positive()))
+            }
+            Condition::Negative(var) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::negative()))
+            }
+            Condition::RangeLessThan(var, val) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::new(i64::MIN, *val - 1)))
+            }
+            Condition::RangeGreaterThan(var, val) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::new(*val + 1, i64::MAX)))
+            }
+            Condition::RangeEquals(var, val) => {
+                let v = bindings.get_value(var)?;
+                Some((v, Range::singleton(*val)))
+            }
+            _ => None,
+        }
     }
 
     /// Optimize a skeleton instruction

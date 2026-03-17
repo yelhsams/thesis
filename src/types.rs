@@ -2,6 +2,7 @@
 //!
 //! This is an extended version of types.rs that includes CLIF pretty-printing methods.
 
+use crate::range::Range;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -66,6 +67,9 @@ pub enum Opcode {
     Uextend,
     Sextend,
 
+    /// Integer remainder (modulo).
+    Irem,
+
     // Side-effect ops
     Div,
     Load,
@@ -109,6 +113,7 @@ impl Opcode {
                 | Opcode::Uge
                 | Opcode::Uextend
                 | Opcode::Sextend
+                | Opcode::Irem
         )
     }
 
@@ -243,6 +248,53 @@ impl Block {
     }
 }
 
+/// A snapshot of range assumptions under which a conditional union is valid.
+///
+/// Each entry `(value, range)` asserts that `value` must fall within `range`
+/// at the extraction site for the union to be sound. The union is only valid
+/// when **every** listed assumption is entailed by the active range context.
+#[derive(Debug, Clone)]
+pub struct AssumptionSet {
+    /// Each entry: (value, range) — the union is only valid when every listed
+    /// value is known to fall within its range at the extraction site.
+    pub assumptions: Vec<(ValueId, Range)>,
+}
+
+impl AssumptionSet {
+    /// Create an empty assumption set.
+    pub fn new() -> Self {
+        Self {
+            assumptions: Vec::new(),
+        }
+    }
+
+    /// Returns `true` if all assumptions are entailed by the given range context.
+    ///
+    /// An assumption `(v, r)` is entailed when the active range for `v` is a
+    /// subset of `r`, i.e., `active.min >= r.min && active.max <= r.max`.
+    pub fn is_entailed_by(&self, active: &crate::range::RangeAssumptions) -> bool {
+        self.assumptions.iter().all(|&(value, ref required)| {
+            let actual = active.get_range(value);
+            actual.min >= required.min && actual.max <= required.max
+        })
+    }
+}
+
+/// A union that is only valid under a specific assumption context.
+///
+/// Unlike unconditional unions (stored as `ValueDef::Union`), conditional
+/// unions are stored separately in `DataFlowGraph::conditional_unions` and
+/// are only consulted during extraction when their assumptions are satisfied.
+#[derive(Debug, Clone)]
+pub struct ConditionalUnion {
+    /// Left-hand side of the conditional equivalence.
+    pub lhs: ValueId,
+    /// Right-hand side of the conditional equivalence.
+    pub rhs: ValueId,
+    /// The assumptions that must hold for this union to be valid.
+    pub condition: AssumptionSet,
+}
+
 /// The data flow graph
 #[derive(Debug, Clone)]
 pub struct DataFlowGraph {
@@ -258,6 +310,12 @@ pub struct DataFlowGraph {
     /// Map from value to its type
     pub value_types: HashMap<ValueId, Type>,
 
+    /// Conditional unions: equivalences valid only under specific range assumptions.
+    ///
+    /// These are consulted during extraction but do **not** create `ValueDef::Union`
+    /// entries in the e-graph proper.
+    pub conditional_unions: Vec<ConditionalUnion>,
+
     /// Next available IDs
     next_inst: u32,
     next_value: u32,
@@ -270,6 +328,7 @@ impl DataFlowGraph {
             inst_results: HashMap::new(),
             value_defs: HashMap::new(),
             value_types: HashMap::new(),
+            conditional_unions: Vec::new(),
             next_inst: 0,
             next_value: 0,
         }
@@ -323,6 +382,25 @@ impl DataFlowGraph {
             .insert(value_id, ValueDef::Union(left, right));
 
         value_id
+    }
+
+    /// Record a conditional union between two values.
+    ///
+    /// Unlike `make_union`, this does **not** create a `ValueDef::Union` node.
+    /// The equivalence is stored separately and is only consulted at extraction
+    /// time when the `condition` is entailed by the active range context.
+    pub fn make_conditional_union(
+        &mut self,
+        lhs: ValueId,
+        rhs: ValueId,
+        condition: AssumptionSet,
+    ) -> &ConditionalUnion {
+        self.conditional_unions.push(ConditionalUnion {
+            lhs,
+            rhs,
+            condition,
+        });
+        self.conditional_unions.last().unwrap()
     }
 
     /// Get the definition of a value
@@ -655,6 +733,7 @@ impl fmt::Display for Opcode {
             Opcode::Uge => "icmp.uge",
             Opcode::Uextend => "uextend",
             Opcode::Sextend => "sextend",
+            Opcode::Irem => "irem",
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Call => "call",

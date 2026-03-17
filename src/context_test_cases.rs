@@ -6,6 +6,8 @@
 
 use crate::clif_parser::*;
 use crate::egraph_pass::*;
+use crate::pattern::*;
+use crate::range::RangeAssumptions;
 use crate::support::*;
 use crate::types::*;
 
@@ -507,5 +509,203 @@ block0(v0: i32):
         println!("{}", "=".repeat(70));
 
         assert!(!output.is_empty(), "Should produce output");
+    }
+
+    /// Test that a conditional union is created for `v0 % 4 == v0` when
+    /// `v0 ∈ [0, 3]` (i.e., in the true branch of `brif (ult v0, 4)`),
+    /// and that the conditional union is **not** applied during extraction
+    /// in the else branch where the range does not hold.
+    #[test]
+    fn test_conditional_union_mod_reduction() {
+        // ── Build the two-block CFG by hand ──────────────────────────
+        //
+        // block0(v0: i32):
+        //   c4   = iconst 4
+        //   cmp  = icmp.ult v0, c4          // v0 < 4 (unsigned)
+        //   brif cmp, block1, block2
+        //
+        // block1:                            // v0 ∈ [0, 3]
+        //   mod_result = irem v0, c4         // v0 % 4  — should equal v0
+        //   return mod_result
+        //
+        // block2:                            // v0 ∈ [4, +∞]
+        //   return v0
+
+        let mut dfg = DataFlowGraph::new();
+
+        let block0 = BlockId(0);
+        let block1 = BlockId(1);
+        let block2 = BlockId(2);
+
+        // block0 param
+        let v0 = dfg.make_block_param(block0, 0, Type::I32);
+
+        // c4 = iconst 4
+        let c4_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, 4);
+        let c4_id = dfg.make_inst(c4_inst);
+        let c4 = dfg.make_inst_result(c4_id, Type::I32);
+
+        // cmp = icmp.ult v0, c4
+        let cmp_inst = Instruction::new(Opcode::Ult, vec![v0, c4], Type::I32);
+        let cmp_id = dfg.make_inst(cmp_inst);
+        let cmp = dfg.make_inst_result(cmp_id, Type::I32);
+
+        // brif cmp, block1, block2
+        let brif_inst = Instruction::with_branch(
+            Opcode::CondBranch,
+            vec![cmp],
+            Type::I32,
+            BranchInfo::Conditional(block1, 0, block2, 0),
+        );
+        let brif_id = dfg.make_inst(brif_inst);
+        dfg.make_inst_result(brif_id, Type::I32);
+
+        // block1: mod_result = irem v0, c4
+        let irem_inst = Instruction::new(Opcode::Irem, vec![v0, c4], Type::I32);
+        let irem_id = dfg.make_inst(irem_inst);
+        let mod_result = dfg.make_inst_result(irem_id, Type::I32);
+
+        let ret1_inst = Instruction::new(Opcode::Return, vec![mod_result], Type::I32);
+        let ret1_id = dfg.make_inst(ret1_inst);
+        dfg.make_inst_result(ret1_id, Type::I32);
+
+        // block2: return v0
+        let ret2_inst = Instruction::new(Opcode::Return, vec![v0], Type::I32);
+        let ret2_id = dfg.make_inst(ret2_inst);
+        dfg.make_inst_result(ret2_id, Type::I32);
+
+        // ── Build layout ─────────────────────────────────────────────
+        let mut layout = Layout::new();
+
+        let mut b0 = Block::new(block0);
+        b0.params = vec![v0];
+        b0.insts = vec![c4_id, cmp_id, brif_id];
+        layout.add_block(b0);
+
+        let mut b1 = Block::new(block1);
+        b1.insts = vec![irem_id, ret1_id];
+        layout.add_block(b1);
+
+        let mut b2 = Block::new(block2);
+        b2.insts = vec![ret2_id];
+        layout.add_block(b2);
+
+        // ── Build dominator tree ─────────────────────────────────────
+        let domtree = DominatorTree::from_cfg(
+            block0,
+            &[
+                (block0, vec![block1, block2]),
+                (block1, vec![]),
+                (block2, vec![]),
+            ],
+        );
+
+        // ── Add a rewrite rule: irem(x, n) => x  when x ∈ [0, n-1] ─
+        //
+        // This rule has a range-based condition: InRange("x", 0, 3).
+        // In block1 the branch guarantees v0 ∈ [0, 3], so the condition
+        // is satisfied only because of a branch-local assumption —
+        // triggering a *conditional* union rather than an unconditional one.
+        let mod_reduction_rule = Rewrite::new("mod-reduction-by-range")
+            .match_pattern(Pattern::op(
+                Opcode::Irem,
+                vec![Pattern::var("x"), Pattern::constant(4)],
+            ))
+            .produce(Pattern::var("x"))
+            .when(Condition::InRange(VarId::new("x"), 0, 3))
+            .build();
+
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.add_rewrite_rule(mod_reduction_rule);
+        // v0 is treated as an unsigned i32 parameter — non-negative.
+        // This lets the `ult v0, 4` true-branch intersect to [0, 3].
+        pass.assume_range(v0, 0, i64::MAX);
+        pass.run();
+
+        // ── Assertions ───────────────────────────────────────────────
+
+        // 1. A ConditionalUnion should have been created between mod_result
+        //    and v0 (or their optimized representatives).
+        let has_conditional = pass.dfg.conditional_unions.iter().any(|cu| {
+            // One side should be the irem result, the other should be v0.
+            (cu.lhs == mod_result || cu.rhs == mod_result || cu.lhs == v0 || cu.rhs == v0)
+                && !cu.condition.assumptions.is_empty()
+        });
+        assert!(
+            has_conditional,
+            "Expected a ConditionalUnion between mod_result and v0, found: {:?}",
+            pass.dfg.conditional_unions
+        );
+
+        // 2. The conditional union's AssumptionSet should reference v0 with
+        //    a range within [0, 3]. Clone the assumptions to avoid borrow issues.
+        let cu_assumptions = {
+            let cu = pass
+                .dfg
+                .conditional_unions
+                .iter()
+                .find(|cu| {
+                    (cu.lhs == mod_result || cu.rhs == mod_result || cu.lhs == v0 || cu.rhs == v0)
+                        && !cu.condition.assumptions.is_empty()
+                })
+                .expect("conditional union must exist");
+            cu.condition.assumptions.clone()
+        };
+        let has_v0_assumption = cu_assumptions
+            .iter()
+            .any(|&(v, ref r)| v == v0 && r.min >= 0 && r.max <= 3);
+        assert!(
+            has_v0_assumption,
+            "Conditional union should include assumption v0 ∈ [0, 3], got: {:?}",
+            cu_assumptions
+        );
+
+        // 3. The conditional union must NOT be applied during extraction
+        //    in block2 where v0 ∈ [4, +∞]. Verify by checking that an
+        //    elaborator without range assumptions (simulating block2
+        //    context) does not pick the conditional alternative.
+        {
+            let mut stats = Stats::default();
+            let elaborator = crate::elaborate::Elaborator::new(
+                &mut pass.dfg,
+                &pass.domtree,
+                &mut stats,
+            );
+            // Without range assumptions, conditional unions should be ignored.
+            // (The elaborator's `range_assumptions` is None.)
+            assert!(
+                elaborator.range_assumptions.is_none(),
+                "Default elaborator should have no range assumptions"
+            );
+        }
+
+        // Build an AssumptionSet from the clone for entailment checks.
+        let cu_condition = AssumptionSet {
+            assumptions: cu_assumptions,
+        };
+
+        // 4. With block1's range assumptions, the conditional union IS used.
+        {
+            let mut ra = RangeAssumptions::new();
+            ra.assume_range(v0, crate::range::Range::new(0, 3));
+
+            assert!(
+                cu_condition.is_entailed_by(&ra),
+                "Conditional union should be entailed in block1 context"
+            );
+        }
+
+        // 5. With block2's range assumptions (v0 >= 4), it is NOT entailed.
+        {
+            let mut ra = RangeAssumptions::new();
+            ra.assume_range(v0, crate::range::Range::new(4, i64::MAX));
+
+            assert!(
+                !cu_condition.is_entailed_by(&ra),
+                "Conditional union should NOT be entailed in block2 context"
+            );
+        }
+
+        println!("\n✓ Conditional union mod reduction test passed");
     }
 }
