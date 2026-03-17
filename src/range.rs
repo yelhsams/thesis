@@ -560,6 +560,86 @@ pub fn compute_inst_range(
             }
         }
 
+        // --- New opcodes ---
+
+        Opcode::Iabs => {
+            if arg_ranges.len() == 1 {
+                let r = &arg_ranges[0];
+                if r.min >= 0 {
+                    // Already non-negative
+                    Range::new(r.min, r.max)
+                } else if r.max < 0 {
+                    // Entirely negative: |[a,b]| = [-b, -a]
+                    Range::new(0i64.saturating_sub(r.max), 0i64.saturating_sub(r.min))
+                } else {
+                    // Straddles zero
+                    Range::new(0, std::cmp::max(0i64.saturating_sub(r.min), r.max))
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Clz | Opcode::Ctz => Range::new(0, 63),
+
+        Opcode::Rotl | Opcode::Rotr | Opcode::Ireduce => Range::unbounded(),
+
+        Opcode::Select => {
+            if arg_ranges.len() == 3 {
+                arg_ranges[1].union(&arg_ranges[2])
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Sdiv => {
+            if arg_ranges.len() == 2 {
+                if let Some(divisor) = arg_ranges[1].as_singleton() {
+                    if divisor > 0 && arg_ranges[0].is_non_negative() {
+                        Range::new(arg_ranges[0].min / divisor, arg_ranges[0].max / divisor)
+                    } else {
+                        Range::unbounded()
+                    }
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Udiv => {
+            if arg_ranges.len() == 2 {
+                if let Some(divisor) = arg_ranges[1].as_singleton() {
+                    if divisor > 0 && arg_ranges[0].is_non_negative() {
+                        Range::new(0, arg_ranges[0].max / divisor)
+                    } else {
+                        Range::unbounded()
+                    }
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
+        Opcode::Urem | Opcode::Srem => {
+            if arg_ranges.len() == 2 {
+                if let Some(divisor) = arg_ranges[1].as_singleton() {
+                    if divisor > 0 {
+                        Range::new(0, divisor - 1)
+                    } else {
+                        Range::unbounded()
+                    }
+                } else {
+                    Range::unbounded()
+                }
+            } else {
+                Range::unbounded()
+            }
+        }
+
         _ => Range::unbounded(),
     }
 }

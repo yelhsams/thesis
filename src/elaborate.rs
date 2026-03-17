@@ -59,6 +59,12 @@ impl CostModel for DefaultCostModel {
             Opcode::Call => Cost(20),
             Opcode::Branch | Opcode::CondBranch | Opcode::Return => Cost(5),
             Opcode::Trap => Cost(100),
+            Opcode::Sdiv | Opcode::Udiv | Opcode::Urem | Opcode::Srem => Cost(5),
+            Opcode::Iabs => Cost(1),
+            Opcode::Select => Cost(1),
+            Opcode::Ireduce => Cost(1),
+            Opcode::Clz | Opcode::Ctz => Cost(1),
+            Opcode::Rotl | Opcode::Rotr => Cost(1),
         }
     }
 }

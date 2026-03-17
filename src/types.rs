@@ -69,9 +69,31 @@ pub enum Opcode {
 
     /// Integer remainder (modulo).
     Irem,
+    /// Signed integer division (pure, used by rewrite rules).
+    Sdiv,
+    /// Integer absolute value (1 arg).
+    Iabs,
+    /// Ternary select: select(cond, true_val, false_val), pure.
+    Select,
+    /// Truncate to a narrower integer type (1 arg).
+    Ireduce,
+    /// Count leading zeros (1 arg).
+    Clz,
+    /// Count trailing zeros (1 arg).
+    Ctz,
+    /// Rotate left (2 args: value, shift amount).
+    Rotl,
+    /// Rotate right (2 args: value, shift amount).
+    Rotr,
 
     // Side-effect ops
     Div,
+    /// Unsigned integer division (side-effectful: traps on div-by-zero).
+    Udiv,
+    /// Unsigned remainder (side-effectful: traps on div-by-zero).
+    Urem,
+    /// Signed remainder (side-effectful: traps on div-by-zero).
+    Srem,
     Load,
     Store,
     Call,
@@ -114,6 +136,14 @@ impl Opcode {
                 | Opcode::Uextend
                 | Opcode::Sextend
                 | Opcode::Irem
+                | Opcode::Sdiv
+                | Opcode::Iabs
+                | Opcode::Select
+                | Opcode::Ireduce
+                | Opcode::Clz
+                | Opcode::Ctz
+                | Opcode::Rotl
+                | Opcode::Rotr
         )
     }
 
@@ -128,7 +158,7 @@ impl Opcode {
     /// Returns true if this operation can be merged (deduplicated) even though
     /// it has side effects
     pub fn is_mergeable(self) -> bool {
-        matches!(self, Opcode::Trap | Opcode::Div)
+        matches!(self, Opcode::Trap | Opcode::Div | Opcode::Udiv | Opcode::Urem | Opcode::Srem)
     }
 
     /// Returns true if this is a comparison operation
@@ -734,6 +764,17 @@ impl fmt::Display for Opcode {
             Opcode::Uextend => "uextend",
             Opcode::Sextend => "sextend",
             Opcode::Irem => "irem",
+            Opcode::Sdiv => "sdiv",
+            Opcode::Iabs => "iabs",
+            Opcode::Select => "select",
+            Opcode::Ireduce => "ireduce",
+            Opcode::Clz => "clz",
+            Opcode::Ctz => "ctz",
+            Opcode::Rotl => "rotl",
+            Opcode::Rotr => "rotr",
+            Opcode::Udiv => "udiv",
+            Opcode::Urem => "urem",
+            Opcode::Srem => "srem",
             Opcode::Load => "load",
             Opcode::Store => "store",
             Opcode::Call => "call",
