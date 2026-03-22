@@ -6,6 +6,7 @@
 //! 2. Place those instructions back into the CFG layout
 //! 3. Perform code motion (LICM, rematerialization, etc.)
 
+use crate::range::RangeAssumptions;
 use crate::support::*;
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +44,7 @@ impl CostModel for DefaultCostModel {
             Opcode::AddImm => Cost(1),
             Opcode::Mul => Cost(2),
             Opcode::MulImm => Cost(2),
+            Opcode::Irem => Cost(5),
             Opcode::Div => Cost(5),
             Opcode::And | Opcode::Or | Opcode::Xor => Cost(1),
             Opcode::Shl | Opcode::Ushr | Opcode::Sshr => Cost(1),
@@ -57,6 +59,12 @@ impl CostModel for DefaultCostModel {
             Opcode::Call => Cost(20),
             Opcode::Branch | Opcode::CondBranch | Opcode::Return => Cost(5),
             Opcode::Trap => Cost(100),
+            Opcode::Sdiv | Opcode::Udiv | Opcode::Urem | Opcode::Srem => Cost(5),
+            Opcode::Iabs => Cost(1),
+            Opcode::Select => Cost(1),
+            Opcode::Ireduce => Cost(1),
+            Opcode::Clz | Opcode::Ctz => Cost(1),
+            Opcode::Rotl | Opcode::Rotr => Cost(1),
         }
     }
 }
@@ -72,6 +80,13 @@ pub struct Elaborator<'a> {
 
     /// Memoization: (value, block) -> elaborated value in that block
     elaborated_cache: HashMap<(ValueId, BlockId), ValueId>,
+
+    /// Optional range assumptions active at the current extraction site.
+    ///
+    /// When set, conditional unions whose `AssumptionSet` is entailed by
+    /// these assumptions are included as additional candidates during cost
+    /// computation and value elaboration.
+    pub range_assumptions: Option<&'a RangeAssumptions>,
 
     /// Statistics
     stats: &'a mut Stats,
@@ -89,6 +104,28 @@ impl<'a> Elaborator<'a> {
             cost_model: DefaultCostModel,
             best_value_cache: HashMap::new(),
             elaborated_cache: HashMap::new(),
+            range_assumptions: None,
+            stats,
+        }
+    }
+
+    /// Create an elaborator with range assumptions for context-aware extraction.
+    ///
+    /// When range assumptions are provided, conditional unions whose
+    /// `AssumptionSet` is entailed are included as additional candidates.
+    pub fn with_range_assumptions(
+        dfg: &'a mut DataFlowGraph,
+        domtree: &'a DominatorTree,
+        stats: &'a mut Stats,
+        range_assumptions: &'a RangeAssumptions,
+    ) -> Self {
+        Self {
+            dfg,
+            domtree,
+            cost_model: DefaultCostModel,
+            best_value_cache: HashMap::new(),
+            elaborated_cache: HashMap::new(),
+            range_assumptions: Some(range_assumptions),
             stats,
         }
     }
@@ -124,7 +161,12 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Recursively compute the best cost for a value
+    /// Recursively compute the best cost for a value.
+    ///
+    /// In addition to unconditional e-class members (via `ValueDef::Union`
+    /// chains), this consults `dfg.conditional_unions` for any conditional
+    /// equivalences whose `AssumptionSet` is entailed by the active
+    /// `range_assumptions`, including those members as additional candidates.
     fn compute_best_cost(&mut self, value: ValueId) -> Cost {
         // Check cache
         if let Some(&(cost, _)) = self.best_value_cache.get(&value) {
@@ -166,7 +208,50 @@ impl<'a> Elaborator<'a> {
         };
 
         self.best_value_cache.insert(value, (best_cost, best_inst));
-        best_cost
+
+        // Additionally, check satisfied conditional unions for cheaper alternatives.
+        self.consider_conditional_unions(value);
+
+        self.best_value_cache[&value].0
+    }
+
+    /// Check conditional unions that mention `value` and, if their assumptions
+    /// are entailed by the active range context, include the other side as a
+    /// candidate that may lower the best cost.
+    fn consider_conditional_unions(&mut self, value: ValueId) {
+        let ra = match self.range_assumptions {
+            Some(ra) => ra as *const RangeAssumptions,
+            None => return,
+        };
+        let ra = unsafe { &*ra };
+
+        // Collect candidates from conditional unions.
+        let candidates: Vec<ValueId> = self
+            .dfg
+            .conditional_unions
+            .iter()
+            .filter_map(|cu| {
+                if !cu.condition.is_entailed_by(ra) {
+                    return None;
+                }
+                if cu.lhs == value {
+                    Some(cu.rhs)
+                } else if cu.rhs == value {
+                    Some(cu.lhs)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for candidate in candidates {
+            let cand_cost = self.compute_best_cost(candidate);
+            let current = self.best_value_cache[&value];
+            if cand_cost < current.0 {
+                let cand_entry = self.best_value_cache[&candidate];
+                self.best_value_cache.insert(value, cand_entry);
+            }
+        }
     }
 
     /// Elaborate all values needed in a block
@@ -190,10 +275,11 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Elaborate a value in a specific block
+    /// Elaborate a value in a specific block.
     ///
-    /// This ensures the value has a defining instruction placed
-    /// at or before this block in the CFG.
+    /// This ensures the value has a defining instruction placed at or before
+    /// this block in the CFG. When range assumptions are active, satisfied
+    /// conditional unions are considered as additional candidates.
     fn elaborate_value_in_block(&mut self, value: ValueId, block_id: BlockId) -> ValueId {
         self.stats.elaborate_visit_node += 1;
 
@@ -221,8 +307,9 @@ impl<'a> Elaborator<'a> {
                     self.elaborate_value_in_block(arg, block_id);
                 }
 
-                // The instruction itself is now ready
-                value
+                // Check if a conditional union offers a cheaper alternative
+                self.best_conditional_alternative(value, block_id)
+                    .unwrap_or(value)
             }
 
             ValueDef::Union(left, right) => {
@@ -245,6 +332,49 @@ impl<'a> Elaborator<'a> {
 
         self.elaborated_cache.insert(cache_key, elaborated);
         elaborated
+    }
+
+    /// If a satisfied conditional union offers a strictly cheaper alternative
+    /// for `value`, return it. Otherwise return `None`.
+    fn best_conditional_alternative(
+        &mut self,
+        value: ValueId,
+        block_id: BlockId,
+    ) -> Option<ValueId> {
+        let ra = self.range_assumptions? as *const RangeAssumptions;
+        let ra = unsafe { &*ra };
+
+        let current_cost = self.compute_best_cost(value);
+
+        let candidates: Vec<ValueId> = self
+            .dfg
+            .conditional_unions
+            .iter()
+            .filter_map(|cu| {
+                if !cu.condition.is_entailed_by(ra) {
+                    return None;
+                }
+                if cu.lhs == value {
+                    Some(cu.rhs)
+                } else if cu.rhs == value {
+                    Some(cu.lhs)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut best: Option<(Cost, ValueId)> = None;
+        for cand in candidates {
+            let cost = self.compute_best_cost(cand);
+            if cost < current_cost {
+                if best.map_or(true, |(bc, _)| cost < bc) {
+                    best = Some((cost, cand));
+                }
+            }
+        }
+
+        best.map(|(_, v)| self.elaborate_value_in_block(v, block_id))
     }
 
     /// Get the best instruction to use for a value

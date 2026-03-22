@@ -485,6 +485,18 @@ impl Parser {
             "brif" | "br_if" => Ok(Opcode::CondBranch),
             "return" => Ok(Opcode::Return),
             "trap" => Ok(Opcode::Trap),
+            "irem" => Ok(Opcode::Irem),
+            "sdiv" => Ok(Opcode::Sdiv),
+            "udiv" => Ok(Opcode::Udiv),
+            "urem" => Ok(Opcode::Urem),
+            "srem" => Ok(Opcode::Srem),
+            "iabs" => Ok(Opcode::Iabs),
+            "select" => Ok(Opcode::Select),
+            "ireduce" => Ok(Opcode::Ireduce),
+            "clz" => Ok(Opcode::Clz),
+            "ctz" => Ok(Opcode::Ctz),
+            "rotl" => Ok(Opcode::Rotl),
+            "rotr" => Ok(Opcode::Rotr),
             _ => Err(format!("Unknown opcode: {}", opcode_str)),
         }
     }
