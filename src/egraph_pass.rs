@@ -75,12 +75,21 @@ impl EgraphPass {
                 .display(&self.dfg, &func_name, &sig_params, sig_return)
         );
 
+        // Pre-pass: build the param→sources map so that downstream phases can
+        // "see through" block parameters to their actual incoming values.
+        self.dfg.build_param_sources(&self.layout);
+
         // Phase 1: Remove pure instructions and build egraph with range propagation
         self.remove_pure_and_optimize();
 
         println!("\n=== Egraph Built (iteration 1) ===");
         println!("Pure instructions removed from layout");
         println!("Union nodes created for equivalent values\n");
+
+        // Phase 1b: Redundant phi elimination — after GVN has run, any block
+        // param whose every predecessor passes the same canonical value can be
+        // replaced outright (avoids a spurious join at the phi node).
+        self.eliminate_redundant_params();
 
         // Repeat until fixed point.
         const MAX_RANGE_ITERATIONS: usize = 3;
@@ -475,6 +484,135 @@ impl EgraphPass {
         self.rewrite_engine.add_rule(rule);
     }
 
+    /// Check whether `value` was remapped by GVN or redundant-phi elimination.
+    /// Returns `true` if the value has a recorded canonical replacement.
+    pub fn is_gvn_remapped(&self, value: ValueId) -> bool {
+        self.gvn_mapping.contains_key(&value)
+    }
+
+    /// Expose the complete GVN mapping for testing purposes.
+    pub fn gvn_mapping(&self) -> &HashMap<ValueId, ValueId> {
+        &self.gvn_mapping
+    }
+
+    /// Redundant phi (block-param) elimination.
+    ///
+    /// After GVN has run, each block parameter's incoming values may all
+    /// resolve to the same canonical representative.  When that is the case the
+    /// param itself can be replaced by that single value, removing the join.
+    ///
+    /// The method iterates to a fixed point so that eliminating one param can
+    /// unlock another.
+    ///
+    /// Loop-carried params: if the only back-edge source is the param itself
+    /// (i.e., all *non-self* sources agree on a single value), the param is
+    /// loop-invariant and is replaced by that value.  A pure cycle with no
+    /// external input (all sources are self-referential) is left unchanged.
+    fn eliminate_redundant_params(&mut self) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            // Collect all block params and their sources.
+            // We snapshot the keys to avoid borrow conflicts.
+            let params: Vec<ValueId> = self
+                .dfg
+                .param_sources
+                .keys()
+                .copied()
+                .collect();
+
+            for param in params {
+                // Skip if already eliminated in a prior iteration.
+                //
+                // gvn_mapping is pre-populated by remove_pure_and_optimize with
+                // identity entries (param → param) for every block param, so we
+                // cannot use `contains_key` alone.  A param is only considered
+                // eliminated when its mapping points to a *different* value.
+                if self.gvn_mapping.get(&param).map(|&v| v != param).unwrap_or(false) {
+                    continue;
+                }
+                match self.dfg.value_defs.get(&param) {
+                    Some(ValueDef::BlockParam(_, _)) => {}
+                    _ => continue,
+                }
+
+                let sources = match self.dfg.param_sources.get(&param) {
+                    Some(s) if !s.is_empty() => s.clone(),
+                    _ => continue,
+                };
+
+                // Resolve each incoming value to its fully-canonical representative.
+                //
+                // We use `fully_resolve` (which follows gvn_mapping transitively)
+                // on top of `find_canonical` (which follows union nodes) so that
+                // replacements made in earlier iterations of this loop are visible.
+                //
+                // Aliasing invariant: `find_canonical` reads `self.dfg.value_defs`
+                // and `self.gvn_mapping` without writing to them; `fully_resolve`
+                // only reads `self.gvn_mapping`.  We only mutate `value_defs` and
+                // `gvn_mapping` after the read phase for this param is complete.
+                let mut canon_cache: HashMap<ValueId, ValueId> = HashMap::new();
+                let mut non_self_canonicals: Vec<ValueId> = Vec::new();
+                let mut all_self = true; // true until we see a non-self source
+
+                for &(_, incoming) in &sources {
+                    let c = self.find_canonical(incoming, &mut canon_cache);
+                    let resolved = self.fully_resolve(c);
+                    if resolved == param {
+                        // Loop-carried self-reference — do not add to non-self list.
+                    } else {
+                        all_self = false;
+                        non_self_canonicals.push(resolved);
+                    }
+                }
+
+                // If every source is a self-reference there is no invariant value
+                // to replace the param with (pure cycle).
+                if all_self || non_self_canonicals.is_empty() {
+                    continue;
+                }
+
+                // Check whether all non-self canonical values agree.
+                let first = non_self_canonicals[0];
+                if non_self_canonicals.iter().all(|&v| v == first) {
+                    // All external predecessors pass the same value (loop-invariant
+                    // if there were also self-sources).  Replace param with it.
+                    let replacement_def = match self.dfg.value_defs.get(&first).copied() {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    self.dfg.value_defs.insert(param, replacement_def);
+                    // Record in the GVN mapping so subsequent find_canonical calls
+                    // and extract_best_values pick up the replacement.
+                    self.gvn_mapping.insert(param, first);
+                    println!(
+                        "  eliminate_redundant_params: {:?} → {:?}",
+                        param, first
+                    );
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    /// Follow `gvn_mapping` transitively until no further mapping exists.
+    ///
+    /// This is used inside `eliminate_redundant_params` to make replacements
+    /// made in earlier iterations visible when computing canonical values for
+    /// later ones (e.g., v2 → v0 in iteration 1 allows v8 → v0 in iteration 2).
+    /// The depth limit guards against unexpected cycles.
+    pub fn fully_resolve(&self, value: ValueId) -> ValueId {
+        let mut current = value;
+        for _ in 0..64 {
+            match self.gvn_mapping.get(&current).copied() {
+                Some(next) if next != current => current = next,
+                _ => return current,
+            }
+        }
+        current // cycle-safe fallback
+    }
+
     /// Iterative range refinement pass
     /// Returns the number of new union nodes created (0 = fixed point)
     fn range_refine_iteration(&mut self) -> usize {
@@ -660,6 +798,35 @@ impl EgraphPass {
                     }
 
                     let block_data = self.layout.block_data[&block].clone();
+
+                    // Join-point range propagation: for each block param, compute
+                    // the union of the ranges of all incoming values.  When all
+                    // predecessors deliver values in a known bounded range the param
+                    // inherits that range, enabling further downstream optimisations.
+                    //
+                    // Note: param_sources stores the *raw* incoming ValueIds as they
+                    // appear in branch instructions.  We look up the current (scoped)
+                    // range for each incoming value; at this point in the dominator-
+                    // tree walk the predecessor's block-local range facts have already
+                    // been recorded in the root scope via range propagation from insts.
+                    for &param in &block_data.params {
+                        if let Some(sources) = self.dfg.param_sources.get(&param).cloned() {
+                            let joined = sources
+                                .iter()
+                                .map(|&(_, incoming)| self.range_assumptions.get_range(incoming))
+                                .fold(Range::empty(), |acc, r| acc.union(&r));
+                            // Only apply if the union is non-empty (at least one source
+                            // was known) and strictly tighter than the unbounded default.
+                            if !joined.is_empty() && !joined.is_unbounded() {
+                                println!(
+                                    "    Join-point range: {:?} => {}",
+                                    param, joined
+                                );
+                                self.range_assumptions.assume_range(param, joined);
+                            }
+                        }
+                    }
+
                     for &param in &block_data.params {
                         value_to_opt_value.insert(param, param);
                         available_block.insert(param, block);

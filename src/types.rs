@@ -337,6 +337,11 @@ pub struct DataFlowGraph {
     /// Conditional unions: equivalences valid only under specific range assumptions
     pub conditional_unions: Vec<ConditionalUnion>,
 
+    /// Maps each block-param ValueId to the list of (predecessor_block, incoming_value)
+    /// pairs. Populated by a pre-pass that scans all branch instructions.
+    /// Calling build_param_sources again clears and rebuilds this map (idempotent).
+    pub param_sources: HashMap<ValueId, Vec<(BlockId, ValueId)>>,
+
     /// Next available IDs
     next_inst: u32,
     next_value: u32,
@@ -350,6 +355,7 @@ impl DataFlowGraph {
             value_defs: HashMap::new(),
             value_types: HashMap::new(),
             conditional_unions: Vec::new(),
+            param_sources: HashMap::new(),
             next_inst: 0,
             next_value: 0,
         }
@@ -422,6 +428,79 @@ impl DataFlowGraph {
             condition,
         });
         self.conditional_unions.last().unwrap()
+    }
+
+    /// Build the param_sources map by scanning all branch instructions in `layout`.
+    ///
+    /// For every Jump/Conditional terminator, maps each target block's parameter
+    /// to the (predecessor_block, incoming_value) pair supplied at that call site.
+    /// Calling this method multiple times is safe: the map is cleared and rebuilt
+    /// from scratch each time (idempotent).
+    pub fn build_param_sources(&mut self, layout: &Layout) {
+        self.param_sources.clear();
+
+        for &block_id in &layout.blocks {
+            let block = &layout.block_data[&block_id];
+            for &inst_id in &block.insts {
+                let inst = &self.insts[&inst_id];
+                match &inst.branch_info {
+                    Some(BranchInfo::Jump(target)) => {
+                        // Unconditional jump: all args go to target block params in order.
+                        if let Some(target_block) = layout.block_data.get(target) {
+                            for (idx, &param) in target_block.params.iter().enumerate() {
+                                if let Some(&incoming) = inst.args.get(idx) {
+                                    self.param_sources
+                                        .entry(param)
+                                        .or_insert_with(Vec::new)
+                                        .push((block_id, incoming));
+                                }
+                            }
+                        }
+                    }
+                    Some(BranchInfo::Conditional(
+                        then_block,
+                        then_count,
+                        else_block,
+                        else_count,
+                    )) => {
+                        // Conditional branch: args[0] is the condition, args[1..1+then_count]
+                        // go to then_block params, args[1+then_count..] go to else_block params.
+                        let then_block = *then_block;
+                        let then_count = *then_count;
+                        let else_block = *else_block;
+                        let else_count = *else_count;
+
+                        if let Some(target_block) = layout.block_data.get(&then_block) {
+                            for i in 0..then_count {
+                                if let (Some(&param), Some(&incoming)) = (
+                                    target_block.params.get(i),
+                                    inst.args.get(1 + i),
+                                ) {
+                                    self.param_sources
+                                        .entry(param)
+                                        .or_insert_with(Vec::new)
+                                        .push((block_id, incoming));
+                                }
+                            }
+                        }
+                        if let Some(target_block) = layout.block_data.get(&else_block) {
+                            for i in 0..else_count {
+                                if let (Some(&param), Some(&incoming)) = (
+                                    target_block.params.get(i),
+                                    inst.args.get(1 + then_count + i),
+                                ) {
+                                    self.param_sources
+                                        .entry(param)
+                                        .or_insert_with(Vec::new)
+                                        .push((block_id, incoming));
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 
     /// Get the definition of a value
