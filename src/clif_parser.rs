@@ -482,7 +482,7 @@ impl Parser {
             "store" => Ok(Opcode::Store),
             "call" => Ok(Opcode::Call),
             "jump" => Ok(Opcode::Branch),
-            "brif" | "br_if" => Ok(Opcode::CondBranch),
+            "brif" => Ok(Opcode::CondBranch),
             "return" => Ok(Opcode::Return),
             "trap" => Ok(Opcode::Trap),
             "irem" => Ok(Opcode::Irem),
@@ -604,85 +604,87 @@ mod tests {
     #[test]
     fn test_simple_function() {
         let input = r#"
-function %test(i32) -> i32 {
-block0(v0: i32):
-    v1 = iconst.i32 1
-    v2 = iadd.i32 v0, v1
-    return v2
-}
-"#;
+                            function %test(i32) -> i32 {
+                            block0(v0: i32):
+                                v1 = iconst.i32 1
+                                v2 = iadd.i32 v0, v1
+                                return v2
+                            }
+                            "#;
 
         let result = parse_clif(input);
         assert!(result.is_ok(), "Parse failed: {:?}", result.err());
 
-        let (dfg, layout) = result.unwrap();
+        let (_, layout) = result.unwrap();
         assert_eq!(layout.blocks.len(), 1);
 
         let block = &layout.block_data[&BlockId(0)];
         assert_eq!(block.params.len(), 1);
-        assert!(block.insts.len() >= 2); // At least iconst and iadd
+        assert!(block.insts.len() >= 2);
     }
 
     #[test]
     fn test_conditional_branch() {
         let input = r#"
-function %test(i32) -> i32 {
-block0(v0: i32):
-    brif v0, block1(v0), block2(v0)
+                            function %test(i32) -> i32 {
+                            block0(v0: i32):
+                                brif v0, block1(v0), block2(v0)
 
-block1(v1: i32):
-    v2 = iconst.i32 1
-    return v2
+                            block1(v1: i32):
+                                v2 = iconst.i32 1
+                                return v2
 
-block2(v3: i32):
-    v4 = iconst.i32 0
-    return v4
-}
-"#;
+                            block2(v3: i32):
+                                v4 = iconst.i32 0
+                                return v4
+                            }
+                            "#;
 
         let result = parse_clif(input);
         assert!(result.is_ok(), "Parse failed: {:?}", result.err());
 
-        let (dfg, layout) = result.unwrap();
+        let (_, layout) = result.unwrap();
         assert_eq!(layout.blocks.len(), 3);
     }
 
     #[test]
     fn test_with_comments() {
         let input = r#"
-function %test(i32) -> i32 {
-block0(v0: i32):
-    v1 = iconst.i32 1 ; this is a constant
-    v2 = iadd.i32 v0, v1 ; add them
-    return v2
-}
-"#;
+                            function %test(i32) -> i32 {
+                            block0(v0: i32):
+                                v1 = iconst.i32 1 ; this is a constant
+                                v2 = iadd.i32 v0, v1 ; add them
+                                return v2
+                            }
+                            "#;
 
         let result = parse_clif(input);
         assert!(result.is_ok(), "Parse failed: {:?}", result.err());
+        let (_, layout) = result.unwrap();
+        assert_eq!(layout.blocks.len(), 1);
     }
 
     #[test]
     fn test_branch_display() {
         let input = r#"
-function %test_branches(i32) -> i32 {
-block0(v0: i32):
-    v1 = iconst.i32 10
-    v2 = icmp.eq.i32 v0, v1
-    brif v2, block1(v0), block2(v0)
+                            function %test_branches(i32) -> i32 {
+                            block0(v0: i32):
+                                v1 = iconst.i32 10
+                                v2 = icmp.eq.i32 v0, v1
+                                brif v2, block1(v0), block2(v0)
 
-block1(v3: i32):
-    v4 = iadd.i32 v3, v1
-    jump block3(v4)
+                            block1(v3: i32):
+                                v4 = iadd.i32 v3, v1
+                                jump block3(v4)
 
-block2(v5: i32):
-    v6 = imul.i32 v5, v1
-    jump block3(v6)
+                            block2(v5: i32):
+                                v6 = imul.i32 v5, v1
+                                jump block3(v6)
 
-block3(v7: i32):
-    return v7
-}
-"#;
+                            block3(v7: i32):
+                                return v7
+                            }
+                            "#;
 
         let result = parse_clif(input);
         assert!(result.is_ok(), "Parse failed: {:?}", result.err());
@@ -690,15 +692,12 @@ block3(v7: i32):
         let (dfg, layout) = result.unwrap();
         assert_eq!(layout.blocks.len(), 4, "Should have 4 blocks");
 
-        // Display the full CLIF format
-        println!("\n{}", "=".repeat(70));
         println!("Full CLIF Display with Branch Targets:");
-        println!("{}", "=".repeat(70));
+        println!("{}", "-".repeat(70));
         let clif_output = layout.display(&dfg, "test_branches", &[Type::I32], Some(Type::I32));
         println!("{}", clif_output);
-        println!("{}", "=".repeat(70));
+        println!("{}", "-".repeat(70));
 
-        // Check that branch instructions are parsed correctly
         let block0 = &layout.block_data[&BlockId(0)];
         let brif_inst_id = block0
             .insts
@@ -715,7 +714,6 @@ block3(v7: i32):
             "brif should have branch_info"
         );
 
-        // Verify brif display shows both branch targets
         let brif_display = dfg.display_inst(*brif_inst_id);
         assert!(
             brif_display.contains("brif"),
@@ -729,9 +727,8 @@ block3(v7: i32):
             brif_display.contains("block2"),
             "Display should contain 'block2'"
         );
-        println!("✓ brif display: {}", brif_display);
+        println!("brif display good: {}", brif_display);
 
-        // Check jump instruction in block1
         let block1 = &layout.block_data[&BlockId(1)];
         let jump_inst_id = block1
             .insts
@@ -748,7 +745,6 @@ block3(v7: i32):
             "jump should have branch_info"
         );
 
-        // Verify jump display shows target
         let jump_display = dfg.display_inst(*jump_inst_id);
         assert!(
             jump_display.contains("jump"),
@@ -758,9 +754,8 @@ block3(v7: i32):
             jump_display.contains("block3"),
             "Display should contain 'block3'"
         );
-        println!("✓ jump display: {}", jump_display);
+        println!("jump display good: {}", jump_display);
 
-        // Check jump instruction in block2
         let block2 = &layout.block_data[&BlockId(2)];
         let jump2_inst_id = block2
             .insts
@@ -775,6 +770,6 @@ block3(v7: i32):
             jump2_display.contains("block3"),
             "Display should contain 'block3'"
         );
-        println!("✓ jump display: {}", jump2_display);
+        println!("jump display good: {}", jump2_display);
     }
 }

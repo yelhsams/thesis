@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_basic_tokens() {
-        let input = "function %f(i32) -> i32 {";
+        let input = "function %f(i32) -> i32 {}";
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
 
@@ -301,6 +301,7 @@ mod tests {
         assert_eq!(tokens[5], Token::Arrow);
         assert_eq!(tokens[6], Token::Type("i32".to_string()));
         assert_eq!(tokens[7], Token::LBrace);
+        assert_eq!(tokens[8], Token::RBrace);
     }
 
     #[test]
@@ -328,7 +329,6 @@ mod tests {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize().unwrap();
 
-        // Comment should be converted to newline
         let iadd_pos = tokens
             .iter()
             .position(|t| matches!(t, Token::Opcode(s) if s == "iadd"))
