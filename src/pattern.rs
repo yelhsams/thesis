@@ -3028,6 +3028,30 @@ impl RewriteLibrary {
                 .build(),
         );
 
+        // irem(x, n) => x  when range proves x ∈ [0, n-1]
+        rules.push(
+            Rewrite::new("irem-identity-range")
+                .match_pattern(Pattern::op(
+                    Opcode::Irem,
+                    vec![Pattern::var("x"), Pattern::any_constant("n")],
+                ))
+                .produce(Pattern::var("x"))
+                .when(Condition::Custom {
+                    name: "x-range-lt-n-nonneg".to_string(),
+                    check: |bindings| {
+                        let n = match bindings.get_constant(&VarId::new("n")) {
+                            Some(n) if n > 0 => n,
+                            _ => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.min >= 0 && r.max < n)
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
         Self { rules }
     }
 

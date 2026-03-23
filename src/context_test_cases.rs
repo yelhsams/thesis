@@ -192,15 +192,17 @@ mod tests {
         let original_clif = r#"function %test(i32) -> i32 {
                                     block0(v0: i32):
                                         v1   = iconst.i32 4
-                                        v2  = icmp.ult.i32 v0, v1          ; v0 < 4 (unsigned)
-                                        brif v2, block1(v0), block2(v0)
+                                        v2   = icmp.ult.i32 v0, v1         ; v0 < 4
+                                        v3   = iconst.i32 0
+                                        v4   = icmp.sge.i32 v0, v3        ; v0 > 0
+                                        v5   = band.i32 v1, v4
+                                        brif v5, block1(v0), block2(v0)
 
                                     block1(v3: i32):
-                                        v4 = iconst.i32 4                         ; v0 ∈ [0, 3]
-                                        v5 = irem v0, v4         ; v0 % 4  — should equal v0
+                                        v5 = irem v0, v1         ; v0 % 4  — should equal v0
                                         return v5
 
-                                    block2(v6: i32):                            ; v0 ∈ [4, +∞]
+                                    block2(v6: i32):
                                         return v6
                                     }"#;
         let expected_clif = r#"function %test(i32) -> i32 {
