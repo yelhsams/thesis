@@ -501,6 +501,13 @@ impl EgraphPass {
     /// (i.e., all *non-self* sources agree on a single value), the param is
     /// loop-invariant and is replaced by that value.  A pure cycle with no
     /// external input (all sources are self-referential) is left unchanged.
+    ///
+    /// NOTE: The inline block-param propagation in `remove_pure_and_optimize`
+    /// now handles most cases (unconditional unions when all sources agree,
+    /// conditional unions when they disagree).  This method is kept as a
+    /// safety-net fallback for cases the inline approach cannot reach (e.g.,
+    /// cross-iteration convergence in loops, or values that only become
+    /// canonical after the full GVN pass completes).
     fn eliminate_redundant_params(&mut self) {
         let mut changed = true;
         while changed {
@@ -693,7 +700,7 @@ impl EgraphPass {
 
         let remat_values: HashSet<ValueId> = HashSet::new();
 
-        let mut branch_conditions: HashMap<BlockId, Vec<(ValueId, Option<i64>, Opcode, bool)>> =
+        let mut branch_conditions: HashMap<(BlockId, BlockId), Vec<(ValueId, Option<i64>, Opcode, bool)>> =
             HashMap::new();
 
         // Pre-compute branch conditions for each block by scanning all blocks
@@ -710,6 +717,7 @@ impl EgraphPass {
                             let cond_value = inst.args[0];
 
                             // Try to find if the condition is a comparison
+                            let mut handled = false;
                             if let ValueDef::Inst(cond_inst_id) = self.dfg.value_def(cond_value) {
                                 let cond_inst = &self.dfg.insts[&cond_inst_id];
                                 if cond_inst.opcode.is_comparison() {
@@ -727,7 +735,7 @@ impl EgraphPass {
 
                                     if let Some(lhs) = lhs {
                                         // For then block, condition is true
-                                        branch_conditions.entry(*then_block).or_default().push((
+                                        branch_conditions.entry((block_id, *then_block)).or_default().push((
                                             lhs,
                                             rhs_const,
                                             cond_inst.opcode,
@@ -735,14 +743,33 @@ impl EgraphPass {
                                         ));
 
                                         // For else block, condition is false
-                                        branch_conditions.entry(*else_block).or_default().push((
+                                        branch_conditions.entry((block_id, *else_block)).or_default().push((
                                             lhs,
                                             rhs_const,
                                             cond_inst.opcode,
                                             false,
                                         ));
+                                        handled = true;
                                     }
                                 }
+                            }
+
+                            // Fallback for non-comparison conditions:
+                            // `brif v` is semantically `brif (ne v, 0)`, so the
+                            // else branch learns v == 0 and the then branch v != 0.
+                            if !handled {
+                                branch_conditions.entry((block_id, *then_block)).or_default().push((
+                                    cond_value,
+                                    Some(0),
+                                    Opcode::Ne,
+                                    true,
+                                ));
+                                branch_conditions.entry((block_id, *else_block)).or_default().push((
+                                    cond_value,
+                                    Some(0),
+                                    Opcode::Ne,
+                                    false,
+                                ));
                             }
                         }
                     }
@@ -776,7 +803,11 @@ impl EgraphPass {
                     self.range_assumptions.push_scope();
 
                     // Learn range facts from branch conditions that lead to this block
-                    if let Some(conditions) = branch_conditions.get(&block) {
+                    // Iterate over all (pred, target) entries where target == block
+                    for (&(_, target), conditions) in &branch_conditions {
+                        if target != block {
+                            continue;
+                        }
                         for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
                             let facts =
                                 learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
@@ -837,6 +868,68 @@ impl EgraphPass {
                                 "    Singleton range substitution: {:?} => const {}",
                                 param, c
                             );
+                        }
+                    }
+
+                    // Inline block-param equivalence propagation: for each param,
+                    // look at its incoming values (param_sources) resolved through
+                    // value_to_opt_value.  If all agree, create an unconditional union;
+                    // if they disagree, create conditional unions per edge.
+                    for &param in &block_data.params {
+                        let sources = match self.dfg.param_sources.get(&param).cloned() {
+                            Some(s) if !s.is_empty() => s,
+                            _ => continue,
+                        };
+
+                        // Resolve each incoming value through value_to_opt_value
+                        let resolved: Vec<(BlockId, ValueId)> = sources
+                            .iter()
+                            .map(|&(pred, incoming)| {
+                                let resolved = value_to_opt_value.get(&incoming).copied().unwrap_or(incoming);
+                                (pred, resolved)
+                            })
+                            .collect();
+
+                        // Check if all resolved values agree
+                        let first_val = resolved[0].1;
+                        let all_agree = resolved.iter().all(|&(_, v)| v == first_val);
+
+                        if all_agree && first_val != param {
+                            // All sources agree on the same value — unconditional union
+                            let union_node = self.dfg.make_union(param, first_val);
+                            // Only update value_to_opt_value if singleton substitution
+                            // hasn't already replaced the param with something better
+                            // (e.g., a constant).
+                            let current = value_to_opt_value.get(&param).copied().unwrap_or(param);
+                            if current == param {
+                                value_to_opt_value.insert(param, first_val);
+                                if let Some(&avail) = available_block.get(&first_val) {
+                                    available_block.insert(param, avail);
+                                }
+                            }
+                            available_block.insert(union_node, block);
+                            self.stats.union += 1;
+                            println!(
+                                "    Param union (all agree): {:?} = union({:?}, {:?})",
+                                union_node, param, first_val
+                            );
+                        } else if !all_agree {
+                            // Sources disagree — create conditional unions per edge
+                            for &(pred, resolved_incoming) in &resolved {
+                                if resolved_incoming == param {
+                                    continue;
+                                }
+                                let assumptions = build_edge_assumptions(
+                                    pred,
+                                    block,
+                                    &branch_conditions,
+                                );
+                                self.dfg.make_conditional_union(param, resolved_incoming, assumptions);
+                                println!(
+                                    "    Param conditional union: {:?} ~ {:?} (from pred {:?})",
+                                    param, resolved_incoming, pred
+                                );
+                            }
                         }
                     }
 
@@ -918,6 +1011,29 @@ impl EgraphPass {
         // Save the GVN mapping for use in extraction
         self.gvn_mapping = value_to_opt_value;
     }
+}
+
+/// Build an `AssumptionSet` capturing the range facts that hold on the edge
+/// from `pred` to `target` (derived from branch conditions).
+///
+/// This is a free function rather than a method on `EgraphPass` to avoid
+/// borrow conflicts (`remove_pure_and_optimize` holds `&mut self` while
+/// `branch_conditions` is a local variable).
+fn build_edge_assumptions(
+    pred: BlockId,
+    target: BlockId,
+    branch_conditions: &HashMap<(BlockId, BlockId), Vec<(ValueId, Option<i64>, Opcode, bool)>>,
+) -> AssumptionSet {
+    let mut assumptions = Vec::new();
+    if let Some(conditions) = branch_conditions.get(&(pred, target)) {
+        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+            let facts = learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
+            for (value, range) in facts {
+                assumptions.push((value, range));
+            }
+        }
+    }
+    AssumptionSet { assumptions }
 }
 
 /// Context for optimization

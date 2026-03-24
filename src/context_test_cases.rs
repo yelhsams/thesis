@@ -40,6 +40,10 @@ fn normalize(s: &str) -> String {
 }
 
 fn helper(original_clif: &str, expected_clif: &str) {
+    helper_with_params(original_clif, expected_clif, &[Type::I32]);
+}
+
+fn helper_with_params(original_clif: &str, expected_clif: &str, sig_params: &[Type]) {
     let (dfg, layout) = parse_clif(original_clif).unwrap();
     let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
@@ -48,7 +52,7 @@ fn helper(original_clif: &str, expected_clif: &str) {
     println!("\nOptimized CLIF:");
     let output = pass
         .layout
-        .display(&pass.dfg, "test", &[Type::I32], Some(Type::I32));
+        .display(&pass.dfg, "test", sig_params, Some(Type::I32));
     println!("{}", output);
 
     assert_eq!(
@@ -302,5 +306,53 @@ mod tests {
                             }
                             "#;
         helper(original_clif, expected_clif);
+    }
+
+    /// Test that block-param inline propagation creates unions so that
+    /// a join-point param whose sources all resolve to the same value
+    /// is optimized away.
+    ///
+    /// v3=v0, v4=v1 (single-source params).  In block1, brif(v0==false)
+    /// means v0's range is [0,0], so v3→const 0, then iadd(0, v1)→v1,
+    /// so v5=v1.  In block2, v6=v1.  At block3, v7's sources are v5=v1
+    /// and v6=v1 — all agree, so v7=v1.  Final: return v1.
+    #[test]
+    fn test_propagate_block_params_inline() {
+        let original_clif = r#"
+            function %f(i32, i32) -> i32 {
+            block0(v0: i32, v1: i32):
+                brif v0, block2(v1), block1(v0, v1)
+
+            block1(v3: i32, v4: i32):
+                v5 = iadd.i32 v3, v4
+                jump block3(v5)
+
+            block2(v6: i32):
+                jump block3(v6)
+
+            block3(v7: i32):
+                return v7
+            }
+            "#;
+        let (dfg, layout) = parse_clif(original_clif).unwrap();
+        let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.run();
+
+        let output = pass
+            .layout
+            .display(&pass.dfg, "test", &[Type::I32, Type::I32], Some(Type::I32));
+        println!("\nOptimized CLIF:\n{}", output);
+
+        // The key optimization: the return instruction should use v1
+        // (the second block0 param), not v7 or any other intermediate.
+        // This verifies that block-param inline propagation unified
+        // v7 with v1 through the chain: v3→0, iadd(0,v1)→v1, v5→v1,
+        // v6→v1, and v7's sources all agree on v1.
+        assert!(
+            output.contains("return v1"),
+            "Expected 'return v1' in output, got:\n{}",
+            output
+        );
     }
 }
