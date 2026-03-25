@@ -81,16 +81,38 @@ pub struct Elaborator<'a> {
     /// Memoization: (value, block) -> elaborated value in that block
     elaborated_cache: HashMap<(ValueId, BlockId), ValueId>,
 
-    /// Optional range assumptions active at the current extraction site.
+    /// Mutable range assumptions active at the current extraction site.
     ///
     /// When set, conditional unions whose `AssumptionSet` is entailed by
     /// these assumptions are included as additional candidates during cost
-    /// computation and value elaboration.
-    pub range_assumptions: Option<&'a RangeAssumptions>,
+    /// computation and value elaboration. The elaborator pushes/pops scopes
+    /// as it walks the dominator tree.
+    pub range_assumptions: Option<&'a mut RangeAssumptions>,
+
+    /// Block entry facts per CFG edge, used to apply range assumptions
+    /// when entering each block during the domtree walk.
+    block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+
+    /// CFG predecessor map for looking up incoming edges per block.
+    cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
+
+    /// Per-domtree-level sets of `ValueId`s whose `best_value_cache` entries
+    /// were inserted or modified at that level. On `Pop`, these entries are
+    /// removed so that branch-local conditional-union results don't leak to
+    /// sibling branches.
+    cache_scope_stack: Vec<HashSet<ValueId>>,
 
     /// Statistics
     stats: &'a mut Stats,
 }
+
+/// Empty statics used as defaults when no block_entry_facts / cfg_preds are
+/// provided (e.g. in unit tests that use `Elaborator::new`).
+static EMPTY_ENTRY_FACTS: std::sync::LazyLock<
+    HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+> = std::sync::LazyLock::new(HashMap::new);
+static EMPTY_CFG_PREDS: std::sync::LazyLock<HashMap<BlockId, Vec<BlockId>>> =
+    std::sync::LazyLock::new(HashMap::new);
 
 impl<'a> Elaborator<'a> {
     pub fn new(
@@ -105,6 +127,9 @@ impl<'a> Elaborator<'a> {
             best_value_cache: HashMap::new(),
             elaborated_cache: HashMap::new(),
             range_assumptions: None,
+            block_entry_facts: &EMPTY_ENTRY_FACTS,
+            cfg_preds: &EMPTY_CFG_PREDS,
+            cache_scope_stack: Vec::new(),
             stats,
         }
     }
@@ -113,11 +138,15 @@ impl<'a> Elaborator<'a> {
     ///
     /// When range assumptions are provided, conditional unions whose
     /// `AssumptionSet` is entailed are included as additional candidates.
+    /// The elaborator will do a domtree-preorder walk, pushing/popping
+    /// range assumption scopes and applying block entry facts at each block.
     pub fn with_range_assumptions(
         dfg: &'a mut DataFlowGraph,
         domtree: &'a DominatorTree,
         stats: &'a mut Stats,
-        range_assumptions: &'a RangeAssumptions,
+        range_assumptions: &'a mut RangeAssumptions,
+        block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+        cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
     ) -> Self {
         Self {
             dfg,
@@ -126,27 +155,146 @@ impl<'a> Elaborator<'a> {
             best_value_cache: HashMap::new(),
             elaborated_cache: HashMap::new(),
             range_assumptions: Some(range_assumptions),
+            block_entry_facts,
+            cfg_preds,
+            cache_scope_stack: Vec::new(),
             stats,
         }
     }
 
-    /// Main elaboration entry point
+    /// Main elaboration entry point.
     ///
-    /// Traverses all blocks and ensures every value used is properly
-    /// elaborated (has a defining instruction in the layout).
+    /// When range assumptions are available, performs a domtree-preorder walk
+    /// (Visit/Pop stack pattern) so that conditional unions are evaluated in
+    /// the correct scoped context. Otherwise falls back to layout-order
+    /// traversal.
     pub fn elaborate(&mut self, layout: &Layout) {
         println!("\n=== Starting Elaboration ===\n");
 
-        // First pass: compute best costs for all values
-        self.compute_best_costs();
-
-        // Second pass: elaborate values in each block
-        for &block_id in &layout.blocks {
-            self.elaborate_block(block_id, layout);
+        if self.range_assumptions.is_some() {
+            self.elaborate_domtree(layout);
+        } else {
+            // Legacy path: no range assumptions, plain layout-order walk.
+            self.compute_best_costs();
+            for &block_id in &layout.blocks {
+                self.elaborate_block(block_id, layout);
+            }
         }
 
         println!("\n=== Elaboration Complete ===");
         println!("All pure values placed back into layout");
+    }
+
+    /// Domtree-preorder elaboration walk.
+    ///
+    /// Mirrors the Visit/Pop stack pattern from `remove_pure_and_optimize`:
+    /// - On `Visit(block)`: push a range assumption scope, apply entry facts,
+    ///   recompute best costs under the new assumptions, then elaborate.
+    /// - On `Pop`: pop the range assumption scope and invalidate cache entries
+    ///   that were influenced by the now-departed conditional context.
+    fn elaborate_domtree(&mut self, layout: &Layout) {
+        use crate::range::Range;
+
+        enum StackEntry {
+            Visit(BlockId),
+            Pop,
+        }
+
+        let root = match layout.entry_block() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut block_stack = vec![StackEntry::Visit(root)];
+
+        while let Some(entry) = block_stack.pop() {
+            match entry {
+                StackEntry::Visit(block) => {
+                    block_stack.push(StackEntry::Pop);
+                    // Push domtree children in reverse order for correct preorder
+                    for &child in self.domtree.children(block).iter().rev() {
+                        block_stack.push(StackEntry::Visit(child));
+                    }
+
+                    // --- Push range assumption scope ---
+                    // Safety: we only access range_assumptions mutably here and
+                    // the borrows in consider_conditional_unions / best_conditional_alternative
+                    // use raw-pointer casts that do not alias with push/pop.
+                    let ra = self.range_assumptions.as_deref_mut().unwrap();
+                    ra.push_scope();
+
+                    // Apply block entry facts (union across predecessors, same
+                    // logic as remove_pure_and_optimize).
+                    {
+                        let preds = self.cfg_preds.get(&block).cloned().unwrap_or_default();
+                        let num_edges = preds.len();
+                        if num_edges > 0 {
+                            let mut value_edge_count: HashMap<ValueId, usize> = HashMap::new();
+                            let mut value_union: HashMap<ValueId, Range> = HashMap::new();
+                            for pred in &preds {
+                                if let Some(facts) = self.block_entry_facts.get(&(*pred, block)) {
+                                    let mut per_edge: HashMap<ValueId, Range> = HashMap::new();
+                                    for &(value, range) in facts {
+                                        per_edge
+                                            .entry(value)
+                                            .and_modify(|acc| {
+                                                *acc = match acc.intersect(&range) {
+                                                    Some(r) => r,
+                                                    None => Range::empty(),
+                                                };
+                                            })
+                                            .or_insert(range);
+                                    }
+                                    for (value, range) in per_edge {
+                                        *value_edge_count.entry(value).or_insert(0) += 1;
+                                        value_union
+                                            .entry(value)
+                                            .and_modify(|acc| {
+                                                *acc = acc.union(&range);
+                                            })
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                            let ra = self.range_assumptions.as_deref_mut().unwrap();
+                            for (value, range) in &value_union {
+                                if value_edge_count.get(value) == Some(&num_edges)
+                                    && !range.is_unbounded()
+                                {
+                                    ra.assume_range(*value, *range);
+                                }
+                            }
+                        }
+                    }
+
+                    // Push a new cache-scope level to track entries added
+                    // under the current domtree context.
+                    self.cache_scope_stack.push(HashSet::new());
+
+                    // Recompute best costs for all values under the current
+                    // range assumptions (conditional unions may now fire).
+                    self.compute_best_costs();
+
+                    // Elaborate block instructions
+                    self.elaborate_block(block, layout);
+                }
+
+                StackEntry::Pop => {
+                    // Pop range assumption scope
+                    let ra = self.range_assumptions.as_deref_mut().unwrap();
+                    ra.pop_scope();
+
+                    // Invalidate cache entries that were added/modified at
+                    // this domtree level — they may have been influenced by
+                    // conditional unions that are no longer in scope.
+                    if let Some(dirty) = self.cache_scope_stack.pop() {
+                        for value in dirty {
+                            self.best_value_cache.remove(&value);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Compute the best cost for each value by exploring the egraph
@@ -219,7 +367,7 @@ impl<'a> Elaborator<'a> {
     /// are entailed by the active range context, include the other side as a
     /// candidate that may lower the best cost.
     fn consider_conditional_unions(&mut self, value: ValueId) {
-        let ra = match self.range_assumptions {
+        let ra = match self.range_assumptions.as_deref() {
             Some(ra) => ra as *const RangeAssumptions,
             None => return,
         };
@@ -250,6 +398,10 @@ impl<'a> Elaborator<'a> {
             if cand_cost < current.0 {
                 let cand_entry = self.best_value_cache[&candidate];
                 self.best_value_cache.insert(value, cand_entry);
+                // Track this value as dirty at the current domtree level
+                if let Some(scope) = self.cache_scope_stack.last_mut() {
+                    scope.insert(value);
+                }
             }
         }
     }
@@ -341,7 +493,10 @@ impl<'a> Elaborator<'a> {
         value: ValueId,
         block_id: BlockId,
     ) -> Option<ValueId> {
-        let ra = self.range_assumptions? as *const RangeAssumptions;
+        let ra = match self.range_assumptions.as_deref() {
+            Some(ra) => ra as *const RangeAssumptions,
+            None => return None,
+        };
         let ra = unsafe { &*ra };
 
         let current_cost = self.compute_best_cost(value);

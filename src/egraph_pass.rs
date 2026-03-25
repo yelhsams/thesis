@@ -37,6 +37,13 @@ pub struct EgraphPass {
     gvn_mapping: HashMap<ValueId, ValueId>,
 
     pub range_assumptions: RangeAssumptions,
+
+    /// Range facts per CFG edge (pred, target), populated during
+    /// `remove_pure_and_optimize` and reused by the elaborator's domtree walk.
+    pub block_entry_facts: HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+
+    /// CFG predecessor map, populated during `remove_pure_and_optimize`.
+    pub cfg_preds: HashMap<BlockId, Vec<BlockId>>,
 }
 
 impl EgraphPass {
@@ -49,6 +56,8 @@ impl EgraphPass {
             rewrite_engine: RewriteEngine::with_standard_library(),
             gvn_mapping: HashMap::new(),
             range_assumptions: RangeAssumptions::new(),
+            block_entry_facts: HashMap::new(),
+            cfg_preds: HashMap::new(),
         }
     }
 
@@ -1487,6 +1496,9 @@ impl EgraphPass {
         }
         // Save the GVN mapping for use in extraction
         self.gvn_mapping = value_to_opt_value;
+        // Save block_entry_facts and cfg_preds for the elaborator's domtree walk
+        self.block_entry_facts = block_entry_facts;
+        self.cfg_preds = cfg_preds;
     }
 }
 
