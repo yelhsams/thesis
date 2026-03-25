@@ -1108,13 +1108,30 @@ impl EgraphPass {
                     }
 
                     // Apply nonzero marks from incoming edge conditions
-                    for ((pred, target), conditions) in &block_edge_conditions {
-                        if *target != block || *pred == block {
-                            continue;
-                        }
-                        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
-                            if opcode == Opcode::Ne && is_true_branch && rhs_const == Some(0) {
-                                self.range_assumptions.mark_nonzero(lhs);
+                    // Only mark nonzero if ALL predecessor edges agree.
+                    {
+                        let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
+                        let num_preds = preds.len();
+                        if num_preds > 0 {
+                            let mut nonzero_edge_count: HashMap<ValueId, usize> = HashMap::new();
+                            for pred in &preds {
+                                if let Some(conditions) =
+                                    block_edge_conditions.get(&(*pred, block))
+                                {
+                                    for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+                                        if opcode == Opcode::Ne
+                                            && is_true_branch
+                                            && rhs_const == Some(0)
+                                        {
+                                            *nonzero_edge_count.entry(lhs).or_insert(0) += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            for (value, count) in &nonzero_edge_count {
+                                if *count == num_preds {
+                                    self.range_assumptions.mark_nonzero(*value);
+                                }
                             }
                         }
                     }
