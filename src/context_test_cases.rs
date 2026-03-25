@@ -245,7 +245,7 @@ mod tests {
                                         v2   = icmp.ult.i32 v0, v1         ; v0 < 4
                                         v3   = iconst.i32 0
                                         v4   = icmp.sge.i32 v0, v3        ; v0 > 0
-                                        v5   = band.i32 v1, v4
+                                        v5   = band.i32 v2, v4
                                         brif v5, block1(v0), block2(v0)
 
                                     block1(v3: i32):
