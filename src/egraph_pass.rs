@@ -63,15 +63,7 @@ impl EgraphPass {
 
     /// Run the complete egraph pass
     pub fn run(&mut self) {
-        println!("Starting Egraph Pass...");
-
-        println!("Initial IR (without optimization):");
         let (func_name, sig_params, sig_return) = self.get_function_signature();
-        println!(
-            "{}",
-            self.layout
-                .display(&self.dfg, &func_name, &sig_params, sig_return)
-        );
 
         // Repeat until fixed point.
         const MAX_RANGE_ITERATIONS: usize = 3;
@@ -85,31 +77,31 @@ impl EgraphPass {
             self.stats.range_refinement_iterations += 1;
             let new_unions = self.range_refine_iteration();
             self.stats.range_refinement_new_unions += new_unions as u64;
-            println!(
-                "  Range refinement iteration {}: {} new unions created",
-                iteration + 2,
-                new_unions
-            );
             // Phase 1b: Redundant phi elimination — after GVN has run, any block
             // param whose every predecessor passes the same canonical value can be
             // replaced outright (avoids a spurious join at the phi node).
             self.eliminate_redundant_params();
 
             if new_unions == 0 {
-                println!("  Fixed point reached after {} iterations", iteration + 2);
                 break;
             }
         }
 
-        println!();
-
         // Print intermediate state showing unions
-        println!("After building egraph (with union nodes):");
-        println!("{}", "─".repeat(60));
         self.print_egraph_state();
 
         let canonical_map = self.extract_best_values();
         self.rebuild_layout(&canonical_map);
+
+        // Iterative CFG simplification
+        for _ in 0..4 {
+            self.eliminate_dead_blocks();
+            self.simplify_constant_brif();
+            self.simplify_trivial_blocks();
+            self.simplify_redundant_brif();
+            self.simplify_uniform_returns();
+        }
+        self.eliminate_dead_blocks();
 
         // Print final statistics
         self.stats.print_summary();
@@ -119,8 +111,6 @@ impl EgraphPass {
     /// Extract the best (cheapest) representative from each equivalence class
     /// and update all instructions to use those representatives
     fn extract_best_values(&mut self) -> HashMap<ValueId, ValueId> {
-        println!("Finding canonical representatives for all values...\n");
-
         // Build a map from each value to its canonical representative
         let mut canonical_map: HashMap<ValueId, ValueId> = HashMap::new();
 
@@ -156,18 +146,11 @@ impl EgraphPass {
             }
         }
 
-        println!(
-            "\nExtraction complete: updated {} instructions\n",
-            updated_count
-        );
-
         canonical_map
     }
 
     /// Rebuild the layout to only include necessary instructions
     fn rebuild_layout(&mut self, _canonical_map: &HashMap<ValueId, ValueId>) {
-        println!("Rebuilding layout with canonical values...");
-
         // For each block, rebuild its instruction list
         for &block_id in &self.layout.blocks.clone() {
             let block_data = self.layout.block_data.get(&block_id).unwrap();
@@ -232,14 +215,7 @@ impl EgraphPass {
             let original_count = block.insts.len();
             block.insts = new_insts;
             let new_count = block.insts.len();
-
-            println!(
-                "  Block {}: {} insts -> {} insts",
-                block_id.0, original_count, new_count
-            );
         }
-
-        println!();
     }
 
     /// Topologically sort instructions so that definitions come before uses
@@ -442,34 +418,20 @@ impl EgraphPass {
     /// Print the current state of the egraph including union nodes
     fn print_egraph_state(&self) {
         // Show all value definitions including unions
-        println!("Value definitions:");
         let mut values: Vec<_> = self.dfg.value_defs.keys().copied().collect();
         values.sort();
 
         for value in values {
             let def_str = self.dfg.display_value_def(value);
             match self.dfg.value_def(value) {
-                ValueDef::Union(_, _) => {
-                    println!("  {} ← UNION NODE", def_str);
-                }
-                ValueDef::BlockParam(_, _) => {
-                    println!("  {} ← BLOCK PARAM", def_str);
-                }
-                ValueDef::Inst(_) => {
-                    println!("  {}", def_str);
-                }
+                ValueDef::Union(_, _) => {}
+                ValueDef::BlockParam(_, _) => {}
+                ValueDef::Inst(_) => {}
             }
         }
-        println!();
 
         // Show the layout (skeleton)
-        println!("Remaining skeleton (control flow):");
         let (func_name, sig_params, sig_return) = self.get_function_signature();
-        println!(
-            "{}",
-            self.layout
-                .display(&self.dfg, &func_name, &sig_params, sig_return)
-        );
     }
 
     /// Add a custom rewrite rule to the engine
@@ -488,6 +450,357 @@ impl EgraphPass {
         &self.gvn_mapping
     }
 
+    /// If every return instruction in the function returns the same value,
+    /// and that value is available in the entry block or is a constant,
+    /// replace the entire function body with `return value`.
+    fn simplify_uniform_returns(&mut self) {
+        let entry = match self.layout.entry_block() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut return_values: Vec<ValueId> = Vec::new();
+        for &block_id in &self.layout.blocks {
+            if let Some(block) = self.layout.block_data.get(&block_id) {
+                for &inst_id in &block.insts {
+                    let inst = &self.dfg.insts[&inst_id];
+                    if inst.opcode == Opcode::Return {
+                        if let Some(&ret_val) = inst.args.first() {
+                            return_values.push(ret_val);
+                        }
+                    }
+                }
+            }
+        }
+
+        if return_values.is_empty() {
+            return;
+        }
+
+        let first = return_values[0];
+        if !return_values.iter().all(|&v| v == first) {
+            return;
+        }
+
+        let entry_data = self.layout.block_data.get(&entry).unwrap();
+        let is_entry_param = entry_data.params.contains(&first);
+        let is_entry_defined = entry_data
+            .insts
+            .iter()
+            .any(|&iid| self.dfg.inst_results(iid).contains(&first));
+
+        if !is_entry_param && !is_entry_defined {
+            if let Some(c) = self.dfg.value_imm(first) {
+                let const_inst = Instruction::with_imm(Opcode::Const, vec![], Type::I32, c);
+                let const_inst_id = self.dfg.make_inst(const_inst);
+                let const_val = self.dfg.make_inst_result(const_inst_id, Type::I32);
+
+                let ret_inst = Instruction::new(Opcode::Return, vec![const_val], Type::I32);
+                let ret_id = self.dfg.make_inst(ret_inst);
+
+                let entry_data = self.layout.block_data.get_mut(&entry).unwrap();
+                entry_data.insts = vec![const_inst_id, ret_id];
+                self.layout.blocks = vec![entry];
+                return;
+            }
+            return;
+        }
+
+        let entry_data = self.layout.block_data.get_mut(&entry).unwrap();
+        if let Some(&last_inst_id) = entry_data.insts.last() {
+            let last = &self.dfg.insts[&last_inst_id];
+            if last.branch_info.is_some() {
+                let ret_inst = Instruction::new(Opcode::Return, vec![first], Type::I32);
+                let ret_id = self.dfg.make_inst(ret_inst);
+
+                let mut needed = HashSet::new();
+                let mut work = vec![first];
+                while let Some(v) = work.pop() {
+                    if let ValueDef::Inst(iid) = self.dfg.value_def(v) {
+                        if needed.insert(iid) {
+                            for &arg in &self.dfg.insts[&iid].args {
+                                work.push(arg);
+                            }
+                        }
+                    }
+                }
+
+                let old_insts = entry_data.insts.clone();
+                entry_data.insts = old_insts
+                    .into_iter()
+                    .filter(|iid| needed.contains(iid))
+                    .collect();
+                entry_data.insts.push(ret_id);
+
+                self.layout.blocks = vec![entry];
+            }
+        }
+    }
+
+    /// Simplify brif instructions whose condition is a known constant.
+    fn simplify_constant_brif(&mut self) {
+        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+        for inst_id in all_insts {
+            let inst = self.dfg.insts[&inst_id].clone();
+            if let Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) = &inst.branch_info {
+                let cond = inst.args[0];
+                if let Some(val) = self.dfg.value_imm(cond) {
+                    let (target, count, offset) = if val != 0 {
+                        (*then_b, *tc, 1usize)
+                    } else {
+                        (*else_b, *ec, 1 + tc)
+                    };
+                    let new_args: Vec<ValueId> = inst.args[offset..offset + count].to_vec();
+                    let new_inst = Instruction::with_branch(
+                        Opcode::Branch,
+                        new_args,
+                        inst.ty,
+                        BranchInfo::Jump(target),
+                    );
+                    self.dfg.insts.insert(inst_id, new_inst);
+                }
+            }
+        }
+    }
+
+    /// Eliminate dead (unreachable) blocks.
+    fn eliminate_dead_blocks(&mut self) {
+        let entry = match self.layout.entry_block() {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut reachable = HashSet::new();
+        let mut work = vec![entry];
+        while let Some(b) = work.pop() {
+            if !reachable.insert(b) {
+                continue;
+            }
+            if let Some(block) = self.layout.block_data.get(&b) {
+                for &inst_id in &block.insts {
+                    let inst = &self.dfg.insts[&inst_id];
+                    match &inst.branch_info {
+                        Some(BranchInfo::Jump(t)) => work.push(*t),
+                        Some(BranchInfo::Conditional(t, _, e, _)) => {
+                            work.push(*t);
+                            work.push(*e);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        self.layout.blocks.retain(|b| reachable.contains(b));
+    }
+
+    /// Simplify trivial blocks (single-instruction blocks).
+    fn simplify_trivial_blocks(&mut self) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let blocks = self.layout.blocks.clone();
+            for &block_id in &blocks {
+                let block = match self.layout.block_data.get(&block_id) {
+                    Some(b) => b.clone(),
+                    None => continue,
+                };
+
+                if block.insts.len() != 1 {
+                    continue;
+                }
+                let inst = &self.dfg.insts[&block.insts[0]];
+
+                // Case 1: Block with only a return — inline into predecessors
+                if inst.opcode == Opcode::Return && !inst.args.is_empty() {
+                    let ret_val = inst.args[0];
+                    if Some(block_id) != self.layout.entry_block() {
+                        let param_idx = block.params.iter().position(|&p| p == ret_val);
+
+                        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+                        for pred_inst_id in all_insts {
+                            let pred_inst = self.dfg.insts[&pred_inst_id].clone();
+                            match &pred_inst.branch_info {
+                                Some(BranchInfo::Jump(t)) if *t == block_id => {
+                                    let actual_val = if let Some(idx) = param_idx {
+                                        pred_inst.args.get(idx).copied().unwrap_or(ret_val)
+                                    } else {
+                                        ret_val
+                                    };
+                                    let new_inst = Instruction::new(
+                                        Opcode::Return,
+                                        vec![actual_val],
+                                        pred_inst.ty,
+                                    );
+                                    self.dfg.insts.insert(pred_inst_id, new_inst);
+                                    changed = true;
+                                }
+                                Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) => {
+                                    let then_b = *then_b;
+                                    let tc = *tc;
+                                    let else_b = *else_b;
+                                    let ec = *ec;
+
+                                    if then_b != block_id && else_b != block_id {
+                                        continue;
+                                    }
+
+                                    if then_b == block_id && else_b == block_id {
+                                        let then_val = if let Some(idx) = param_idx {
+                                            pred_inst.args.get(1 + idx).copied().unwrap_or(ret_val)
+                                        } else {
+                                            ret_val
+                                        };
+                                        let else_val = if let Some(idx) = param_idx {
+                                            pred_inst
+                                                .args
+                                                .get(1 + tc + idx)
+                                                .copied()
+                                                .unwrap_or(ret_val)
+                                        } else {
+                                            ret_val
+                                        };
+                                        if then_val == else_val {
+                                            let new_inst = Instruction::new(
+                                                Opcode::Return,
+                                                vec![then_val],
+                                                pred_inst.ty,
+                                            );
+                                            self.dfg.insts.insert(pred_inst_id, new_inst);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // Case 2: Block with only a jump — forward predecessors
+                let (target, jump_args) = match &inst.branch_info {
+                    Some(BranchInfo::Jump(t)) => (*t, inst.args.clone()),
+                    _ => continue,
+                };
+
+                if Some(block_id) == self.layout.entry_block() || target == block_id {
+                    continue;
+                }
+
+                let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+                for pred_inst_id in all_insts {
+                    let pred_inst = self.dfg.insts[&pred_inst_id].clone();
+                    match &pred_inst.branch_info {
+                        Some(BranchInfo::Jump(t)) if *t == block_id => {
+                            let mut new_args = Vec::new();
+                            for &jump_arg in &jump_args {
+                                let resolved = block
+                                    .params
+                                    .iter()
+                                    .position(|&p| p == jump_arg)
+                                    .and_then(|idx| pred_inst.args.get(idx).copied())
+                                    .unwrap_or(jump_arg);
+                                new_args.push(resolved);
+                            }
+                            let mut new_inst = pred_inst.clone();
+                            new_inst.branch_info = Some(BranchInfo::Jump(target));
+                            new_inst.args = new_args;
+                            self.dfg.insts.insert(pred_inst_id, new_inst);
+                            changed = true;
+                        }
+                        Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) => {
+                            let then_b = *then_b;
+                            let tc = *tc;
+                            let else_b = *else_b;
+                            let ec = *ec;
+
+                            if then_b != block_id && else_b != block_id {
+                                continue;
+                            }
+
+                            let mut new_inst = pred_inst.clone();
+                            if then_b == block_id {
+                                let then_args: Vec<ValueId> =
+                                    (0..tc).map(|i| pred_inst.args[1 + i]).collect();
+                                let mut new_then_args = Vec::new();
+                                for &jump_arg in &jump_args {
+                                    let resolved = block
+                                        .params
+                                        .iter()
+                                        .position(|&p| p == jump_arg)
+                                        .and_then(|idx| then_args.get(idx).copied())
+                                        .unwrap_or(jump_arg);
+                                    new_then_args.push(resolved);
+                                }
+                                let else_args: Vec<ValueId> =
+                                    (0..ec).map(|i| pred_inst.args[1 + tc + i]).collect();
+                                let new_tc = new_then_args.len();
+                                new_inst.args = vec![pred_inst.args[0]];
+                                new_inst.args.extend(new_then_args);
+                                new_inst.args.extend(&else_args);
+                                new_inst.branch_info =
+                                    Some(BranchInfo::Conditional(target, new_tc, else_b, ec));
+                                changed = true;
+                            }
+                            if else_b == block_id {
+                                let current_info = new_inst.branch_info.clone().unwrap();
+                                let (cur_then, cur_tc, _, _) = match current_info {
+                                    BranchInfo::Conditional(t, tc, _, ec) => (t, tc, block_id, ec),
+                                    _ => unreachable!(),
+                                };
+                                let else_start = 1 + cur_tc;
+                                let else_args: Vec<ValueId> = new_inst.args[else_start..].to_vec();
+                                let mut new_else_args = Vec::new();
+                                for &jump_arg in &jump_args {
+                                    let resolved = block
+                                        .params
+                                        .iter()
+                                        .position(|&p| p == jump_arg)
+                                        .and_then(|idx| else_args.get(idx).copied())
+                                        .unwrap_or(jump_arg);
+                                    new_else_args.push(resolved);
+                                }
+                                let new_ec = new_else_args.len();
+                                new_inst.args.truncate(else_start);
+                                new_inst.args.extend(new_else_args);
+                                new_inst.branch_info =
+                                    Some(BranchInfo::Conditional(cur_then, cur_tc, target, new_ec));
+                                changed = true;
+                            }
+                            self.dfg.insts.insert(pred_inst_id, new_inst);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Simplify redundant brif: if both branches go to the same block with the
+    /// same arguments, replace with an unconditional jump.
+    fn simplify_redundant_brif(&mut self) {
+        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+        for inst_id in all_insts {
+            let inst = self.dfg.insts[&inst_id].clone();
+            if let Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) = &inst.branch_info {
+                if then_b == else_b && tc == ec {
+                    let then_args: Vec<ValueId> = (0..*tc).map(|i| inst.args[1 + i]).collect();
+                    let else_args: Vec<ValueId> = (0..*ec).map(|i| inst.args[1 + tc + i]).collect();
+                    if then_args == else_args {
+                        let new_inst = Instruction::with_branch(
+                            Opcode::Branch,
+                            then_args,
+                            inst.ty,
+                            BranchInfo::Jump(*then_b),
+                        );
+                        self.dfg.insts.insert(inst_id, new_inst);
+                    }
+                }
+            }
+        }
+    }
+
     /// Redundant phi (block-param) elimination.
     ///
     /// After GVN has run, each block parameter's incoming values may all
@@ -501,6 +814,13 @@ impl EgraphPass {
     /// (i.e., all *non-self* sources agree on a single value), the param is
     /// loop-invariant and is replaced by that value.  A pure cycle with no
     /// external input (all sources are self-referential) is left unchanged.
+    ///
+    /// NOTE: The inline block-param propagation in `remove_pure_and_optimize`
+    /// now handles most cases (unconditional unions when all sources agree,
+    /// conditional unions when they disagree).  This method is kept as a
+    /// safety-net fallback for cases the inline approach cannot reach (e.g.,
+    /// cross-iteration convergence in loops, or values that only become
+    /// canonical after the full GVN pass completes).
     fn eliminate_redundant_params(&mut self) {
         let mut changed = true;
         while changed {
@@ -579,7 +899,6 @@ impl EgraphPass {
                     // Record in the GVN mapping so subsequent find_canonical calls
                     // and extract_best_values pick up the replacement.
                     self.gvn_mapping.insert(param, first);
-                    println!("  eliminate_redundant_params: {:?} → {:?}", param, first);
                     changed = true;
                 }
             }
@@ -661,10 +980,6 @@ impl EgraphPass {
                 if rewritten != value {
                     let _new_union = self.dfg.make_union(value, rewritten);
                     self.stats.union += 1;
-                    println!(
-                        "    Range refinement: new union {:?} = {:?} ∪ {:?}",
-                        _new_union, value, rewritten
-                    );
                 }
             }
         }
@@ -693,8 +1008,10 @@ impl EgraphPass {
 
         let remat_values: HashSet<ValueId> = HashSet::new();
 
-        let mut branch_conditions: HashMap<BlockId, Vec<(ValueId, Option<i64>, Opcode, bool)>> =
-            HashMap::new();
+        let mut branch_conditions: HashMap<
+            (BlockId, BlockId),
+            Vec<(ValueId, Option<i64>, Opcode, bool)>,
+        > = HashMap::new();
 
         // Pre-compute branch conditions for each block by scanning all blocks
         for &block_id in &self.layout.blocks {
@@ -710,6 +1027,7 @@ impl EgraphPass {
                             let cond_value = inst.args[0];
 
                             // Try to find if the condition is a comparison
+                            let mut handled = false;
                             if let ValueDef::Inst(cond_inst_id) = self.dfg.value_def(cond_value) {
                                 let cond_inst = &self.dfg.insts[&cond_inst_id];
                                 if cond_inst.opcode.is_comparison() {
@@ -727,22 +1045,33 @@ impl EgraphPass {
 
                                     if let Some(lhs) = lhs {
                                         // For then block, condition is true
-                                        branch_conditions.entry(*then_block).or_default().push((
-                                            lhs,
-                                            rhs_const,
-                                            cond_inst.opcode,
-                                            true,
-                                        ));
+                                        branch_conditions
+                                            .entry((block_id, *then_block))
+                                            .or_default()
+                                            .push((lhs, rhs_const, cond_inst.opcode, true));
 
                                         // For else block, condition is false
-                                        branch_conditions.entry(*else_block).or_default().push((
-                                            lhs,
-                                            rhs_const,
-                                            cond_inst.opcode,
-                                            false,
-                                        ));
+                                        branch_conditions
+                                            .entry((block_id, *else_block))
+                                            .or_default()
+                                            .push((lhs, rhs_const, cond_inst.opcode, false));
+                                        handled = true;
                                     }
                                 }
+                            }
+
+                            // Fallback for non-comparison conditions:
+                            // `brif v` is semantically `brif (ne v, 0)`, so the
+                            // else branch learns v == 0 and the then branch v != 0.
+                            if !handled {
+                                branch_conditions
+                                    .entry((block_id, *then_block))
+                                    .or_default()
+                                    .push((cond_value, Some(0), Opcode::Ne, true));
+                                branch_conditions
+                                    .entry((block_id, *else_block))
+                                    .or_default()
+                                    .push((cond_value, Some(0), Opcode::Ne, false));
                             }
                         }
                     }
@@ -762,8 +1091,6 @@ impl EgraphPass {
         while let Some(entry) = block_stack.pop() {
             match entry {
                 StackEntry::Visit(block) => {
-                    println!("Processing block {:?}", block);
-
                     block_stack.push(StackEntry::Pop);
                     for &child in self.domtree.children(block) {
                         block_stack.push(StackEntry::Visit(child));
@@ -775,41 +1102,61 @@ impl EgraphPass {
                     // Push scope for range assumptions
                     self.range_assumptions.push_scope();
 
-                    // Learn range facts from branch conditions that lead to this block
-                    if let Some(conditions) = branch_conditions.get(&block) {
-                        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
-                            let facts =
-                                learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
-                            for (value, range) in facts {
-                                println!("    Learning range fact: {:?} in {}", value, range);
-                                self.range_assumptions.assume_range(value, range);
+                    let block_data = self.layout.block_data[&block].clone();
+
+                    // Per-edge join-point range propagation BEFORE learning branch
+                    // conditions, so we use the parent-scope ranges as the base.
+                    // Edge-specific conditions are applied per-edge to narrow each
+                    // incoming value's range independently.
+                    for &param in &block_data.params {
+                        if let Some(sources) = self.dfg.param_sources.get(&param).cloned() {
+                            let mut joined = Range::empty();
+                            for &(pred, incoming) in &sources {
+                                if pred == block {
+                                    continue;
+                                } // Skip self-loop sources
+                                let mut src_range = self.range_assumptions.get_range(incoming);
+                                // Apply edge-specific conditions to narrow the range
+                                if let Some(conditions) = branch_conditions.get(&(pred, block)) {
+                                    for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+                                        let facts = learn_from_comparison(
+                                            opcode,
+                                            lhs,
+                                            rhs_const,
+                                            is_true_branch,
+                                        );
+                                        for (value, range) in facts {
+                                            if value == incoming {
+                                                src_range = match src_range.intersect(&range) {
+                                                    Some(r) => r,
+                                                    None => Range::empty(),
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                joined = joined.union(&src_range);
+                            }
+                            if !joined.is_empty() && !joined.is_unbounded() {
+                                self.range_assumptions.assume_range(param, joined);
                             }
                         }
                     }
 
-                    let block_data = self.layout.block_data[&block].clone();
-
-                    // Join-point range propagation: for each block param, compute
-                    // the union of the ranges of all incoming values.  When all
-                    // predecessors deliver values in a known bounded range the param
-                    // inherits that range, enabling further downstream optimisations.
-                    //
-                    // Note: param_sources stores the *raw* incoming ValueIds as they
-                    // appear in branch instructions.  We look up the current (scoped)
-                    // range for each incoming value; at this point in the dominator-
-                    // tree walk the predecessor's block-local range facts have already
-                    // been recorded in the root scope via range propagation from insts.
-                    for &param in &block_data.params {
-                        if let Some(sources) = self.dfg.param_sources.get(&param).cloned() {
-                            let joined = sources
-                                .iter()
-                                .map(|&(_, incoming)| self.range_assumptions.get_range(incoming))
-                                .fold(Range::empty(), |acc, r| acc.union(&r));
-                            // Only apply if the union is non-empty (at least one source
-                            // was known) and strictly tighter than the unbounded default.
-                            if !joined.is_empty() && !joined.is_unbounded() {
-                                println!("    Join-point range: {:?} => {}", param, joined);
-                                self.range_assumptions.assume_range(param, joined);
+                    // NOW learn range facts from branch conditions that lead to
+                    // this block (after per-edge join, so join uses parent ranges).
+                    for (&(pred, target), conditions) in &branch_conditions {
+                        if target != block || pred == block {
+                            continue;
+                        }
+                        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+                            let facts =
+                                learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
+                            for (value, range) in facts {
+                                self.range_assumptions.assume_range(value, range);
+                            }
+                            if opcode == Opcode::Ne && is_true_branch && rhs_const == Some(0) {
+                                self.range_assumptions.mark_nonzero(lhs);
                             }
                         }
                     }
@@ -825,18 +1172,98 @@ impl EgraphPass {
                         // downstream rewrites can fire.
                         let range = self.range_assumptions.get_range(param);
                         if let Some(c) = range.as_singleton() {
-                            // Look for an existing const instruction with this value
-                            // (to avoid duplicates) or create a new one.
                             let const_inst =
                                 Instruction::with_imm(Opcode::Const, vec![], Type::I32, c);
-                            let const_inst_id = self.dfg.make_inst(const_inst);
-                            let const_val = self.dfg.make_inst_result(const_inst_id, Type::I32);
+                            let key = (Type::I32, const_inst.clone());
+                            let const_val = if let Some(Some(existing)) = gvn_map.get(&key) {
+                                *existing
+                            } else {
+                                let const_inst_id = self.dfg.make_inst(const_inst);
+                                let cv = self.dfg.make_inst_result(const_inst_id, Type::I32);
+                                gvn_map.insert(key, Some(cv));
+                                available_block.insert(cv, block);
+                                cv
+                            };
                             value_to_opt_value.insert(param, const_val);
-                            available_block.insert(const_val, block);
-                            println!(
-                                "    Singleton range substitution: {:?} => const {}",
-                                param, c
-                            );
+                        }
+                    }
+
+                    // Inline block-param equivalence propagation: for each param,
+                    // look at its incoming values (param_sources) resolved through
+                    // value_to_opt_value.  If all agree, create an unconditional union;
+                    // if they disagree, create conditional unions per edge.
+                    for &param in &block_data.params {
+                        let sources = match self.dfg.param_sources.get(&param).cloned() {
+                            Some(s) if !s.is_empty() => s,
+                            _ => continue,
+                        };
+
+                        // Resolve each incoming value through value_to_opt_value
+                        let resolved: Vec<(BlockId, ValueId)> = sources
+                            .iter()
+                            .map(|&(pred, incoming)| {
+                                let resolved = value_to_opt_value
+                                    .get(&incoming)
+                                    .copied()
+                                    .unwrap_or(incoming);
+                                (pred, resolved)
+                            })
+                            .collect();
+
+                        // Filter out self-referential sources (loop-carried back-edges)
+                        let non_self: Vec<(BlockId, ValueId)> = resolved
+                            .iter()
+                            .filter(|&&(_, v)| v != param)
+                            .copied()
+                            .collect();
+
+                        if non_self.is_empty() {
+                            continue;
+                        }
+
+                        // Check if all non-self resolved values agree (by ID or constant value)
+                        let first_val = non_self[0].1;
+                        let mut all_agree = non_self.iter().all(|&(_, v)| v == first_val);
+
+                        // If IDs don't match, check if they all represent the same constant
+                        if !all_agree {
+                            let first_const = self.dfg.value_imm(first_val);
+                            if let Some(c) = first_const {
+                                all_agree = non_self
+                                    .iter()
+                                    .all(|&(_, v)| self.dfg.value_imm(v) == Some(c));
+                            }
+                        }
+
+                        if all_agree && first_val != param {
+                            // All sources agree on the same value — unconditional union
+                            let union_node = self.dfg.make_union(param, first_val);
+                            // Only update value_to_opt_value if singleton substitution
+                            // hasn't already replaced the param with something better
+                            // (e.g., a constant).
+                            let current = value_to_opt_value.get(&param).copied().unwrap_or(param);
+                            if current == param {
+                                value_to_opt_value.insert(param, first_val);
+                                if let Some(&avail) = available_block.get(&first_val) {
+                                    available_block.insert(param, avail);
+                                }
+                            }
+                            available_block.insert(union_node, block);
+                            self.stats.union += 1;
+                        } else if !all_agree {
+                            // Sources disagree — create conditional unions per edge
+                            for &(pred, resolved_incoming) in &resolved {
+                                if resolved_incoming == param {
+                                    continue;
+                                }
+                                let assumptions =
+                                    build_edge_assumptions(pred, block, &branch_conditions);
+                                self.dfg.make_conditional_union(
+                                    param,
+                                    resolved_incoming,
+                                    assumptions,
+                                );
+                            }
                         }
                     }
 
@@ -844,8 +1271,6 @@ impl EgraphPass {
 
                     for inst_id in inst_ids {
                         let inst = self.dfg.insts[&inst_id].clone();
-
-                        println!("  Processing inst {:?}: {:?}", inst_id, inst.opcode);
 
                         let mut rewritten_inst = inst.clone();
                         for arg in &mut rewritten_inst.args {
@@ -873,10 +1298,8 @@ impl EgraphPass {
 
                         if rewritten_inst.opcode.is_pure() {
                             ctx.insert_pure_enode(inst_id);
-                            println!("    -> Pure inst, added to egraph");
                         } else {
                             ctx.optimize_skeleton_inst(inst_id, block);
-                            println!("    -> Skeleton inst, kept in layout");
                         }
 
                         // Propagate ranges forward: compute output range from operand ranges
@@ -902,7 +1325,37 @@ impl EgraphPass {
                                     self.range_assumptions
                                         .assume_range(opt_result, output_range);
                                 }
-                                println!("    Range propagated: {:?} => {}", result, output_range);
+                                // Singleton range → create const union so extraction
+                                // can replace this value with a constant.
+                                // Only override if the value hasn't been simplified already.
+                                if let Some(c) = output_range.as_singleton() {
+                                    let current =
+                                        value_to_opt_value.get(&result).copied().unwrap_or(result);
+                                    if current == result || current == opt_result {
+                                        let const_inst = Instruction::with_imm(
+                                            Opcode::Const,
+                                            vec![],
+                                            Type::I32,
+                                            c,
+                                        );
+                                        let key = (Type::I32, const_inst.clone());
+                                        let const_val = if let Some(Some(existing)) =
+                                            gvn_map.get(&key)
+                                        {
+                                            *existing
+                                        } else {
+                                            let const_inst_id = self.dfg.make_inst(const_inst);
+                                            let cv =
+                                                self.dfg.make_inst_result(const_inst_id, Type::I32);
+                                            gvn_map.insert(key, Some(cv));
+                                            available_block.insert(cv, block);
+                                            cv
+                                        };
+                                        let _union = self.dfg.make_union(opt_result, const_val);
+                                        value_to_opt_value.insert(result, const_val);
+                                        self.stats.union += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -918,6 +1371,29 @@ impl EgraphPass {
         // Save the GVN mapping for use in extraction
         self.gvn_mapping = value_to_opt_value;
     }
+}
+
+/// Build an `AssumptionSet` capturing the range facts that hold on the edge
+/// from `pred` to `target` (derived from branch conditions).
+///
+/// This is a free function rather than a method on `EgraphPass` to avoid
+/// borrow conflicts (`remove_pure_and_optimize` holds `&mut self` while
+/// `branch_conditions` is a local variable).
+fn build_edge_assumptions(
+    pred: BlockId,
+    target: BlockId,
+    branch_conditions: &HashMap<(BlockId, BlockId), Vec<(ValueId, Option<i64>, Opcode, bool)>>,
+) -> AssumptionSet {
+    let mut assumptions = Vec::new();
+    if let Some(conditions) = branch_conditions.get(&(pred, target)) {
+        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
+            let facts = learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
+            for (value, range) in facts {
+                assumptions.push((value, range));
+            }
+        }
+    }
+    AssumptionSet { assumptions }
 }
 
 /// Context for optimization
@@ -965,7 +1441,6 @@ impl<'a> OptimizeCtx<'a> {
                         self.available_block.insert(result, avail_block);
                     }
 
-                    println!("      GVN hit: merged with {:?}", existing_value);
                     return *existing_value;
                 }
 
@@ -988,8 +1463,6 @@ impl<'a> OptimizeCtx<'a> {
 
                 // Second pass: create conditional unions for range-dependent rewrites
                 self.apply_conditional_rewrites_and_store(result);
-
-                println!("      New instruction: {:?}", result);
 
                 opt_result
             }
@@ -1058,11 +1531,6 @@ impl<'a> OptimizeCtx<'a> {
             self.available_block.insert(new_union, avail);
 
             union_value = new_union;
-
-            println!(
-                "        Created union {:?} = {:?} ∪ {:?}",
-                new_union, union_value, opt_value
-            );
         }
 
         self.rewrite_depth -= 1;
@@ -1158,10 +1626,6 @@ impl<'a> OptimizeCtx<'a> {
             let cu = self
                 .dfg
                 .make_conditional_union(value, new_value, assumption_set);
-            println!(
-                "Conditional union: lhs={:?} rhs={:?} under {:?}",
-                cu.lhs, cu.rhs, cu.condition.assumptions
-            );
         }
     }
 
@@ -1319,13 +1783,8 @@ impl<'a> OptimizeCtx<'a> {
                                     self.available_block.insert(result, avail_block);
                                 }
 
-                                println!(
-                                    "      Skeleton GVN hit: merged with {:?}",
-                                    existing_value
-                                );
                                 return;
                             } else {
-                                println!("      Cannot merge: different conditions");
                             }
                         }
                     }

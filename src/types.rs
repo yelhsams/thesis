@@ -524,6 +524,17 @@ impl DataFlowGraph {
         self.inst_results[&inst][0]
     }
 
+    /// If `value` is defined by a Const instruction, return its immediate.
+    pub fn value_imm(&self, value: ValueId) -> Option<i64> {
+        if let Some(ValueDef::Inst(inst_id)) = self.value_defs.get(&value) {
+            let inst = &self.insts[inst_id];
+            if inst.opcode == Opcode::Const {
+                return inst.immediate;
+            }
+        }
+        None
+    }
+
     /// Check if two instructions are mergeable
     pub fn instructions_mergeable(&self, inst1: InstId, inst2: InstId) -> bool {
         let i1 = &self.insts[&inst1];

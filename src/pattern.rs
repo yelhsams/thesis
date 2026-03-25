@@ -144,6 +144,9 @@ pub enum Condition {
     RangeEquals(VarId, i64),
 
     Unreachable(VarId),
+
+    /// Variable must be known to be nonzero (range excludes 0 or explicitly marked)
+    NonZero(VarId),
 }
 
 /// Bindings from pattern variables to values/constants
@@ -413,6 +416,11 @@ impl Condition {
                 .get_value(var)
                 .and_then(|v| bindings.range_assumptions().map(|a| a.is_unreachable(v)))
                 .unwrap_or(false),
+
+            Condition::NonZero(var) => bindings
+                .get_value(var)
+                .and_then(|v| bindings.range_assumptions().map(|ra| ra.is_nonzero(v)))
+                .unwrap_or(false),
         }
     }
 
@@ -440,6 +448,9 @@ impl Condition {
     }
     pub fn range_eq(var: impl Into<String>, value: i64) -> Self {
         Condition::RangeEquals(VarId::new(var), value)
+    }
+    pub fn nonzero(var: impl Into<String>) -> Self {
+        Condition::NonZero(VarId::new(var))
     }
 }
 
@@ -3049,6 +3060,37 @@ impl RewriteLibrary {
                             .unwrap_or(false)
                     },
                 })
+                .build(),
+        );
+
+        // Sign-bit nonzero pattern:
+        // band(sshr(bor(x, ineg(x)), 31), 1) => 1 when x is nonzero
+        //
+        // For any nonzero 32-bit integer x, bor(x, -x) always has the MSB set,
+        // so sshr by 31 gives -1 (all ones), and band(-1, 1) = 1.
+        rules.push(
+            Rewrite::new("sign-bit-nonzero")
+                .match_pattern(Pattern::op(
+                    Opcode::And,
+                    vec![
+                        Pattern::op(
+                            Opcode::Sshr,
+                            vec![
+                                Pattern::op(
+                                    Opcode::Or,
+                                    vec![
+                                        Pattern::var("x"),
+                                        Pattern::op(Opcode::Ineg, vec![Pattern::var("x")]),
+                                    ],
+                                ),
+                                Pattern::constant(31),
+                            ],
+                        ),
+                        Pattern::constant(1),
+                    ],
+                ))
+                .produce(Pattern::constant(1))
+                .when(Condition::nonzero("x"))
                 .build(),
         );
 

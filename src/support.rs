@@ -1,5 +1,5 @@
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
 /// Simplified dominator tree
@@ -96,6 +96,151 @@ impl DominatorTree {
             while let Some(&idom) = tree.idom.get(&current) {
                 doms.insert(idom);
                 current = idom;
+            }
+            tree.dominators.insert(block, doms);
+        }
+
+        tree
+    }
+
+    /// Build a proper dominator tree from the CFG defined by the layout and DFG.
+    ///
+    /// Extracts successor edges from branch instructions and computes
+    /// dominators using the iterative algorithm (Cooper-Harvey-Kennedy).
+    pub fn from_layout(layout: &Layout, dfg: &DataFlowGraph) -> Self {
+        let entry = match layout.entry_block() {
+            Some(b) => b,
+            None => return Self::new(),
+        };
+
+        // Step 1: Extract CFG successors
+        let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+
+        for &block_id in &layout.blocks {
+            succs.entry(block_id).or_default();
+            preds.entry(block_id).or_default();
+        }
+
+        for &block_id in &layout.blocks {
+            let block = &layout.block_data[&block_id];
+            for &inst_id in &block.insts {
+                let inst = &dfg.insts[&inst_id];
+                match &inst.branch_info {
+                    Some(BranchInfo::Jump(target)) => {
+                        succs.entry(block_id).or_default().push(*target);
+                        preds.entry(*target).or_default().push(block_id);
+                    }
+                    Some(BranchInfo::Conditional(then_b, _, else_b, _)) => {
+                        succs.entry(block_id).or_default().push(*then_b);
+                        succs.entry(block_id).or_default().push(*else_b);
+                        preds.entry(*then_b).or_default().push(block_id);
+                        preds.entry(*else_b).or_default().push(block_id);
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        // Step 2: Compute reverse postorder (RPO) numbering via DFS
+        let mut rpo_order: Vec<BlockId> = Vec::new();
+        let mut visited: HashSet<BlockId> = HashSet::new();
+        let mut dfs_stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+        visited.insert(entry);
+
+        while let Some((block, idx)) = dfs_stack.last_mut() {
+            let block_succs = succs.get(block).cloned().unwrap_or_default();
+            if *idx < block_succs.len() {
+                let next = block_succs[*idx];
+                *idx += 1;
+                if visited.insert(next) {
+                    dfs_stack.push((next, 0));
+                }
+            } else {
+                rpo_order.push(*block);
+                dfs_stack.pop();
+            }
+        }
+        rpo_order.reverse();
+
+        // Step 3: Build RPO numbering map
+        let mut rpo_num: HashMap<BlockId, usize> = HashMap::new();
+        for (i, &b) in rpo_order.iter().enumerate() {
+            rpo_num.insert(b, i);
+        }
+
+        // Step 4: Cooper-Harvey-Kennedy iterative dominator algorithm
+        let mut idom: HashMap<BlockId, BlockId> = HashMap::new();
+        idom.insert(entry, entry);
+
+        let intersect = |mut b1: BlockId,
+                         mut b2: BlockId,
+                         idom: &HashMap<BlockId, BlockId>,
+                         rpo_num: &HashMap<BlockId, usize>|
+         -> BlockId {
+            while b1 != b2 {
+                while rpo_num[&b1] > rpo_num[&b2] {
+                    b1 = idom[&b1];
+                }
+                while rpo_num[&b2] > rpo_num[&b1] {
+                    b2 = idom[&b2];
+                }
+            }
+            b1
+        };
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in &rpo_order {
+                if b == entry {
+                    continue;
+                }
+                let block_preds = preds.get(&b).cloned().unwrap_or_default();
+                // Find first predecessor that already has an idom
+                let mut new_idom: Option<BlockId> = None;
+                for &p in &block_preds {
+                    if idom.contains_key(&p) {
+                        new_idom = Some(match new_idom {
+                            Some(current) => intersect(current, p, &idom, &rpo_num),
+                            None => p,
+                        });
+                    }
+                }
+                if let Some(new_idom) = new_idom {
+                    if idom.get(&b) != Some(&new_idom) {
+                        idom.insert(b, new_idom);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Step 5: Build tree structure
+        let mut tree = Self::new();
+        tree.idom = idom.clone();
+        // Remove self-loop for entry
+        tree.idom.remove(&entry);
+
+        for (&block, &dom) in &idom {
+            if block != dom {
+                tree.children.entry(dom).or_default().push(block);
+            }
+        }
+
+        // Sort children for deterministic traversal order
+        for children in tree.children.values_mut() {
+            children.sort();
+        }
+
+        // Step 6: Compute dominator sets
+        for &block in &rpo_order {
+            let mut doms = HashSet::new();
+            doms.insert(block);
+            let mut current = block;
+            while let Some(&d) = tree.idom.get(&current) {
+                doms.insert(d);
+                current = d;
             }
             tree.dominators.insert(block, doms);
         }

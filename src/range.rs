@@ -2,7 +2,7 @@
 //! into/outof scope
 
 use crate::types::ValueId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -186,6 +186,22 @@ impl Range {
     /// result is in [0, min(self.max, other.max)].
     pub fn bitand(&self, other: &Range) -> Range {
         if self.is_non_negative() && other.is_non_negative() {
+            // When one operand is a singleton and the other range is small,
+            // enumerate for an exact result.
+            if self.is_singleton() && (other.max - other.min) <= 64 {
+                let c = self.min;
+                let mut min_r = i64::MAX;
+                let mut max_r = i64::MIN;
+                for x in other.min..=other.max {
+                    let r = c & x;
+                    min_r = min_r.min(r);
+                    max_r = max_r.max(r);
+                }
+                return Range::new(min_r, max_r);
+            }
+            if other.is_singleton() && (self.max - self.min) <= 64 {
+                return other.bitand(self);
+            }
             Range::new(0, self.max.min(other.max))
         } else {
             Range::unbounded()
@@ -287,6 +303,9 @@ impl std::fmt::Display for Range {
 #[derive(Debug, Clone)]
 pub struct RangeAssumptions {
     scopes: Vec<HashMap<ValueId, Range>>,
+    /// Parallel scope stack tracking values known to be nonzero.
+    /// Cloned on push_scope, popped on pop_scope.
+    nonzero_scopes: Vec<HashSet<ValueId>>,
 }
 
 impl RangeAssumptions {
@@ -294,17 +313,21 @@ impl RangeAssumptions {
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
+            nonzero_scopes: vec![HashSet::new()],
         }
     }
 
     pub fn push_scope(&mut self) {
         let snapshot = self.scopes.last().cloned().unwrap_or_default();
         self.scopes.push(snapshot);
+        let nz_snapshot = self.nonzero_scopes.last().cloned().unwrap_or_default();
+        self.nonzero_scopes.push(nz_snapshot);
     }
 
     pub fn pop_scope(&mut self) {
         assert!(self.scopes.len() > 1, "Cannot pop the root scope");
         self.scopes.pop();
+        self.nonzero_scopes.pop();
     }
 
     pub fn depth(&self) -> usize {
@@ -408,9 +431,31 @@ impl RangeAssumptions {
         self.get_range(value).is_empty()
     }
 
+    /// Mark a value as definitely nonzero in the current scope.
+    pub fn mark_nonzero(&mut self, value: ValueId) {
+        if let Some(nz) = self.nonzero_scopes.last_mut() {
+            nz.insert(value);
+        }
+    }
+
+    /// Check if a value is known to be nonzero (either its range excludes 0,
+    /// or it was explicitly marked via `mark_nonzero`).
+    pub fn is_nonzero(&self, value: ValueId) -> bool {
+        let range = self.get_range(value);
+        if !range.contains(0) {
+            return true;
+        }
+        self.nonzero_scopes
+            .last()
+            .map(|nz| nz.contains(&value))
+            .unwrap_or(false)
+    }
+
     pub fn clear(&mut self) {
         self.scopes.clear();
         self.scopes.push(HashMap::new());
+        self.nonzero_scopes.clear();
+        self.nonzero_scopes.push(HashSet::new());
     }
 
     pub fn stats(&self) -> RangeAssumptionsStats {

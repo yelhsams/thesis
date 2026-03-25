@@ -68,7 +68,7 @@ block0(v0: i32):
     println!("Example 1: Algebraic Simplification");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
@@ -116,7 +116,7 @@ block0(v0: i32, v1: i32):
     println!("Example 2: Global Value Numbering (GVN)");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
@@ -156,7 +156,7 @@ block0(v0: i32):
     println!("Example 3: Union Nodes and Cost-Based Extraction");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
 
     // First run the pass to build the egraph
     let mut pass = EgraphPass::new(dfg, layout, domtree);
@@ -202,7 +202,7 @@ block1():
     println!("Example 4: Scoped GVN (Dominance-Aware)");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
@@ -239,7 +239,7 @@ block0(v0: i32):
     println!("Example 5: Strength Reduction");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
@@ -281,7 +281,7 @@ block2():
     println!("Example 6: Conditional Branch Optimization");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
@@ -323,7 +323,7 @@ block2():
     println!("Example 7: Range-Aware Egraph Optimization");
 
     let (dfg, layout) = parse_clif(clif_input).expect("Parse failed");
-    let domtree = DominatorTree::from_linear_blocks(&layout.blocks);
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.run();
 
