@@ -1712,7 +1712,7 @@ impl<'a> OptimizeCtx<'a> {
                 {
                     let current = ra.get_range(var);
                     if self.is_branch_local(var, &required_range) {
-                        branch_local_facts.push((var, current));
+                        branch_local_facts.push((var, required_range));
                         all_global = false;
                     }
                 }
