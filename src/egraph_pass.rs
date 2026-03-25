@@ -1288,131 +1288,110 @@ impl EgraphPass {
                                 let else_b = *else_b;
                                 if !inst_after.args.is_empty() {
                                     let cond_value = inst_after.args[0];
-                                    let mut handled = false;
-
-                                    // Collect comparison operands from the
-                                    // condition value.  For a single comparison
-                                    // this yields one entry; for `band(cmp1,
-                                    // cmp2)` it yields both (on the true branch
-                                    // both must be nonzero, i.e. both hold).
-                                    let mut cmp_operands: Vec<(ValueId, Option<i64>, Opcode)> =
-                                        Vec::new();
-                                    let mut is_band = false;
-
-                                    if let ValueDef::Inst(cond_inst_id) =
-                                        self.dfg.value_def(cond_value)
+                                    // True branch: condition is nonzero.
+                                    // Walk backward through band/bor/cmp to
+                                    // learn all leaf-level range facts.
                                     {
-                                        let cond_inst = &self.dfg.insts[&cond_inst_id];
-                                        if cond_inst.opcode.is_comparison() {
-                                            if let Some(lhs) = cond_inst.args.get(0).copied() {
-                                                let rhs_const = cond_inst
-                                                    .args
-                                                    .get(1)
-                                                    .and_then(|&rhs| self.dfg.value_imm(rhs));
-                                                cmp_operands.push((
-                                                    lhs,
-                                                    rhs_const,
-                                                    cond_inst.opcode,
-                                                ));
-                                            }
-                                        } else if cond_inst.opcode == Opcode::And
-                                            && cond_inst.args.len() == 2
-                                        {
-                                            // band(a, b): on the true branch both
-                                            // a and b are nonzero.  If either is a
-                                            // comparison, extract its facts.
-                                            is_band = true;
-                                            for &operand in &cond_inst.args {
-                                                if let ValueDef::Inst(op_inst_id) =
-                                                    self.dfg.value_def(operand)
-                                                {
-                                                    let op_inst = &self.dfg.insts[&op_inst_id];
-                                                    if op_inst.opcode.is_comparison() {
-                                                        if let Some(lhs) =
-                                                            op_inst.args.get(0).copied()
-                                                        {
-                                                            let rhs_const =
-                                                                op_inst.args.get(1).and_then(
-                                                                    |&rhs| self.dfg.value_imm(rhs),
-                                                                );
-                                                            cmp_operands.push((
-                                                                lhs,
-                                                                rhs_const,
-                                                                op_inst.opcode,
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                        self.range_assumptions.push_scope();
+                                        let then_facts = self
+                                            .range_assumptions
+                                            .refine_nonzero(cond_value, &self.dfg);
+                                        self.range_assumptions.pop_scope();
 
-                                    if !cmp_operands.is_empty() {
-                                        for &(lhs, rhs_const, opcode) in &cmp_operands {
-                                            // On the true branch, all comparisons hold.
-                                            let then_facts =
-                                                learn_from_comparison(opcode, lhs, rhs_const, true);
-                                            block_entry_facts
-                                                .entry(then_b)
-                                                .or_default()
-                                                .extend(then_facts);
-                                            block_edge_conditions
-                                                .entry((block, then_b))
-                                                .or_default()
-                                                .push((lhs, rhs_const, opcode, true));
-
-                                            // On the else branch, for a single comparison
-                                            // the negation holds.  For band(cmp1, cmp2)
-                                            // we only know at least one is false — we
-                                            // cannot assert that any individual comparison
-                                            // is false, so skip else-branch facts.
-                                            if !is_band {
-                                                let else_facts = learn_from_comparison(
-                                                    opcode, lhs, rhs_const, false,
-                                                );
-                                                block_entry_facts
-                                                    .entry(else_b)
-                                                    .or_default()
-                                                    .extend(else_facts);
-                                                block_edge_conditions
-                                                    .entry((block, else_b))
-                                                    .or_default()
-                                                    .push((lhs, rhs_const, opcode, false));
-                                            }
-                                        }
-                                        handled = true;
-                                    }
-
-                                    if !handled {
-                                        let then_facts = learn_from_comparison(
-                                            Opcode::Ne,
-                                            cond_value,
-                                            Some(0),
-                                            true,
-                                        );
                                         block_entry_facts
                                             .entry(then_b)
                                             .or_default()
-                                            .extend(then_facts);
-                                        block_edge_conditions
-                                            .entry((block, then_b))
-                                            .or_default()
-                                            .push((cond_value, Some(0), Opcode::Ne, true));
+                                            .extend(then_facts.iter().cloned());
+                                        // Record leaf facts as edge conditions
+                                        // so block-param range join can narrow
+                                        // per-edge ranges.
+                                        for &(value, range) in &then_facts {
+                                            // Approximate: store as a >= min
+                                            // and < max+1 pair. The edge
+                                            // conditions use (lhs, rhs_const,
+                                            // opcode, is_true_branch) tuples.
+                                            // We record Sge for the lower bound.
+                                            block_edge_conditions
+                                                .entry((block, then_b))
+                                                .or_default()
+                                                .push((value, Some(range.min), Opcode::Sge, true));
+                                            if range.max < i64::MAX {
+                                                block_edge_conditions
+                                                    .entry((block, then_b))
+                                                    .or_default()
+                                                    .push((
+                                                        value,
+                                                        Some(range.max + 1),
+                                                        Opcode::Slt,
+                                                        true,
+                                                    ));
+                                            }
+                                        }
+                                        if then_facts.is_empty() {
+                                            // No leaf facts found — record
+                                            // top-level cond != 0 as fallback.
+                                            let ne_facts = learn_from_comparison(
+                                                Opcode::Ne,
+                                                cond_value,
+                                                Some(0),
+                                                true,
+                                            );
+                                            block_entry_facts
+                                                .entry(then_b)
+                                                .or_default()
+                                                .extend(ne_facts);
+                                            block_edge_conditions
+                                                .entry((block, then_b))
+                                                .or_default()
+                                                .push((cond_value, Some(0), Opcode::Ne, true));
+                                        }
+                                    }
 
-                                        let else_facts = learn_from_comparison(
-                                            Opcode::Ne,
-                                            cond_value,
-                                            Some(0),
-                                            false,
-                                        );
+                                    // Else branch: condition is zero.
+                                    {
+                                        self.range_assumptions.push_scope();
+                                        let else_facts = self
+                                            .range_assumptions
+                                            .refine_zero(cond_value, &self.dfg);
+                                        self.range_assumptions.pop_scope();
+
                                         block_entry_facts
                                             .entry(else_b)
                                             .or_default()
-                                            .extend(else_facts);
-                                        block_edge_conditions
-                                            .entry((block, else_b))
-                                            .or_default()
-                                            .push((cond_value, Some(0), Opcode::Ne, false));
+                                            .extend(else_facts.iter().cloned());
+                                        for &(value, range) in &else_facts {
+                                            block_edge_conditions
+                                                .entry((block, else_b))
+                                                .or_default()
+                                                .push((value, Some(range.min), Opcode::Sge, true));
+                                            if range.max < i64::MAX {
+                                                block_edge_conditions
+                                                    .entry((block, else_b))
+                                                    .or_default()
+                                                    .push((
+                                                        value,
+                                                        Some(range.max + 1),
+                                                        Opcode::Slt,
+                                                        true,
+                                                    ));
+                                            }
+                                        }
+                                        if else_facts.is_empty() {
+                                            let ne_facts = learn_from_comparison(
+                                                Opcode::Ne,
+                                                cond_value,
+                                                Some(0),
+                                                false,
+                                            );
+                                            block_entry_facts
+                                                .entry(else_b)
+                                                .or_default()
+                                                .extend(ne_facts);
+                                            block_edge_conditions
+                                                .entry((block, else_b))
+                                                .or_default()
+                                                .push((cond_value, Some(0), Opcode::Ne, false));
+                                        }
                                     }
                                 }
                             }

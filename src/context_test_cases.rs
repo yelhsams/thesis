@@ -263,6 +263,37 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_band_condition_range_propagation() {
+        // band(band(icmp.ult(v0, 8), icmp.sge(v0, 0)), icmp.slt(v0, 5))
+        // On the true branch: v0 < 8 AND v0 >= 0 AND v0 < 5 → v0 ∈ [0, 4]
+        // So irem(v0, 8) should simplify to v0.
+        let original_clif = r#"function %test(i32) -> i32 {
+                                    block0(v0: i32):
+                                        v1  = iconst.i32 8
+                                        v2  = icmp.ult.i32 v0, v1
+                                        v3  = iconst.i32 0
+                                        v4  = icmp.sge.i32 v0, v3
+                                        v5  = band.i32 v2, v4
+                                        v6  = iconst.i32 5
+                                        v7  = icmp.slt.i32 v0, v6
+                                        v8  = band.i32 v5, v7
+                                        brif v8, block1(v0), block2(v0)
+
+                                    block1(v9: i32):
+                                        v10 = irem v0, v1
+                                        return v10
+
+                                    block2(v11: i32):
+                                        return v11
+                                    }"#;
+        let expected_clif = r#"function %test(i32) -> i32 {
+                                    block0(v0: i32):
+                                        return v0
+                                    }"#;
+        helper(original_clif, expected_clif);
+    }
+
+    #[test]
     fn test_seeing_through_blockparam_sign_bit() {
         let original_clif = r#"
                             function %test(i32) -> i32 {

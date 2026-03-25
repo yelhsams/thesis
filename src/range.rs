@@ -1,7 +1,7 @@
 //! Range analysis for integer values by adding assumptions
 //! into/outof scope
 
-use crate::types::ValueId;
+use crate::types::{DataFlowGraph, Opcode, ValueDef, ValueId};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +449,120 @@ impl RangeAssumptions {
             .last()
             .map(|nz| nz.contains(&value))
             .unwrap_or(false)
+    }
+
+    /// Given that `value` is known to be nonzero, walk backward through the
+    /// DFG and record range facts.  Returns all leaf-level facts discovered.
+    ///
+    /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, true)
+    /// - band(a, b): both operands nonzero → recurse into each
+    /// - bor(a, b): only the result is nonzero → mark_nonzero
+    /// - Otherwise: mark_nonzero
+    pub fn refine_nonzero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
+        self.refine_nonzero_inner(value, dfg, 0)
+    }
+
+    fn refine_nonzero_inner(
+        &mut self,
+        value: ValueId,
+        dfg: &DataFlowGraph,
+        depth: usize,
+    ) -> Vec<(ValueId, Range)> {
+        const MAX_DEPTH: usize = 8;
+        if depth >= MAX_DEPTH {
+            self.mark_nonzero(value);
+            return vec![];
+        }
+
+        let mut facts = Vec::new();
+
+        if let ValueDef::Inst(inst_id) = dfg.value_def(value) {
+            let inst = &dfg.insts[&inst_id];
+            if inst.opcode.is_comparison() {
+                if let Some(lhs) = inst.args.get(0).copied() {
+                    let rhs_const = inst.args.get(1).and_then(|&rhs| dfg.value_imm(rhs));
+                    let learned = learn_from_comparison(inst.opcode, lhs, rhs_const, true);
+                    for &(v, range) in &learned {
+                        self.assume_range(v, range);
+                    }
+                    facts.extend(learned);
+                }
+                self.mark_nonzero(value);
+            } else if inst.opcode == Opcode::And && inst.args.len() == 2 {
+                // band(a, b) nonzero → both a and b are nonzero
+                let args = inst.args.clone();
+                for &operand in &args {
+                    let sub_facts = self.refine_nonzero_inner(operand, dfg, depth + 1);
+                    facts.extend(sub_facts);
+                }
+            } else if inst.opcode == Opcode::Or && inst.args.len() == 2 {
+                // bor(a, b) nonzero → at least one is nonzero, can't say which
+                self.mark_nonzero(value);
+            } else {
+                self.mark_nonzero(value);
+            }
+        } else {
+            self.mark_nonzero(value);
+        }
+
+        facts
+    }
+
+    /// Given that `value` is known to be zero, walk backward through the DFG
+    /// and record range facts.  Returns all leaf-level facts discovered.
+    ///
+    /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, false)
+    /// - bor(a, b): both operands zero → recurse into each
+    /// - band(a, b): at least one is zero, can't say which
+    /// - Otherwise: assume_range(value, singleton(0))
+    pub fn refine_zero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
+        self.refine_zero_inner(value, dfg, 0)
+    }
+
+    fn refine_zero_inner(
+        &mut self,
+        value: ValueId,
+        dfg: &DataFlowGraph,
+        depth: usize,
+    ) -> Vec<(ValueId, Range)> {
+        const MAX_DEPTH: usize = 8;
+        if depth >= MAX_DEPTH {
+            self.assume_range(value, Range::singleton(0));
+            return vec![];
+        }
+
+        let mut facts = Vec::new();
+
+        if let ValueDef::Inst(inst_id) = dfg.value_def(value) {
+            let inst = &dfg.insts[&inst_id];
+            if inst.opcode.is_comparison() {
+                if let Some(lhs) = inst.args.get(0).copied() {
+                    let rhs_const = inst.args.get(1).and_then(|&rhs| dfg.value_imm(rhs));
+                    let learned = learn_from_comparison(inst.opcode, lhs, rhs_const, false);
+                    for &(v, range) in &learned {
+                        self.assume_range(v, range);
+                    }
+                    facts.extend(learned);
+                }
+                self.assume_range(value, Range::singleton(0));
+            } else if inst.opcode == Opcode::Or && inst.args.len() == 2 {
+                // bor(a, b) == 0 → both a and b are zero
+                let args = inst.args.clone();
+                for &operand in &args {
+                    let sub_facts = self.refine_zero_inner(operand, dfg, depth + 1);
+                    facts.extend(sub_facts);
+                }
+            } else if inst.opcode == Opcode::And && inst.args.len() == 2 {
+                // band(a, b) == 0 → at least one is zero, can't say which
+                self.assume_range(value, Range::singleton(0));
+            } else {
+                self.assume_range(value, Range::singleton(0));
+            }
+        } else {
+            self.assume_range(value, Range::singleton(0));
+        }
+
+        facts
     }
 
     pub fn clear(&mut self) {
