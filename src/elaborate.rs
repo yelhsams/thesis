@@ -102,6 +102,12 @@ pub struct Elaborator<'a> {
     /// sibling branches.
     cache_scope_stack: Vec<HashSet<ValueId>>,
 
+    /// Reverse index: for each value, the union `ValueId`s that reference it
+    /// as a left or right operand. Used so that `elaborate_value_in_block` can
+    /// discover cheaper equivalents even when the instruction arg itself is
+    /// not a union node.
+    union_members: HashMap<ValueId, Vec<ValueId>>,
+
     /// Statistics
     stats: &'a mut Stats,
 }
@@ -115,11 +121,24 @@ static EMPTY_CFG_PREDS: std::sync::LazyLock<HashMap<BlockId, Vec<BlockId>>> =
     std::sync::LazyLock::new(HashMap::new);
 
 impl<'a> Elaborator<'a> {
+    /// Build the reverse index from values to the union nodes that mention them.
+    fn build_union_members(dfg: &DataFlowGraph) -> HashMap<ValueId, Vec<ValueId>> {
+        let mut index: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+        for (&val, def) in &dfg.value_defs {
+            if let ValueDef::Union(left, right) = def {
+                index.entry(*left).or_default().push(val);
+                index.entry(*right).or_default().push(val);
+            }
+        }
+        index
+    }
+
     pub fn new(
         dfg: &'a mut DataFlowGraph,
         domtree: &'a DominatorTree,
         stats: &'a mut Stats,
     ) -> Self {
+        let union_members = Self::build_union_members(dfg);
         Self {
             dfg,
             domtree,
@@ -130,6 +149,7 @@ impl<'a> Elaborator<'a> {
             block_entry_facts: &EMPTY_ENTRY_FACTS,
             cfg_preds: &EMPTY_CFG_PREDS,
             cache_scope_stack: Vec::new(),
+            union_members,
             stats,
         }
     }
@@ -148,6 +168,7 @@ impl<'a> Elaborator<'a> {
         block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
         cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
     ) -> Self {
+        let union_members = Self::build_union_members(dfg);
         Self {
             dfg,
             domtree,
@@ -158,6 +179,7 @@ impl<'a> Elaborator<'a> {
             block_entry_facts,
             cfg_preds,
             cache_scope_stack: Vec::new(),
+            union_members,
             stats,
         }
     }
@@ -444,6 +466,10 @@ impl<'a> Elaborator<'a> {
 
         self.stats.elaborate_memoize_miss += 1;
 
+        // Provisional entry breaks cycles when a union references this value
+        // and we recursively elaborate back to it.
+        self.elaborated_cache.insert(cache_key, value);
+
         let elaborated = match self.dfg.value_def(value) {
             ValueDef::BlockParam(_, _) => {
                 // Block parameters are already defined
@@ -459,26 +485,34 @@ impl<'a> Elaborator<'a> {
                     self.elaborate_value_in_block(arg, block_id);
                 }
 
-                // Check if a conditional union offers a cheaper alternative
-                self.best_conditional_alternative(value, block_id)
-                    .unwrap_or(value)
+                // Start with conditional union alternative (if any)
+                let mut best = self
+                    .best_conditional_alternative(value, block_id)
+                    .unwrap_or(value);
+                let mut best_cost = self.compute_best_cost(best);
+
+                // Also check unconditional unions that reference this value
+                if let Some(unions) = self.union_members.get(&value).cloned() {
+                    for union_val in unions {
+                        let resolved = self.elaborate_value_in_block(union_val, block_id);
+                        let cost = self.compute_best_cost(resolved);
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best = resolved;
+                        }
+                    }
+                }
+
+                best
             }
 
             ValueDef::Union(left, right) => {
                 // Union node: choose the best side
-                let (_, best_inst) = self.best_value_cache[&value];
+                let left_cost = self.compute_best_cost(left);
+                let right_cost = self.compute_best_cost(right);
 
-                if let Some(_inst_id) = best_inst {
-                    // Recursively elaborate the best choice
-                    let left_cost = self.compute_best_cost(left);
-                    let right_cost = self.compute_best_cost(right);
-
-                    let best = if left_cost <= right_cost { left } else { right };
-                    self.elaborate_value_in_block(best, block_id)
-                } else {
-                    // Shouldn't happen, but handle gracefully
-                    value
-                }
+                let best = if left_cost <= right_cost { left } else { right };
+                self.elaborate_value_in_block(best, block_id)
             }
         };
 
@@ -537,6 +571,42 @@ impl<'a> Elaborator<'a> {
         self.best_value_cache
             .get(&value)
             .and_then(|(_, inst)| *inst)
+    }
+
+    /// After elaboration, rewrite all instruction arguments to use their
+    /// best-cost representatives.  For each instruction in each block, every
+    /// argument is replaced with the value that `elaborate_value_in_block`
+    /// selected for that block context, so conditional unions are respected.
+    pub fn rewrite_args(&mut self, layout: &Layout) {
+        let mut updated_count: usize = 0;
+
+        for &block_id in &layout.blocks {
+            let block = match layout.block_data.get(&block_id) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            for &inst_id in &block.insts {
+                let mut inst = self.dfg.insts[&inst_id].clone();
+                let mut changed = false;
+
+                for arg in &mut inst.args {
+                    if let Some(&elaborated) = self.elaborated_cache.get(&(*arg, block_id)) {
+                        if elaborated != *arg {
+                            *arg = elaborated;
+                            changed = true;
+                        }
+                    }
+                }
+
+                if changed {
+                    self.dfg.insts.insert(inst_id, inst);
+                    updated_count += 1;
+                }
+            }
+        }
+
+        println!("Elaborator rewrote args in {} instructions", updated_count);
     }
 }
 
