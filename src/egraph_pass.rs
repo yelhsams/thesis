@@ -1290,38 +1290,85 @@ impl EgraphPass {
                                     let cond_value = inst_after.args[0];
                                     let mut handled = false;
 
+                                    // Collect comparison operands from the
+                                    // condition value.  For a single comparison
+                                    // this yields one entry; for `band(cmp1,
+                                    // cmp2)` it yields both (on the true branch
+                                    // both must be nonzero, i.e. both hold).
+                                    let mut cmp_operands: Vec<(ValueId, Option<i64>, Opcode)> =
+                                        Vec::new();
+                                    let mut is_band = false;
+
                                     if let ValueDef::Inst(cond_inst_id) =
                                         self.dfg.value_def(cond_value)
                                     {
                                         let cond_inst = &self.dfg.insts[&cond_inst_id];
                                         if cond_inst.opcode.is_comparison() {
-                                            let lhs = cond_inst.args.get(0).copied();
-                                            let rhs_const = cond_inst
-                                                .args
-                                                .get(1)
-                                                .and_then(|&rhs| self.dfg.value_imm(rhs));
-
-                                            if let Some(lhs) = lhs {
-                                                let then_facts = learn_from_comparison(
-                                                    cond_inst.opcode,
+                                            if let Some(lhs) = cond_inst.args.get(0).copied() {
+                                                let rhs_const = cond_inst
+                                                    .args
+                                                    .get(1)
+                                                    .and_then(|&rhs| self.dfg.value_imm(rhs));
+                                                cmp_operands.push((
                                                     lhs,
                                                     rhs_const,
-                                                    true,
-                                                );
-                                                block_entry_facts
-                                                    .entry(then_b)
-                                                    .or_default()
-                                                    .extend(then_facts);
-                                                block_edge_conditions
-                                                    .entry((block, then_b))
-                                                    .or_default()
-                                                    .push((lhs, rhs_const, cond_inst.opcode, true));
+                                                    cond_inst.opcode,
+                                                ));
+                                            }
+                                        } else if cond_inst.opcode == Opcode::And
+                                            && cond_inst.args.len() == 2
+                                        {
+                                            // band(a, b): on the true branch both
+                                            // a and b are nonzero.  If either is a
+                                            // comparison, extract its facts.
+                                            is_band = true;
+                                            for &operand in &cond_inst.args {
+                                                if let ValueDef::Inst(op_inst_id) =
+                                                    self.dfg.value_def(operand)
+                                                {
+                                                    let op_inst = &self.dfg.insts[&op_inst_id];
+                                                    if op_inst.opcode.is_comparison() {
+                                                        if let Some(lhs) =
+                                                            op_inst.args.get(0).copied()
+                                                        {
+                                                            let rhs_const =
+                                                                op_inst.args.get(1).and_then(
+                                                                    |&rhs| self.dfg.value_imm(rhs),
+                                                                );
+                                                            cmp_operands.push((
+                                                                lhs,
+                                                                rhs_const,
+                                                                op_inst.opcode,
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
 
+                                    if !cmp_operands.is_empty() {
+                                        for &(lhs, rhs_const, opcode) in &cmp_operands {
+                                            // On the true branch, all comparisons hold.
+                                            let then_facts =
+                                                learn_from_comparison(opcode, lhs, rhs_const, true);
+                                            block_entry_facts
+                                                .entry(then_b)
+                                                .or_default()
+                                                .extend(then_facts);
+                                            block_edge_conditions
+                                                .entry((block, then_b))
+                                                .or_default()
+                                                .push((lhs, rhs_const, opcode, true));
+
+                                            // On the else branch, for a single comparison
+                                            // the negation holds.  For band(cmp1, cmp2)
+                                            // we only know at least one is false — we
+                                            // cannot assert that any individual comparison
+                                            // is false, so skip else-branch facts.
+                                            if !is_band {
                                                 let else_facts = learn_from_comparison(
-                                                    cond_inst.opcode,
-                                                    lhs,
-                                                    rhs_const,
-                                                    false,
+                                                    opcode, lhs, rhs_const, false,
                                                 );
                                                 block_entry_facts
                                                     .entry(else_b)
@@ -1330,15 +1377,10 @@ impl EgraphPass {
                                                 block_edge_conditions
                                                     .entry((block, else_b))
                                                     .or_default()
-                                                    .push((
-                                                        lhs,
-                                                        rhs_const,
-                                                        cond_inst.opcode,
-                                                        false,
-                                                    ));
-                                                handled = true;
+                                                    .push((lhs, rhs_const, opcode, false));
                                             }
                                         }
+                                        handled = true;
                                     }
 
                                     if !handled {
