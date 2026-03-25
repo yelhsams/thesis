@@ -1002,8 +1002,29 @@ impl EgraphPass {
             }
         }
 
-        // Range facts and edge conditions populated inline during the walk
-        let mut block_entry_facts: HashMap<BlockId, Vec<(ValueId, Range)>> = HashMap::new();
+        // Build CFG predecessors map for sound range-fact joining at merge points.
+        let mut cfg_preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for &blk in &self.layout.blocks {
+            cfg_preds.entry(blk).or_default();
+            let bd = &self.layout.block_data[&blk];
+            for &iid in &bd.insts {
+                let inst = &self.dfg.insts[&iid];
+                match &inst.branch_info {
+                    Some(BranchInfo::Jump(target)) => {
+                        cfg_preds.entry(*target).or_default().push(blk);
+                    }
+                    Some(BranchInfo::Conditional(then_b, _, else_b, _)) => {
+                        cfg_preds.entry(*then_b).or_default().push(blk);
+                        cfg_preds.entry(*else_b).or_default().push(blk);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Range facts per edge (pred, target) and edge conditions populated inline during the walk
+        let mut block_entry_facts: HashMap<(BlockId, BlockId), Vec<(ValueId, Range)>> =
+            HashMap::new();
         let mut block_edge_conditions: HashMap<
             (BlockId, BlockId),
             Vec<(ValueId, Option<i64>, Opcode, bool)>,
@@ -1038,9 +1059,51 @@ impl EgraphPass {
 
                     // 1. Apply range facts from incoming edges (populated by
                     //    predecessors that were already visited in domtree order).
-                    if let Some(facts) = block_entry_facts.get(&block) {
-                        for &(value, range) in facts {
-                            self.range_assumptions.assume_range(value, range);
+                    //    For merge blocks with multiple predecessors, we compute the
+                    //    UNION (join) of ranges per value across all edges to avoid
+                    //    unsoundly intersecting contradictory facts.
+                    {
+                        let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
+                        let num_edges = preds.len();
+                        // For each edge, compute the per-value intersected range
+                        // (multiple facts about the same value on one edge are
+                        // intersected), then union those across edges.
+                        let mut value_edge_count: HashMap<ValueId, usize> = HashMap::new();
+                        let mut value_union: HashMap<ValueId, Range> = HashMap::new();
+                        for pred in &preds {
+                            if let Some(facts) = block_entry_facts.get(&(*pred, block)) {
+                                // Intersect all facts for the same value on this edge
+                                let mut per_edge: HashMap<ValueId, Range> = HashMap::new();
+                                for &(value, range) in facts {
+                                    per_edge
+                                        .entry(value)
+                                        .and_modify(|acc| {
+                                            *acc = match acc.intersect(&range) {
+                                                Some(r) => r,
+                                                None => Range::empty(),
+                                            };
+                                        })
+                                        .or_insert(range);
+                                }
+                                // Union across edges
+                                for (value, range) in per_edge {
+                                    *value_edge_count.entry(value).or_insert(0) += 1;
+                                    value_union
+                                        .entry(value)
+                                        .and_modify(|acc| {
+                                            *acc = acc.union(&range);
+                                        })
+                                        .or_insert(range);
+                                }
+                            }
+                        }
+                        // Only apply facts that appear on ALL incoming edges
+                        for (value, range) in &value_union {
+                            if value_edge_count.get(value) == Some(&num_edges)
+                                && !range.is_unbounded()
+                            {
+                                self.range_assumptions.assume_range(*value, *range);
+                            }
                         }
                     }
 
@@ -1299,7 +1362,7 @@ impl EgraphPass {
                                         self.range_assumptions.pop_scope();
 
                                         block_entry_facts
-                                            .entry(then_b)
+                                            .entry((block, then_b))
                                             .or_default()
                                             .extend(then_facts.iter().cloned());
                                         // Record leaf facts as edge conditions
@@ -1337,7 +1400,7 @@ impl EgraphPass {
                                                 true,
                                             );
                                             block_entry_facts
-                                                .entry(then_b)
+                                                .entry((block, then_b))
                                                 .or_default()
                                                 .extend(ne_facts);
                                             block_edge_conditions
@@ -1356,7 +1419,7 @@ impl EgraphPass {
                                         self.range_assumptions.pop_scope();
 
                                         block_entry_facts
-                                            .entry(else_b)
+                                            .entry((block, else_b))
                                             .or_default()
                                             .extend(else_facts.iter().cloned());
                                         for &(value, range) in &else_facts {
@@ -1384,7 +1447,7 @@ impl EgraphPass {
                                                 false,
                                             );
                                             block_entry_facts
-                                                .entry(else_b)
+                                                .entry((block, else_b))
                                                 .or_default()
                                                 .extend(ne_facts);
                                             block_edge_conditions
