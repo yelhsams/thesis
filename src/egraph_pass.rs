@@ -107,6 +107,9 @@ impl EgraphPass {
         }
         self.rebuild_layout();
 
+        #[cfg(debug_assertions)]
+        self.check_no_unions();
+
         // CFG cleanups (separate from aegraph construction)
         for _ in 0..4 {
             self.eliminate_dead_blocks();
@@ -208,6 +211,37 @@ impl EgraphPass {
             let original_count = block.insts.len();
             block.insts = new_insts;
             let new_count = block.insts.len();
+        }
+    }
+
+    /// Verify that no `ValueDef::Union` nodes are reachable from any
+    /// instruction argument after elaboration and layout rebuild.
+    #[cfg(debug_assertions)]
+    fn check_no_unions(&self) {
+        for &block_id in &self.layout.blocks {
+            let block_data = &self.layout.block_data[&block_id];
+            for &inst_id in &block_data.insts {
+                let inst = &self.dfg.insts[&inst_id];
+                for &arg in &inst.args {
+                    if let ValueDef::Union(_, _) = self.dfg.value_def(arg) {
+                        panic!(
+                            "Union node {:?} still reachable at inst {:?} in block {:?}",
+                            arg, inst_id, block_id
+                        );
+                    }
+                }
+            }
+            if let Some(term_id) = block_data.terminator {
+                let inst = &self.dfg.insts[&term_id];
+                for &arg in &inst.args {
+                    if let ValueDef::Union(_, _) = self.dfg.value_def(arg) {
+                        panic!(
+                            "Union node {:?} still reachable at inst {:?} in block {:?}",
+                            arg, term_id, block_id
+                        );
+                    }
+                }
+            }
         }
     }
 
