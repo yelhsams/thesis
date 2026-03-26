@@ -275,10 +275,6 @@ impl<'a> Elaborator<'a> {
                     // under the current domtree context.
                     self.cache_scope_stack.push(HashSet::new());
 
-                    // Recompute best costs for all values under the current
-                    // range assumptions (conditional unions may now fire).
-                    self.compute_best_costs();
-
                     // Elaborate block instructions
                     self.elaborate_block(block, layout);
                 }
