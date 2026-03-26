@@ -229,6 +229,10 @@ impl<'a> Elaborator<'a> {
 
         let mut block_stack = vec![StackEntry::Visit(root)];
 
+        // Compute best costs once before traversal; subsequent cache misses
+        // after Pop-driven invalidation are handled lazily by compute_best_cost.
+        self.compute_best_costs();
+
         while let Some(entry) = block_stack.pop() {
             match entry {
                 StackEntry::Visit(block) => {
