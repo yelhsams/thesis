@@ -102,12 +102,6 @@ pub struct Elaborator<'a> {
     /// sibling branches.
     cache_scope_stack: Vec<HashSet<ValueId>>,
 
-    /// Reverse index: for each value, the union `ValueId`s that reference it
-    /// as a left or right operand. Used so that `elaborate_value_in_block` can
-    /// discover cheaper equivalents even when the instruction arg itself is
-    /// not a union node.
-    union_members: HashMap<ValueId, Vec<ValueId>>,
-
     /// Statistics
     stats: &'a mut Stats,
 }
@@ -121,24 +115,11 @@ static EMPTY_CFG_PREDS: std::sync::LazyLock<HashMap<BlockId, Vec<BlockId>>> =
     std::sync::LazyLock::new(HashMap::new);
 
 impl<'a> Elaborator<'a> {
-    /// Build the reverse index from values to the union nodes that mention them.
-    fn build_union_members(dfg: &DataFlowGraph) -> HashMap<ValueId, Vec<ValueId>> {
-        let mut index: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
-        for (&val, def) in &dfg.value_defs {
-            if let ValueDef::Union(left, right) = def {
-                index.entry(*left).or_default().push(val);
-                index.entry(*right).or_default().push(val);
-            }
-        }
-        index
-    }
-
     pub fn new(
         dfg: &'a mut DataFlowGraph,
         domtree: &'a DominatorTree,
         stats: &'a mut Stats,
     ) -> Self {
-        let union_members = Self::build_union_members(dfg);
         Self {
             dfg,
             domtree,
@@ -149,7 +130,6 @@ impl<'a> Elaborator<'a> {
             block_entry_facts: &EMPTY_ENTRY_FACTS,
             cfg_preds: &EMPTY_CFG_PREDS,
             cache_scope_stack: Vec::new(),
-            union_members,
             stats,
         }
     }
@@ -168,7 +148,6 @@ impl<'a> Elaborator<'a> {
         block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
         cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
     ) -> Self {
-        let union_members = Self::build_union_members(dfg);
         Self {
             dfg,
             domtree,
@@ -179,7 +158,6 @@ impl<'a> Elaborator<'a> {
             block_entry_facts,
             cfg_preds,
             cache_scope_stack: Vec::new(),
-            union_members,
             stats,
         }
     }
@@ -484,30 +462,12 @@ impl<'a> Elaborator<'a> {
                 // Regular instruction: recursively elaborate its arguments
                 let inst = self.dfg.insts[&inst_id].clone();
 
-                // Recursively elaborate arguments
                 for &arg in &inst.args {
                     self.elaborate_value_in_block(arg, block_id);
                 }
 
-                // Start with conditional union alternative (if any)
-                let mut best = self
-                    .best_conditional_alternative(value, block_id)
-                    .unwrap_or(value);
-                let mut best_cost = self.compute_best_cost(best);
-
-                // Also check unconditional unions that reference this value
-                if let Some(unions) = self.union_members.get(&value).cloned() {
-                    for union_val in unions {
-                        let resolved = self.elaborate_value_in_block(union_val, block_id);
-                        let cost = self.compute_best_cost(resolved);
-                        if cost < best_cost {
-                            best_cost = cost;
-                            best = resolved;
-                        }
-                    }
-                }
-
-                best
+                self.best_conditional_alternative(value, block_id)
+                    .unwrap_or(value)
             }
 
             ValueDef::Union(left, right) => {
