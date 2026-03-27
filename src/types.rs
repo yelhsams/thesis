@@ -691,23 +691,23 @@ pub struct Stats {
 
 impl Stats {
     pub fn print_summary(&self) {
-        println!("\n=== Egraph Pass Statistics ===");
-        println!("Pure instructions processed: {}", self.pure_inst);
-        println!("  - Deduplicated: {}", self.pure_inst_deduped);
-        println!("  - New: {}", self.pure_inst_insert_new);
-        println!("Skeleton instructions: {}", self.skeleton_inst);
-        println!("  - GVN merged: {}", self.skeleton_inst_gvn);
-        println!("Union nodes created: {}", self.union);
-        println!("Rewrite rules invoked: {}", self.rewrite_rule_invoked);
-        println!("Rewrite results: {}", self.rewrite_rule_results);
+        eprintln!("\n=== Egraph Pass Statistics ===");
+        eprintln!("Pure instructions processed: {}", self.pure_inst);
+        eprintln!("  - Deduplicated: {}", self.pure_inst_deduped);
+        eprintln!("  - New: {}", self.pure_inst_insert_new);
+        eprintln!("Skeleton instructions: {}", self.skeleton_inst);
+        eprintln!("  - GVN merged: {}", self.skeleton_inst_gvn);
+        eprintln!("Union nodes created: {}", self.union);
+        eprintln!("Rewrite rules invoked: {}", self.rewrite_rule_invoked);
+        eprintln!("Rewrite results: {}", self.rewrite_rule_results);
         if self.range_refinement_iterations > 0 || self.ranges_propagated > 0 {
-            println!("Range analysis:");
-            println!("  - Ranges propagated: {}", self.ranges_propagated);
-            println!(
+            eprintln!("Range analysis:");
+            eprintln!("  - Ranges propagated: {}", self.ranges_propagated);
+            eprintln!(
                 "  - Refinement iterations: {}",
                 self.range_refinement_iterations
             );
-            println!(
+            eprintln!(
                 "  - New unions from refinement: {}",
                 self.range_refinement_new_unions
             );

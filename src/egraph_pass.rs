@@ -12,8 +12,6 @@ use crate::support::*;
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
 
-const _MATCHES_LIMIT: usize = 5;
-const _ECLASS_ENODE_LIMIT: usize = 5;
 const REWRITE_LIMIT: usize = 5;
 
 /// Main egraph pass structure
@@ -72,8 +70,6 @@ impl EgraphPass {
 
     /// Run the complete egraph pass
     pub fn run(&mut self) {
-        let (func_name, sig_params, sig_return) = self.get_function_signature();
-
         // Single-pass aegraph construction: domtree walk with inline range
         // propagation, branch-condition learning, and conditional union creation.
         self.remove_pure_and_optimize();
@@ -81,9 +77,6 @@ impl EgraphPass {
         // Safety-net redundant phi elimination (handles cross-iteration
         // convergence the single inline pass cannot reach).
         self.eliminate_redundant_params();
-
-        // Print intermediate state showing unions
-        self.print_egraph_state();
 
         // Apply GVN mapping to instruction args before elaboration so the
         // elaborator sees the GVN-canonical values.
@@ -106,8 +99,6 @@ impl EgraphPass {
             elaborator.rewrite_args(&self.layout);
         }
         self.rebuild_layout();
-
-        #[cfg(debug_assertions)]
         self.check_no_unions();
 
         // CFG cleanups (separate from aegraph construction)
@@ -208,9 +199,7 @@ impl EgraphPass {
 
             // Update the block
             let block = self.layout.block_data.get_mut(&block_id).unwrap();
-            let original_count = block.insts.len();
             block.insts = new_insts;
-            let new_count = block.insts.len();
         }
     }
 
@@ -244,6 +233,10 @@ impl EgraphPass {
             }
         }
     }
+
+    /// No-op in release builds; the debug version panics on residual unions.
+    #[cfg(not(debug_assertions))]
+    fn check_no_unions(&self) {}
 
     /// Topologically sort instructions so that definitions come before uses
     fn topological_sort_instructions(&self, inst_set: &HashSet<InstId>) -> Vec<InstId> {
@@ -306,58 +299,6 @@ impl EgraphPass {
         }
 
         result
-    }
-
-    // TODO: Implement this
-    // fn verify_egraph(&self) {
-    //     // We could add other verification checks here, such as:
-    //     // - Checking for circular references in union nodes
-    //     // - Verifying that all referenced values exist
-    //     // - Checking type consistency
-    // }
-
-    /// Extract function signature from entry block
-    fn get_function_signature(&self) -> (String, Vec<Type>, Option<Type>) {
-        let func_name = "test".to_string();
-
-        // Get parameter types from entry block
-        let sig_params: Vec<Type> = if let Some(entry_block) = self.layout.entry_block() {
-            if let Some(block_data) = self.layout.block_data.get(&entry_block) {
-                block_data
-                    .params
-                    .iter()
-                    .map(|&param| self.dfg.value_type(param))
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Try to infer return type from return instructions
-        let sig_return = None; // Could be enhanced to find return instructions
-
-        (func_name, sig_params, sig_return)
-    }
-
-    /// Print the current state of the egraph including union nodes
-    fn print_egraph_state(&self) {
-        // Show all value definitions including unions
-        let mut values: Vec<_> = self.dfg.value_defs.keys().copied().collect();
-        values.sort();
-
-        for value in values {
-            let def_str = self.dfg.display_value_def(value);
-            match self.dfg.value_def(value) {
-                ValueDef::Union(_, _) => {}
-                ValueDef::BlockParam(_, _) => {}
-                ValueDef::Inst(_) => {}
-            }
-        }
-
-        // Show the layout (skeleton)
-        let (func_name, sig_params, sig_return) = self.get_function_signature();
     }
 
     /// Add a custom rewrite rule to the engine
@@ -561,11 +502,10 @@ impl EgraphPass {
                                     self.dfg.insts.insert(pred_inst_id, new_inst);
                                     changed = true;
                                 }
-                                Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) => {
+                                Some(BranchInfo::Conditional(then_b, tc, else_b, _ec)) => {
                                     let then_b = *then_b;
                                     let tc = *tc;
                                     let else_b = *else_b;
-                                    let ec = *ec;
 
                                     if then_b != block_id && else_b != block_id {
                                         continue;
@@ -879,11 +819,7 @@ impl EgraphPass {
 
         let mut available_block: HashMap<ValueId, BlockId> = HashMap::new();
 
-        let mut eclass_size: HashMap<ValueId, u8> = HashMap::new();
-
         let mut gvn_map_blocks: Vec<BlockId> = Vec::new();
-
-        let remat_values: HashSet<ValueId> = HashSet::new();
 
         // Pre-scan: build (target_block, param_index) → (predecessor, incoming_value)
         // from the layout. Values are original (unrewritten); resolved through
@@ -1213,8 +1149,6 @@ impl EgraphPass {
                             gvn_map: &mut gvn_map,
                             gvn_map_blocks: &gvn_map_blocks,
                             available_block: &mut available_block,
-                            eclass_size: &mut eclass_size,
-                            remat_values: &remat_values,
                             stats: &mut self.stats,
                             domtree: &self.domtree,
                             rewrite_depth: 0,
@@ -1274,7 +1208,7 @@ impl EgraphPass {
                                             available_block.insert(cv, block);
                                             cv
                                         };
-                                        let _union = self.dfg.make_union(opt_result, const_val);
+                                        let _ = self.dfg.make_union(opt_result, const_val);
                                         value_to_opt_value.insert(result, const_val);
                                         self.stats.union += 1;
                                     }
@@ -1447,8 +1381,6 @@ struct OptimizeCtx<'a> {
     gvn_map: &'a mut ScopedHashMap<(Type, Instruction), Option<ValueId>>,
     gvn_map_blocks: &'a Vec<BlockId>,
     available_block: &'a mut HashMap<ValueId, BlockId>,
-    eclass_size: &'a mut HashMap<ValueId, u8>,
-    remat_values: &'a HashSet<ValueId>,
     stats: &'a mut Stats,
     domtree: &'a DominatorTree,
     rewrite_depth: usize,
@@ -1527,8 +1459,12 @@ impl<'a> OptimizeCtx<'a> {
 
         let mut union_value = value;
 
-        // Pass range assumptions so range-based rewrite conditions can fire
+        // Pass range assumptions so range-based rewrite conditions can fire.
         let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
+        // SAFETY: The pointee is not mutated through the raw pointer while
+        // this shared reference is live.  `apply_rewrites_with_ranges` only
+        // reads range assumptions; mutation of `self.range_assumptions`
+        // happens after this call returns.
         let rewrites = self.rewrite_engine.apply_rewrites_with_ranges(
             self.dfg,
             value,
@@ -1605,12 +1541,15 @@ impl<'a> OptimizeCtx<'a> {
     /// `apply_rewrites_and_union` already handled it.
     fn apply_conditional_rewrites_and_store(&mut self, value: ValueId) {
         // Only consider instruction-defined values.
-        let _inst_id = match self.dfg.value_def(value) {
+        let _ = match self.dfg.value_def(value) {
             ValueDef::Inst(id) => id,
             _ => return,
         };
 
         let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
+        // SAFETY: The pointee is not mutated through the raw pointer while
+        // this shared reference is live.  We only read range assumptions
+        // below; `self.dfg` is the only field mutated during the loop.
         let ra = unsafe { &*ra_ptr };
 
         // Iterate over all rewrite rules to find ones with range-based conditions.
@@ -1666,7 +1605,7 @@ impl<'a> OptimizeCtx<'a> {
                 assumptions: branch_local_facts,
             };
 
-            let cu = self
+            let _ = self
                 .dfg
                 .make_conditional_union(value, new_value, assumption_set);
         }

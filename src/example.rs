@@ -5,7 +5,6 @@
 
 use crate::clif_parser::*;
 use crate::egraph_pass::*;
-use crate::elaborate::*;
 use crate::support::*;
 use crate::types::*;
 

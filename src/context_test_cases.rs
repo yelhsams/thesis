@@ -1,12 +1,15 @@
 //! Context-aware optimization examples using CLIF
 
+#[cfg(test)]
 use crate::clif_parser::*;
+#[cfg(test)]
 use crate::egraph_pass::*;
-use crate::pattern::*;
-use crate::range::RangeAssumptions;
+#[cfg(test)]
 use crate::support::*;
+#[cfg(test)]
 use crate::types::*;
 
+#[cfg(test)]
 fn canonicalize_values(s: &str) -> String {
     use std::collections::HashMap;
 
@@ -59,6 +62,7 @@ fn canonicalize_values(s: &str) -> String {
     result
 }
 
+#[cfg(test)]
 fn normalize(s: &str) -> String {
     let canonicalized = canonicalize_values(s);
     canonicalized
@@ -67,6 +71,7 @@ fn normalize(s: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 fn helper(original_clif: &str, expected_clif: &str) {
     let (dfg, layout) = parse_clif(original_clif).unwrap();
 
@@ -94,6 +99,7 @@ fn helper(original_clif: &str, expected_clif: &str) {
     );
 }
 
+#[cfg(test)]
 fn helper_with_params(original_clif: &str, expected_clif: &str, sig_params: &[Type]) {
     let (dfg, layout) = parse_clif(original_clif).unwrap();
     let domtree = DominatorTree::from_layout(&layout, &dfg);

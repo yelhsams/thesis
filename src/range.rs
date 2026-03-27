@@ -279,27 +279,6 @@ impl std::fmt::Display for Range {
     }
 }
 
-// notes:
-// sketch out idea first.
-// run into difficulties I didn't anticipate
-// pushing/popping basic assumptions
-// whether rules should match
-// union nodes need to be tagged under what context
-
-// understand what order we are puting into the egraph, what order we are visiting thems
-
-// start with small example
-// super simple with partially broken algorithm
-// examples that would break if assumptions 'lived too long'
-
-// focus on order of visits
-
-// draw control flow graph to side
-
-// sightglass
-
-// tree based cost model recursively
-
 #[derive(Debug, Clone)]
 pub struct RangeAssumptions {
     scopes: Vec<HashMap<ValueId, Range>>,

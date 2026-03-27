@@ -424,7 +424,6 @@ pub fn example_comparison() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::range::RangeAssumptions;
 
     #[test]
     fn test_all_pattern_examples() {

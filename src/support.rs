@@ -1,5 +1,5 @@
 use crate::types::*;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 /// Simplified dominator tree
@@ -354,7 +354,7 @@ impl<K: Eq + Hash + Clone, V: Clone> ScopedHashMap<K, V> {
     }
 
     /// Entry API for scoped hash map
-    pub fn entry(&mut self, key: K) -> ScopedEntry<K, V> {
+    pub fn entry(&mut self, key: K) -> ScopedEntry<'_, K, V> {
         if self.get(&key).is_some() {
             ScopedEntry::Occupied(OccupiedEntry { map: self, key })
         } else {

@@ -169,8 +169,6 @@ impl<'a> Elaborator<'a> {
     /// the correct scoped context. Otherwise falls back to layout-order
     /// traversal.
     pub fn elaborate(&mut self, layout: &Layout) {
-        println!("\n=== Starting Elaboration ===\n");
-
         if self.range_assumptions.is_some() {
             self.elaborate_domtree(layout);
         } else {
@@ -180,9 +178,6 @@ impl<'a> Elaborator<'a> {
                 self.elaborate_block(block_id, layout);
             }
         }
-
-        println!("\n=== Elaboration Complete ===");
-        println!("All pure values placed back into layout");
     }
 
     /// Domtree-preorder elaboration walk.
@@ -299,8 +294,6 @@ impl<'a> Elaborator<'a> {
 
     /// Compute the best cost for each value by exploring the egraph
     fn compute_best_costs(&mut self) {
-        println!("Computing best costs for all values...");
-
         // Get all values that are defined by instructions
         let values: Vec<_> = self.dfg.value_defs.keys().copied().collect();
 
@@ -371,6 +364,11 @@ impl<'a> Elaborator<'a> {
             Some(ra) => ra as *const RangeAssumptions,
             None => return,
         };
+        // SAFETY: The pointee (`RangeAssumptions`) is not mutated through
+        // the raw pointer while this shared reference is live.  The cast
+        // exists solely to satisfy the borrow checker — `self` is borrowed
+        // mutably for `compute_best_cost`, but `range_assumptions` is only
+        // read (not written) during the iteration below.
         let ra = unsafe { &*ra };
 
         // Collect candidates from conditional unions.
@@ -408,8 +406,6 @@ impl<'a> Elaborator<'a> {
 
     /// Elaborate all values needed in a block
     fn elaborate_block(&mut self, block_id: BlockId, layout: &Layout) {
-        println!("Elaborating block {:?}", block_id);
-
         let block = &layout.block_data[&block_id];
 
         // Process each instruction in the block
@@ -491,6 +487,9 @@ impl<'a> Elaborator<'a> {
             Some(ra) => ra as *const RangeAssumptions,
             None => return None,
         };
+        // SAFETY: The pointee is not mutated through the raw pointer while
+        // this shared reference is live.  We only read `range_assumptions`
+        // here; mutation happens elsewhere via `&mut self`.
         let ra = unsafe { &*ra };
 
         let current_cost = self.compute_best_cost(value);
@@ -538,8 +537,6 @@ impl<'a> Elaborator<'a> {
     /// argument is replaced with the value that `elaborate_value_in_block`
     /// selected for that block context, so conditional unions are respected.
     pub fn rewrite_args(&mut self, layout: &Layout) {
-        let mut updated_count: usize = 0;
-
         for &block_id in &layout.blocks {
             let block = match layout.block_data.get(&block_id) {
                 Some(b) => b,
@@ -561,12 +558,9 @@ impl<'a> Elaborator<'a> {
 
                 if changed {
                     self.dfg.insts.insert(inst_id, inst);
-                    updated_count += 1;
                 }
             }
         }
-
-        println!("Elaborator rewrote args in {} instructions", updated_count);
     }
 }
 

@@ -13,7 +13,6 @@ pub mod types;
 
 pub use clif_lexer::*;
 pub use clif_parser::*;
-pub use context_test_cases::*;
 pub use egraph_pass::*;
 pub use elaborate::*;
 pub use example::*;

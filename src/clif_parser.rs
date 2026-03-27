@@ -248,7 +248,7 @@ impl Parser {
 
     fn parse_instruction_args(
         &mut self,
-        dfg: &DataFlowGraph,
+        _dfg: &DataFlowGraph,
         opcode: &Opcode,
     ) -> Result<(Vec<ValueId>, Option<i64>, Option<BranchInfo>), String> {
         let mut args = Vec::new();
