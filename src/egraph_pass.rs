@@ -1459,17 +1459,16 @@ impl<'a> OptimizeCtx<'a> {
 
         let mut union_value = value;
 
-        // Pass range assumptions so range-based rewrite conditions can fire.
-        let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
-        // SAFETY: The pointee is not mutated through the raw pointer while
-        // this shared reference is live.  `apply_rewrites_with_ranges` only
-        // reads range assumptions; mutation of `self.range_assumptions`
-        // happens after this call returns.
-        let rewrites = self.rewrite_engine.apply_rewrites_with_ranges(
-            self.dfg,
-            value,
-            Some(unsafe { &*ra_ptr }),
-        );
+        // Range-conditioned rewrites are handled by
+        // apply_conditional_rewrites_and_store, which decides whether to
+        // create an unconditional or conditional union based on whether
+        // the range facts are globally provable or branch-local.
+        // Passing range assumptions here would create permanent
+        // ValueDef::Union nodes from branch-local facts, which is unsound
+        // because the extractor follows unions without range guards.
+        let rewrites = self
+            .rewrite_engine
+            .apply_rewrites_with_ranges(self.dfg, value, None);
 
         for rewritten in rewrites {
             self.stats.rewrite_rule_results += 1;
@@ -1532,13 +1531,13 @@ impl<'a> OptimizeCtx<'a> {
         !(root.min >= range.min && root.max <= range.max)
     }
 
-    /// Inspect the current range-assumption scope and, for each rewrite rule
-    /// whose range-based conditions are satisfied only because of branch-local
-    /// assumptions, create a `ConditionalUnion` instead of an unconditional one.
+    /// Handle ALL range-conditioned rewrites.  For each rewrite rule whose
+    /// range-based conditions are currently satisfied, this method creates:
     ///
-    /// If the condition is globally provable (root scope suffices), no
-    /// conditional union is created — the unconditional path in
-    /// `apply_rewrites_and_union` already handled it.
+    /// - An **unconditional** union (via `make_union`) when every range fact
+    ///   is globally provable (root scope suffices).
+    /// - A **conditional** union (via `make_conditional_union`) when at least
+    ///   one range fact is branch-local.
     fn apply_conditional_rewrites_and_store(&mut self, value: ValueId) {
         // Only consider instruction-defined values.
         let _ = match self.dfg.value_def(value) {
@@ -1587,12 +1586,6 @@ impl<'a> OptimizeCtx<'a> {
                 }
             }
 
-            // If all conditions are globally provable, the unconditional path
-            // already handled this — skip.
-            if all_global {
-                continue;
-            }
-
             // Apply the RHS to produce the rewritten value.
             let mut applier = PatternApplier::new(self.dfg);
             let new_value = match applier.apply_pattern(&rule.rhs, &bindings) {
@@ -1600,7 +1593,35 @@ impl<'a> OptimizeCtx<'a> {
                 _ => continue,
             };
 
-            // Build the AssumptionSet from only the branch-local facts.
+            if all_global {
+                // All range facts are globally provable — safe to create an
+                // unconditional union.
+                let union_node = self.dfg.make_union(value, new_value);
+                self.stats.union += 1;
+
+                // Propagate simpler-value information so the extractor sees it.
+                let is_simpler = match self.dfg.value_defs.get(&new_value).copied() {
+                    Some(ValueDef::Inst(iid)) => self.dfg.insts[&iid].opcode == Opcode::Const,
+                    Some(ValueDef::BlockParam(_, _)) => true,
+                    _ => false,
+                };
+                if is_simpler {
+                    self.value_to_opt_value.insert(value, new_value);
+                }
+
+                // Ensure new_value has an availability entry before merging.
+                if !self.available_block.contains_key(&new_value) {
+                    if let Some(&blk) = self.available_block.get(&value) {
+                        self.available_block.insert(new_value, blk);
+                    }
+                }
+                let avail = self.merge_availability(value, new_value);
+                self.available_block.insert(union_node, avail);
+                continue;
+            }
+
+            // Some facts are branch-local — create a conditional union guarded
+            // by the branch-local assumptions.
             let assumption_set = AssumptionSet {
                 assumptions: branch_local_facts,
             };
@@ -1623,7 +1644,9 @@ impl<'a> OptimizeCtx<'a> {
                 | Condition::RangeLessThan(..)
                 | Condition::RangeGreaterThan(..)
                 | Condition::RangeEquals(..)
-                | Condition::Unreachable(..) => {
+                | Condition::Unreachable(..)
+                | Condition::NonZero(..)
+                | Condition::Custom { .. } => {
                     result.push(cond.clone());
                 }
                 Condition::And(inner) => {
