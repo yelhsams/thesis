@@ -10,7 +10,7 @@ pub struct TestCase {
     pub clif: &'static str,
 }
 
-pub const TEST_CASES: [TestCase; 18] = [
+pub const TEST_CASES: &[TestCase] = &[
     TestCase {
         name: "algebra",
         clif: r#"
@@ -359,21 +359,13 @@ fn count_insts(layout: &Layout) -> usize {
     layout.block_data.values().map(|b| b.insts.len()).sum()
 }
 
-fn run_one(name: &str, clif: &str, path_sensitive: bool) -> (usize, usize) {
-    let (dfg, layout) = match parse_clif(clif) {
-        Ok(x) => x,
-        Err(e) => {
-            println!("  [{name}] parse error: {e:?}");
-            return (0, 0);
-        }
-    };
-    let input_insts = count_insts(&layout);
+fn run_one(clif: &str, path_sensitive: bool) -> usize {
+    let (dfg, layout) = parse_clif(clif).expect("parse");
     let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.set_path_sensitive(path_sensitive);
     pass.run();
-    let output_insts = count_insts(&pass.layout);
-    (input_insts, output_insts)
+    count_insts(&pass.layout)
 }
 
 /// Run the entire benchmark suite, comparing path-sensitive vs baseline.
@@ -384,37 +376,33 @@ pub fn run_benchmarks() {
     );
     println!("{}", "-".repeat(54));
 
-    let mut total_input = 0usize;
-    let mut total_ps = 0usize;
-    let mut total_baseline = 0usize;
+    let (mut tot_in, mut tot_ps, mut tot_base) = (0usize, 0usize, 0usize);
 
-    for tc in TEST_CASES.iter() {
-        let (input, ps_out) = run_one(tc.name, tc.clif, true);
-        let (_, base_out) = run_one(tc.name, tc.clif, false);
-
-        println!(
-            "{:<22} {:>8} {:>10} {:>10}",
-            tc.name, input, ps_out, base_out
-        );
-
-        total_input += input;
-        total_ps += ps_out;
-        total_baseline += base_out;
+    for tc in TEST_CASES {
+        let (_, layout) = parse_clif(tc.clif).expect("parse");
+        let input = count_insts(&layout);
+        let ps = run_one(tc.clif, true);
+        let base = run_one(tc.clif, false);
+        println!("{:<22} {:>8} {:>10} {:>10}", tc.name, input, ps, base);
+        tot_in += input;
+        tot_ps += ps;
+        tot_base += base;
     }
 
     println!("{}", "-".repeat(54));
     println!(
         "{:<22} {:>8} {:>10} {:>10}",
-        "TOTAL", total_input, total_ps, total_baseline
+        "TOTAL", tot_in, tot_ps, tot_base
     );
+    let pct = |x: usize| 100.0 * (tot_in - x) as f64 / tot_in as f64;
     println!(
         "\nps reduction:       {} insts ({:.1}%)",
-        total_input as i64 - total_ps as i64,
-        100.0 * (total_input - total_ps) as f64 / total_input as f64
+        tot_in - tot_ps,
+        pct(tot_ps)
     );
     println!(
         "baseline reduction: {} insts ({:.1}%)",
-        total_input as i64 - total_baseline as i64,
-        100.0 * (total_input - total_baseline) as f64 / total_input as f64
+        tot_in - tot_base,
+        pct(tot_base)
     );
 }

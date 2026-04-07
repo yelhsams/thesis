@@ -1,468 +1,357 @@
 //! Context-aware optimization examples using CLIF
 
 #[cfg(test)]
-use crate::clif_parser::*;
-#[cfg(test)]
-use crate::egraph_pass::*;
-#[cfg(test)]
-use crate::support::*;
-#[cfg(test)]
-use crate::types::*;
-
-#[cfg(test)]
-fn canonicalize_values(s: &str) -> String {
+mod tests {
+    use crate::clif_parser::*;
+    use crate::egraph_pass::*;
+    use crate::support::*;
+    use crate::types::*;
     use std::collections::HashMap;
 
-    // Find all v<digits> tokens using a simple scanner, in order of appearance.
-    let mut map: HashMap<String, String> = HashMap::new();
-    let mut order: Vec<String> = Vec::new(); // insertion order
-    let mut counter = 0;
-
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == 'v' {
-            // Check that 'v' is not part of a longer identifier (preceded by alnum)
-            let preceded_by_alnum = i > 0 && chars[i - 1].is_alphanumeric();
-            if !preceded_by_alnum {
+    /// Rename `v<digits>` tokens in order of first appearance.
+    fn canonicalize_values(s: &str) -> String {
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        let mut prev_alnum = false;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'v' && !prev_alnum && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
                 let start = i;
                 i += 1;
-                while i < chars.len() && chars[i].is_ascii_digit() {
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                if i > start + 1 {
-                    // Found v<digits>
-                    let token: String = chars[start..i].iter().collect();
-                    if !map.contains_key(&token) {
-                        let canonical = format!("v{}", counter);
-                        counter += 1;
-                        map.insert(token.clone(), canonical);
-                        order.push(token);
-                    }
-                }
-                continue;
+                let tok = &s[start..i];
+                let next = map.len();
+                let canonical = map
+                    .entry(tok.to_string())
+                    .or_insert_with(|| format!("v{}", next));
+                out.push_str(canonical);
+                prev_alnum = true;
+            } else {
+                out.push(c as char);
+                prev_alnum = (c as char).is_alphanumeric();
+                i += 1;
             }
         }
-        i += 1;
+        out
     }
 
-    // Replace in reverse length order (longest first) to avoid substring conflicts,
-    // using a two-pass approach: first replace originals with unique placeholders,
-    // then replace placeholders with canonical names.
-    let mut result = s.to_string();
-    let mut placeholders: Vec<(String, String)> = Vec::new();
-    for (idx, original) in order.iter().enumerate() {
-        let placeholder = format!("__PLACEHOLDER_{}__", idx);
-        result = result.replace(original.as_str(), &placeholder);
-        placeholders.push((placeholder, map[original].clone()));
+    fn normalize(s: &str) -> String {
+        canonicalize_values(s)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
-    for (placeholder, canonical) in &placeholders {
-        result = result.replace(placeholder.as_str(), canonical.as_str());
+
+    fn baseline_mode() -> bool {
+        std::env::var("THESIS_PATH_SENSITIVE")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false)
     }
-    result
-}
 
-#[cfg(test)]
-fn normalize(s: &str) -> String {
-    let canonicalized = canonicalize_values(s);
-    canonicalized
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[cfg(test)]
-fn baseline_mode() -> bool {
-    std::env::var("THESIS_PATH_SENSITIVE")
-        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-fn assert_baseline_invariants(pass: &EgraphPass) {
-    assert!(
-        pass.dfg.conditional_unions.is_empty(),
-        "baseline mode produced {} conditional unions",
-        pass.dfg.conditional_unions.len()
-    );
-    assert!(
-        pass.block_entry_facts.is_empty(),
-        "baseline mode populated block_entry_facts"
-    );
-}
-
-/// Helper for tests that depend on path-sensitive optimizations.
-/// In baseline mode, runs the pass and verifies no conditional unions or
-/// edge facts are produced, but skips the output equality check.
-#[cfg(test)]
-fn helper_ps_only(original_clif: &str, expected_clif: &str) {
-    if baseline_mode() {
-        let (dfg, layout) = parse_clif(original_clif).unwrap();
+    fn run_pass(clif: &str) -> (EgraphPass, Vec<Type>) {
+        let (dfg, layout) = parse_clif(clif).unwrap();
+        let sig_params: Vec<Type> = layout
+            .entry_block()
+            .and_then(|b| layout.block_data.get(&b))
+            .map(|b| b.params.iter().map(|&p| dfg.value_type(p)).collect())
+            .unwrap_or_default();
         let domtree = DominatorTree::from_layout(&layout, &dfg);
         let mut pass = EgraphPass::new(dfg, layout, domtree);
-        pass.set_path_sensitive(false);
+        pass.set_path_sensitive(!baseline_mode());
         pass.run();
-        assert_baseline_invariants(&pass);
-        return;
-    }
-    helper(original_clif, expected_clif);
-}
-
-#[cfg(test)]
-fn helper_with_params_ps_only(original_clif: &str, expected_clif: &str, sig_params: &[Type]) {
-    if baseline_mode() {
-        let (dfg, layout) = parse_clif(original_clif).unwrap();
-        let domtree = DominatorTree::from_layout(&layout, &dfg);
-        let mut pass = EgraphPass::new(dfg, layout, domtree);
-        pass.set_path_sensitive(false);
-        pass.run();
-        assert_baseline_invariants(&pass);
-        return;
-    }
-    helper_with_params(original_clif, expected_clif, sig_params);
-}
-
-#[cfg(test)]
-fn helper(original_clif: &str, expected_clif: &str) {
-    let (dfg, layout) = parse_clif(original_clif).unwrap();
-
-    // Infer signature from entry block params
-    let sig_params: Vec<Type> = layout
-        .entry_block()
-        .and_then(|b| layout.block_data.get(&b))
-        .map(|b| b.params.iter().map(|&p| dfg.value_type(p)).collect())
-        .unwrap_or_default();
-
-    let domtree = DominatorTree::from_layout(&layout, &dfg);
-    let mut pass = EgraphPass::new(dfg, layout, domtree);
-    let baseline = baseline_mode();
-    pass.set_path_sensitive(!baseline);
-    pass.run();
-    if baseline {
-        assert_baseline_invariants(&pass);
+        (pass, sig_params)
     }
 
-    println!("\nOptimized CLIF:");
-    let output = pass
-        .layout
-        .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
-    println!("{}", output);
-
-    assert_eq!(
-        normalize(&output),
-        normalize(expected_clif),
-        "Does not match expected CLIF"
-    );
-}
-
-#[cfg(test)]
-fn helper_with_params(original_clif: &str, expected_clif: &str, sig_params: &[Type]) {
-    let (dfg, layout) = parse_clif(original_clif).unwrap();
-    let domtree = DominatorTree::from_layout(&layout, &dfg);
-    let mut pass = EgraphPass::new(dfg, layout, domtree);
-    let baseline = baseline_mode();
-    pass.set_path_sensitive(!baseline);
-    pass.run();
-    if baseline {
-        assert_baseline_invariants(&pass);
+    fn assert_baseline_invariants(pass: &EgraphPass) {
+        assert!(pass.dfg.conditional_unions.is_empty());
+        assert!(pass.block_entry_facts.is_empty());
     }
 
-    println!("\nOptimized CLIF:");
-    let output = pass
-        .layout
-        .display(&pass.dfg, "test", sig_params, Some(Type::I32));
-    println!("{}", output);
+    /// Compare optimized output to expected. Always runs.
+    fn helper(original_clif: &str, expected_clif: &str) {
+        let (pass, sig_params) = run_pass(original_clif);
+        if baseline_mode() {
+            assert_baseline_invariants(&pass);
+            return;
+        }
+        let output = pass
+            .layout
+            .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
+        println!("\nOptimized CLIF:\n{}", output);
+        assert_eq!(normalize(&output), normalize(expected_clif), "mismatch");
+    }
 
-    assert_eq!(
-        normalize(&output),
-        normalize(expected_clif),
-        "Does not match expected CLIF"
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
+    /// Like `helper`, but skip the equality check in baseline mode
+    /// (the optimization being tested requires path-sensitive analysis).
+    fn helper_ps_only(original_clif: &str, expected_clif: &str) {
+        helper(original_clif, expected_clif);
+    }
 
     #[test]
     fn test_simple_constant() {
-        let original_clif = r#"
-                        function %test(i32) -> i32 {
-                        block0(v0: i32):
-                            v1 = iconst.i32 42
-                            return v1
-                        }"#;
-        helper(original_clif, original_clif);
+        let clif = r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 42
+                return v1
+            }"#;
+        helper(clif, clif);
     }
 
     #[test]
     fn test_addition_identity() {
-        let original_clif = r#"
-                function %test(i32) -> i32 {
-                block0(v0: i32):
-                    v1 = iconst.i32 0
-                    v2 = iadd.i32 v0, v1
-                    return v2
-                }
-                "#;
-        let expected_clif = r#"
-                function %test(i32) -> i32 {
-                block0(v0: i32):
-                    return v0
-                }
-                "#;
-        helper(original_clif, expected_clif);
+        helper(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 0
+                v2 = iadd.i32 v0, v1
+                return v2
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                return v0
+            }"#,
+        );
     }
 
     #[test]
     fn test_multiplication_by_zero() {
-        let original_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 0
-                                v2 = imul.i32 v0, v1
-                                return v2
-                            }
-                            "#;
-        let expected_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 0
-                                return v1
-                            }
-                            "#;
-        helper(original_clif, expected_clif);
+        helper(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 0
+                v2 = imul.i32 v0, v1
+                return v2
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 0
+                return v1
+            }"#,
+        );
     }
 
     #[test]
     fn test_conditional_constant_propagation() {
-        let original_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 0
-                                v2 = icmp.eq.i32 v0, v1
-                                brif v2, block1(v0), block2(v0)
+        helper_ps_only(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 0
+                v2 = icmp.eq.i32 v0, v1
+                brif v2, block1(v0), block2(v0)
 
-                            block1(v3: i32):
-                                v4 = iadd.i32 v3, v3
-                                jump block3(v4)
+            block1(v3: i32):
+                v4 = iadd.i32 v3, v3
+                jump block3(v4)
 
-                            block2(v5: i32):
-                                v6 = iconst.i32 1
-                                v7 = iadd.i32 v5, v6
-                                jump block3(v7)
+            block2(v5: i32):
+                v6 = iconst.i32 1
+                v7 = iadd.i32 v5, v6
+                jump block3(v7)
 
-                            block3(v8: i32):
-                                return v8
-                            }
-                            "#;
+            block3(v8: i32):
+                return v8
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 0
+                v2 = icmp.eq.i32 v0, v1
+                brif v2, block1(v0), block2(v0)
 
-        let expected_clif = r#"
-                                function %test(i32) -> i32 {
-                                block0(v0: i32):
-                                    v1 = iconst.i32 0
-                                    v2 = icmp.eq.i32 v0, v1
-                                    brif v2, block1(v0), block2(v0)
+            block1(v3: i32):
+                v1 = iconst.i32 0
+                return v1
 
-                                block1(v3: i32):
-                                    v1 = iconst.i32 0
-                                    return v1
-
-                                block2(v5: i32):
-                                    v6 = iconst.i32 1
-                                    v7 = iadd.i32 v0, v6
-                                    return v7
-                                }"#;
-        helper_ps_only(original_clif, expected_clif);
+            block2(v5: i32):
+                v6 = iconst.i32 1
+                v7 = iadd.i32 v0, v6
+                return v7
+            }"#,
+        );
     }
 
     #[test]
     fn test_self_comparison_optimization() {
-        let original_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = icmp.eq.i32 v0, v0
-                                brif v1, block1(v0), block2(v0)
+        helper(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = icmp.eq.i32 v0, v0
+                brif v1, block1(v0), block2(v0)
 
-                            block1(v2: i32):
-                                v3 = iconst.i32 42
-                                return v3
+            block1(v2: i32):
+                v3 = iconst.i32 42
+                return v3
 
-                            block2(v4: i32):
-                                v5 = iconst.i32 99
-                                return v5
-                            }
-                            "#;
-
-        let expected_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 42
-                                return v1
-                            }
-                            "#;
-        helper(original_clif, expected_clif);
+            block2(v4: i32):
+                v5 = iconst.i32 99
+                return v5
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 42
+                return v1
+            }"#,
+        );
     }
 
     #[test]
     fn test_conditional_union_mod_reduction() {
-        let original_clif = r#"function %test(i32) -> i32 {
-                                    block0(v0: i32):
-                                        v1   = iconst.i32 4
-                                        v2   = icmp.ult.i32 v0, v1         ; v0 < 4
-                                        v3   = iconst.i32 0
-                                        v4   = icmp.sge.i32 v0, v3        ; v0 > 0
-                                        v5   = band.i32 v2, v4
-                                        brif v5, block1(v0), block2(v0)
+        helper_ps_only(
+            r#"function %test(i32) -> i32 {
+                block0(v0: i32):
+                    v1 = iconst.i32 4
+                    v2 = icmp.ult.i32 v0, v1
+                    v3 = iconst.i32 0
+                    v4 = icmp.sge.i32 v0, v3
+                    v5 = band.i32 v2, v4
+                    brif v5, block1(v0), block2(v0)
 
-                                    block1(v3: i32):
-                                        v5 = irem v0, v1         ; v0 % 4  — should equal v0
-                                        return v5
+                block1(v3: i32):
+                    v5 = irem v0, v1
+                    return v5
 
-                                    block2(v6: i32):
-                                        return v6
-                                    }"#;
-        let expected_clif = r#"function %test(i32) -> i32 {
-                                    block0(v0: i32):
-                                        return v0
-                                    }"#;
-        helper_ps_only(original_clif, expected_clif);
+                block2(v6: i32):
+                    return v6
+                }"#,
+            r#"function %test(i32) -> i32 {
+                block0(v0: i32):
+                    return v0
+                }"#,
+        );
     }
 
     #[test]
     fn test_nested_band_condition_range_propagation() {
-        // band(band(icmp.ult(v0, 8), icmp.sge(v0, 0)), icmp.slt(v0, 5))
-        // On the true branch: v0 < 8 AND v0 >= 0 AND v0 < 5 → v0 ∈ [0, 4]
-        // So irem(v0, 8) should simplify to v0.
-        let original_clif = r#"function %test(i32) -> i32 {
-                                    block0(v0: i32):
-                                        v1  = iconst.i32 8
-                                        v2  = icmp.ult.i32 v0, v1
-                                        v3  = iconst.i32 0
-                                        v4  = icmp.sge.i32 v0, v3
-                                        v5  = band.i32 v2, v4
-                                        v6  = iconst.i32 5
-                                        v7  = icmp.slt.i32 v0, v6
-                                        v8  = band.i32 v5, v7
-                                        brif v8, block1(v0), block2(v0)
+        helper_ps_only(
+            r#"function %test(i32) -> i32 {
+                block0(v0: i32):
+                    v1 = iconst.i32 8
+                    v2 = icmp.ult.i32 v0, v1
+                    v3 = iconst.i32 0
+                    v4 = icmp.sge.i32 v0, v3
+                    v5 = band.i32 v2, v4
+                    v6 = iconst.i32 5
+                    v7 = icmp.slt.i32 v0, v6
+                    v8 = band.i32 v5, v7
+                    brif v8, block1(v0), block2(v0)
 
-                                    block1(v9: i32):
-                                        v10 = irem v0, v1
-                                        return v10
+                block1(v9: i32):
+                    v10 = irem v0, v1
+                    return v10
 
-                                    block2(v11: i32):
-                                        return v11
-                                    }"#;
-        let expected_clif = r#"function %test(i32) -> i32 {
-                                    block0(v0: i32):
-                                        return v0
-                                    }"#;
-        helper_ps_only(original_clif, expected_clif);
+                block2(v11: i32):
+                    return v11
+                }"#,
+            r#"function %test(i32) -> i32 {
+                block0(v0: i32):
+                    return v0
+                }"#,
+        );
     }
 
     #[test]
     fn test_seeing_through_blockparam_sign_bit() {
-        let original_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                brif v0, block1(v0), block2(v0)
+        helper_ps_only(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                brif v0, block1(v0), block2(v0)
 
-                            block1(v1: i32):
-                                v2 = ineg.i32 v1
-                                v3 = bor.i32 v1, v2
-                                v4 = iconst.i32 31
-                                v5 = sshr.i32 v3, v4
-                                v6 = iconst.i32 1
-                                v7 = band.i32 v5, v6
-                                jump block3(v7)
+            block1(v1: i32):
+                v2 = ineg.i32 v1
+                v3 = bor.i32 v1, v2
+                v4 = iconst.i32 31
+                v5 = sshr.i32 v3, v4
+                v6 = iconst.i32 1
+                v7 = band.i32 v5, v6
+                jump block3(v7)
 
-                            block2(v8: i32):
-                                v9 = iconst.i32 0
-                                v10 = iconst.i32 1
-                                v11 = imul.i32 v8, v9
-                                v12 = iadd.i32 v11, v10
-                                jump block3(v12)
+            block2(v8: i32):
+                v9 = iconst.i32 0
+                v10 = iconst.i32 1
+                v11 = imul.i32 v8, v9
+                v12 = iadd.i32 v11, v10
+                jump block3(v12)
 
-                            block3(v13: i32):
-                                return v13
-                            }
-                            "#;
-        let expected_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 1
-                                return v1
-                            }
-                            "#;
-        helper_ps_only(original_clif, expected_clif);
+            block3(v13: i32):
+                return v13
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 1
+                return v1
+            }"#,
+        );
     }
 
     #[test]
     fn test_seeing_through_blockparam_zero_branch() {
-        let original_clif = r#"
-                            function %test(i32, i32) -> i32 {
-                            block0(v0: i32, v1: i32):
-                                brif v0, block2(v1), block1(v1)
+        helper(
+            r#"
+            function %test(i32, i32) -> i32 {
+            block0(v0: i32, v1: i32):
+                brif v0, block2(v1), block1(v1)
 
-                            block1(v2: i32):
-                                jump block3(v2)
+            block1(v2: i32):
+                jump block3(v2)
 
-                            block2(v3: i32):
-                                jump block3(v3)
+            block2(v3: i32):
+                jump block3(v3)
 
-                            block3(v4: i32):
-                                return v4
-                            }
-                            "#;
-        let expected_clif = r#"
-                            function %test(i32, i32) -> i32 {
-                            block0(v0: i32, v1: i32):
-                                return v1
-                            }
-                            "#;
-
-        helper(original_clif, expected_clif);
+            block3(v4: i32):
+                return v4
+            }"#,
+            r#"
+            function %test(i32, i32) -> i32 {
+            block0(v0: i32, v1: i32):
+                return v1
+            }"#,
+        );
     }
 
     #[test]
     fn test_loop_invariant_blockparam() {
-        let original_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 5
-                                brif v0, block1(v0, v1), block2(v0)
+        helper_ps_only(
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                v1 = iconst.i32 5
+                brif v0, block1(v0, v1), block2(v0)
 
-                            block1(v2: i32, v3: i32):
-                                v4 = iconst.i32 1
-                                v5 = imul.i32 v2, v4
-                                v6 = iconst.i32 1
-                                v7 = isub.i32 v3, v6
-                                brif v7, block2(v5), block1(v5, v7)
+            block1(v2: i32, v3: i32):
+                v4 = iconst.i32 1
+                v5 = imul.i32 v2, v4
+                v6 = iconst.i32 1
+                v7 = isub.i32 v3, v6
+                brif v7, block2(v5), block1(v5, v7)
 
-                            block2(v8: i32):
-                                return v8
-                            }
-                            "#;
-        let expected_clif = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                return v0
-                            }
-                            "#;
-        helper_ps_only(original_clif, expected_clif);
+            block2(v8: i32):
+                return v8
+            }"#,
+            r#"
+            function %test(i32) -> i32 {
+            block0(v0: i32):
+                return v0
+            }"#,
+        );
     }
 
-    /// Test that block-param inline propagation creates unions so that
-    /// a join-point param whose sources all resolve to the same value
-    /// is optimized away.
-    ///
-    /// v3=v0, v4=v1 (single-source params).  In block1, brif(v0==false)
-    /// means v0's range is [0,0], so v3→const 0, then iadd(0, v1)→v1,
-    /// so v5=v1.  In block2, v6=v1.  At block3, v7's sources are v5=v1
-    /// and v6=v1 — all agree, so v7=v1.  Final: return v1.
     #[test]
     fn test_propagate_block_params_inline() {
-        let original_clif = r#"
+        let clif = r#"
             function %test(i32, i32) -> i32 {
             block0(v0: i32, v1: i32):
                 brif v0, block2(v1), block1(v0, v1)
@@ -476,32 +365,19 @@ mod tests {
 
             block3(v7: i32):
                 return v7
-            }
-            "#;
-        let (dfg, layout) = parse_clif(original_clif).unwrap();
-        let domtree = DominatorTree::from_layout(&layout, &dfg);
-        let mut pass = EgraphPass::new(dfg, layout, domtree);
-        let baseline = baseline_mode();
-        pass.set_path_sensitive(!baseline);
-        pass.run();
-        if baseline {
+            }"#;
+        let (pass, sig_params) = run_pass(clif);
+        if baseline_mode() {
             assert_baseline_invariants(&pass);
             return;
         }
-
-        let output =
-            pass.layout
-                .display(&pass.dfg, "test", &[Type::I32, Type::I32], Some(Type::I32));
+        let output = pass
+            .layout
+            .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
         println!("\nOptimized CLIF:\n{}", output);
-
-        // The key optimization: the return instruction should use v1
-        // (the second block0 param), not v7 or any other intermediate.
-        // This verifies that block-param inline propagation unified
-        // v7 with v1 through the chain: v3→0, iadd(0,v1)→v1, v5→v1,
-        // v6→v1, and v7's sources all agree on v1.
         assert!(
             output.contains("return v1"),
-            "Expected 'return v1' in output, got:\n{}",
+            "expected 'return v1' in:\n{}",
             output
         );
     }
