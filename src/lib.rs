@@ -1,9 +1,9 @@
+pub mod benchmark;
 pub mod clif_lexer;
 pub mod clif_parser;
 pub mod context_test_cases;
 pub mod egraph_pass;
 pub mod elaborate;
-pub mod example;
 pub mod pattern;
 pub mod pattern_examples;
 pub mod range;
@@ -15,7 +15,6 @@ pub use clif_lexer::*;
 pub use clif_parser::*;
 pub use egraph_pass::*;
 pub use elaborate::*;
-pub use example::*;
 pub use pattern::*;
 pub use pattern_examples::*;
 pub use range::*;

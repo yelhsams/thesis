@@ -7,8 +7,4 @@ edition = "2021"
 name = "aegraph"
 path = "src/lib.rs"
 
-[[example]]
-name = "example"
-path = "examples/example.rs"
-
 [dependencies]

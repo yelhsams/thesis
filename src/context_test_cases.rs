@@ -72,6 +72,57 @@ fn normalize(s: &str) -> String {
 }
 
 #[cfg(test)]
+fn baseline_mode() -> bool {
+    std::env::var("THESIS_PATH_SENSITIVE")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn assert_baseline_invariants(pass: &EgraphPass) {
+    assert!(
+        pass.dfg.conditional_unions.is_empty(),
+        "baseline mode produced {} conditional unions",
+        pass.dfg.conditional_unions.len()
+    );
+    assert!(
+        pass.block_entry_facts.is_empty(),
+        "baseline mode populated block_entry_facts"
+    );
+}
+
+/// Helper for tests that depend on path-sensitive optimizations.
+/// In baseline mode, runs the pass and verifies no conditional unions or
+/// edge facts are produced, but skips the output equality check.
+#[cfg(test)]
+fn helper_ps_only(original_clif: &str, expected_clif: &str) {
+    if baseline_mode() {
+        let (dfg, layout) = parse_clif(original_clif).unwrap();
+        let domtree = DominatorTree::from_layout(&layout, &dfg);
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.set_path_sensitive(false);
+        pass.run();
+        assert_baseline_invariants(&pass);
+        return;
+    }
+    helper(original_clif, expected_clif);
+}
+
+#[cfg(test)]
+fn helper_with_params_ps_only(original_clif: &str, expected_clif: &str, sig_params: &[Type]) {
+    if baseline_mode() {
+        let (dfg, layout) = parse_clif(original_clif).unwrap();
+        let domtree = DominatorTree::from_layout(&layout, &dfg);
+        let mut pass = EgraphPass::new(dfg, layout, domtree);
+        pass.set_path_sensitive(false);
+        pass.run();
+        assert_baseline_invariants(&pass);
+        return;
+    }
+    helper_with_params(original_clif, expected_clif, sig_params);
+}
+
+#[cfg(test)]
 fn helper(original_clif: &str, expected_clif: &str) {
     let (dfg, layout) = parse_clif(original_clif).unwrap();
 
@@ -84,7 +135,12 @@ fn helper(original_clif: &str, expected_clif: &str) {
 
     let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
+    let baseline = baseline_mode();
+    pass.set_path_sensitive(!baseline);
     pass.run();
+    if baseline {
+        assert_baseline_invariants(&pass);
+    }
 
     println!("\nOptimized CLIF:");
     let output = pass
@@ -104,7 +160,12 @@ fn helper_with_params(original_clif: &str, expected_clif: &str, sig_params: &[Ty
     let (dfg, layout) = parse_clif(original_clif).unwrap();
     let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
+    let baseline = baseline_mode();
+    pass.set_path_sensitive(!baseline);
     pass.run();
+    if baseline {
+        assert_baseline_invariants(&pass);
+    }
 
     println!("\nOptimized CLIF:");
     let output = pass
@@ -212,7 +273,7 @@ mod tests {
                                     v7 = iadd.i32 v0, v6
                                     return v7
                                 }"#;
-        helper(original_clif, expected_clif);
+        helper_ps_only(original_clif, expected_clif);
     }
 
     #[test]
@@ -265,7 +326,7 @@ mod tests {
                                     block0(v0: i32):
                                         return v0
                                     }"#;
-        helper(original_clif, expected_clif);
+        helper_ps_only(original_clif, expected_clif);
     }
 
     #[test]
@@ -296,7 +357,7 @@ mod tests {
                                     block0(v0: i32):
                                         return v0
                                     }"#;
-        helper(original_clif, expected_clif);
+        helper_ps_only(original_clif, expected_clif);
     }
 
     #[test]
@@ -333,7 +394,7 @@ mod tests {
                                 return v1
                             }
                             "#;
-        helper(original_clif, expected_clif);
+        helper_ps_only(original_clif, expected_clif);
     }
 
     #[test]
@@ -388,7 +449,7 @@ mod tests {
                                 return v0
                             }
                             "#;
-        helper(original_clif, expected_clif);
+        helper_ps_only(original_clif, expected_clif);
     }
 
     /// Test that block-param inline propagation creates unions so that
@@ -420,7 +481,13 @@ mod tests {
         let (dfg, layout) = parse_clif(original_clif).unwrap();
         let domtree = DominatorTree::from_layout(&layout, &dfg);
         let mut pass = EgraphPass::new(dfg, layout, domtree);
+        let baseline = baseline_mode();
+        pass.set_path_sensitive(!baseline);
         pass.run();
+        if baseline {
+            assert_baseline_invariants(&pass);
+            return;
+        }
 
         let output =
             pass.layout

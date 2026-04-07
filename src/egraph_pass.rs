@@ -42,6 +42,8 @@ pub struct EgraphPass {
 
     /// CFG predecessor map, populated during `remove_pure_and_optimize`.
     pub cfg_preds: HashMap<BlockId, Vec<BlockId>>,
+
+    pub path_sensitive: bool,
 }
 
 impl EgraphPass {
@@ -56,7 +58,12 @@ impl EgraphPass {
             range_assumptions: RangeAssumptions::new(),
             block_entry_facts: HashMap::new(),
             cfg_preds: HashMap::new(),
+            path_sensitive: true,
         }
+    }
+
+    pub fn set_path_sensitive(&mut self, enabled: bool) {
+        self.path_sensitive = enabled;
     }
 
     pub fn assume_range(&mut self, value: ValueId, min: i64, max: i64) {
@@ -76,7 +83,9 @@ impl EgraphPass {
 
         // Safety-net redundant phi elimination (handles cross-iteration
         // convergence the single inline pass cannot reach).
-        self.eliminate_redundant_params();
+        if self.path_sensitive {
+            self.eliminate_redundant_params();
+        }
 
         // Apply GVN mapping to instruction args before elaboration so the
         // elaborator sees the GVN-canonical values.
@@ -87,16 +96,26 @@ impl EgraphPass {
         // scopes so that conditional unions created during
         // remove_pure_and_optimize are consulted in the correct branch context.
         {
-            let mut elaborator = crate::elaborate::Elaborator::with_range_assumptions(
-                &mut self.dfg,
-                &self.domtree,
-                &mut self.stats,
-                &mut self.range_assumptions,
-                &self.block_entry_facts,
-                &self.cfg_preds,
-            );
-            elaborator.elaborate(&self.layout);
-            elaborator.rewrite_args(&self.layout);
+            if self.path_sensitive {
+                let mut elaborator = crate::elaborate::Elaborator::with_range_assumptions(
+                    &mut self.dfg,
+                    &self.domtree,
+                    &mut self.stats,
+                    &mut self.range_assumptions,
+                    &self.block_entry_facts,
+                    &self.cfg_preds,
+                );
+                elaborator.elaborate(&self.layout);
+                elaborator.rewrite_args(&self.layout);
+            } else {
+                let mut elaborator = crate::elaborate::Elaborator::new(
+                    &mut self.dfg,
+                    &self.domtree,
+                    &mut self.stats,
+                );
+                elaborator.elaborate(&self.layout);
+                elaborator.rewrite_args(&self.layout);
+            }
         }
         self.rebuild_layout();
         self.check_no_unions();
@@ -926,7 +945,7 @@ impl EgraphPass {
                     //    For merge blocks with multiple predecessors, we compute the
                     //    UNION (join) of ranges per value across all edges to avoid
                     //    unsoundly intersecting contradictory facts.
-                    {
+                    if self.path_sensitive {
                         let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_edges = preds.len();
                         // For each edge, compute the per-value intersected range
@@ -973,7 +992,7 @@ impl EgraphPass {
 
                     // Apply nonzero marks from incoming edge conditions
                     // Only mark nonzero if ALL predecessor edges agree.
-                    {
+                    if self.path_sensitive {
                         let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_preds = preds.len();
                         if num_preds > 0 {
@@ -1110,7 +1129,7 @@ impl EgraphPass {
                             }
                             available_block.insert(union_node, block);
                             self.stats.union += 1;
-                        } else if !all_agree {
+                        } else if !all_agree && self.path_sensitive {
                             for &(pred, resolved_incoming) in &resolved {
                                 if resolved_incoming == param {
                                     continue;
@@ -1155,6 +1174,7 @@ impl EgraphPass {
                             subsume_values: HashSet::new(),
                             rewrite_engine: &mut self.rewrite_engine,
                             range_assumptions: &mut self.range_assumptions,
+                            path_sensitive: self.path_sensitive,
                         };
 
                         if rewritten_inst.opcode.is_pure() {
@@ -1221,7 +1241,7 @@ impl EgraphPass {
                         // optimized values. Branch conditions from dominators
                         // are always available for dominated blocks.
                         let inst_after = self.dfg.insts[&inst_id].clone();
-                        if inst_after.opcode == Opcode::CondBranch {
+                        if self.path_sensitive && inst_after.opcode == Opcode::CondBranch {
                             if let Some(BranchInfo::Conditional(then_b, _, else_b, _)) =
                                 &inst_after.branch_info
                             {
@@ -1387,6 +1407,7 @@ struct OptimizeCtx<'a> {
     subsume_values: HashSet<ValueId>,
     rewrite_engine: &'a mut RewriteEngine,
     range_assumptions: &'a mut RangeAssumptions,
+    path_sensitive: bool,
 }
 
 impl<'a> OptimizeCtx<'a> {
@@ -1438,7 +1459,9 @@ impl<'a> OptimizeCtx<'a> {
                 let opt_result = self.apply_rewrites_and_union(result);
 
                 // Second pass: create conditional unions for range-dependent rewrites
-                self.apply_conditional_rewrites_and_store(result);
+                if self.path_sensitive {
+                    self.apply_conditional_rewrites_and_store(result);
+                }
 
                 opt_result
             }
