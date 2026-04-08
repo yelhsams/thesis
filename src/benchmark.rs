@@ -3,7 +3,7 @@
 use crate::clif_parser::parse_clif;
 use crate::egraph_pass::EgraphPass;
 use crate::support::DominatorTree;
-use crate::types::Layout;
+use crate::types::*;
 
 pub struct TestCase {
     pub name: &'static str,
@@ -408,10 +408,21 @@ fn count_insts(layout: &Layout) -> usize {
 
 fn run_one(clif: &str, path_sensitive: bool) -> usize {
     let (dfg, layout) = parse_clif(clif).expect("parse");
+    let sig_params: Vec<Type> = layout
+        .entry_block()
+        .and_then(|b| layout.block_data.get(&b))
+        .map(|b| b.params.iter().map(|&p| dfg.value_type(p)).collect())
+        .unwrap_or_default();
     let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.set_path_sensitive(path_sensitive);
     pass.run();
+
+    let output = pass
+        .layout
+        .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
+    println!("\nOptimized CLIF:\n{}", output);
+
     count_insts(&pass.layout)
 }
 
