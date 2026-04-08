@@ -131,8 +131,8 @@ impl EgraphPass {
         self.eliminate_dead_blocks();
 
         // Print final statistics
-        self.stats.print_summary();
-        self.rewrite_engine.print_stats();
+        // self.stats.print_summary();
+        // self.rewrite_engine.print_stats();
     }
 
     /// Resolve GVN mappings in all instruction arguments so that the
@@ -1369,6 +1369,54 @@ impl EgraphPass {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Second pass: re-evaluate branch-terminator condition
+                    // values that were GVN-mapped from a dominator block.
+                    // Range-conditioned rewrites for such values were
+                    // attempted in their defining block, where the current
+                    // block's range assumptions were not yet in scope.
+                    // Re-running apply_conditional_rewrites_and_store on them
+                    // here lets range-based folds fire under the tightened
+                    // scope (e.g., icmp.sge x, 0 → 1 once x is known to be
+                    // non-negative on this branch). Restricted to brif
+                    // condition values to keep the cost bounded.
+                    if self.path_sensitive {
+                        let mut cond_values: Vec<ValueId> = Vec::new();
+                        for &iid in &block_data.insts {
+                            let inst = &self.dfg.insts[&iid];
+                            if inst.opcode == Opcode::CondBranch {
+                                if let Some(&cond) = inst.args.first() {
+                                    cond_values.push(cond);
+                                }
+                            }
+                        }
+                        for cond in cond_values {
+                            let canonical = value_to_opt_value.get(&cond).copied().unwrap_or(cond);
+                            let defined_in_dominator = available_block
+                                .get(&canonical)
+                                .copied()
+                                .map(|b| b != block)
+                                .unwrap_or(false);
+                            if !defined_in_dominator {
+                                continue;
+                            }
+                            let mut ctx = OptimizeCtx {
+                                dfg: &mut self.dfg,
+                                value_to_opt_value: &mut value_to_opt_value,
+                                gvn_map: &mut gvn_map,
+                                gvn_map_blocks: &gvn_map_blocks,
+                                available_block: &mut available_block,
+                                stats: &mut self.stats,
+                                domtree: &self.domtree,
+                                rewrite_depth: 0,
+                                subsume_values: HashSet::new(),
+                                rewrite_engine: &mut self.rewrite_engine,
+                                range_assumptions: &mut self.range_assumptions,
+                                path_sensitive: self.path_sensitive,
+                            };
+                            ctx.apply_conditional_rewrites_and_store(canonical);
                         }
                     }
                 }

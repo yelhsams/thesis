@@ -406,8 +406,9 @@ fn count_insts(layout: &Layout, dfg: &DataFlowGraph) -> usize {
     use crate::elaborate::{CostModel, DefaultCostModel};
     let model = DefaultCostModel;
     layout
-        .block_data
-        .values()
+        .blocks
+        .iter()
+        .filter_map(|b| layout.block_data.get(b))
         .flat_map(|b| b.insts.iter())
         .map(|iid| {
             let opcode = dfg.insts[iid].opcode;

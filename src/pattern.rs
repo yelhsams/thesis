@@ -1357,6 +1357,102 @@ impl RewriteLibrary {
                 .build(),
         );
 
+        // Known-true sge: sge(x, C) => 1 when x.min >= C
+        rules.push(
+            Rewrite::new("range-fold-sge-true")
+                .match_pattern(Pattern::op(
+                    Opcode::Sge,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(1))
+                .when(Condition::Custom {
+                    name: "x-range-ge-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_ge(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-false sge: sge(x, C) => 0 when x.max < C
+        rules.push(
+            Rewrite::new("range-fold-sge-false")
+                .match_pattern(Pattern::op(
+                    Opcode::Sge,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(0))
+                .when(Condition::Custom {
+                    name: "x-range-lt-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_less_than(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-true sgt: sgt(x, C) => 1 when x.min > C
+        rules.push(
+            Rewrite::new("range-fold-sgt-true")
+                .match_pattern(Pattern::op(
+                    Opcode::Sgt,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(1))
+                .when(Condition::Custom {
+                    name: "x-range-gt-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_greater_than(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
+        // Known-false sgt: sgt(x, C) => 0 when x.max <= C
+        rules.push(
+            Rewrite::new("range-fold-sgt-false")
+                .match_pattern(Pattern::op(
+                    Opcode::Sgt,
+                    vec![Pattern::var("x"), Pattern::any_constant("c")],
+                ))
+                .produce(Pattern::constant(0))
+                .when(Condition::Custom {
+                    name: "x-range-le-c".to_string(),
+                    check: |bindings| {
+                        let c = match bindings.get_constant(&VarId::new("c")) {
+                            Some(c) => c,
+                            None => return false,
+                        };
+                        bindings
+                            .get_value_range(&VarId::new("x"))
+                            .map(|r| r.definitely_le(c))
+                            .unwrap_or(false)
+                    },
+                })
+                .build(),
+        );
+
         // Range-based constant propagation: if range is a singleton, replace with constant
         // This is handled implicitly by compute_inst_range + the egraph,
         // but we add explicit rules for key patterns:
