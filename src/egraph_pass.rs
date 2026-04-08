@@ -1025,125 +1025,133 @@ impl EgraphPass {
                         available_block.insert(param, block);
 
                         // Per-edge join-point range propagation
-                        let key = (block, param_idx);
-                        if let Some(incoming) = block_param_incoming.get(&key) {
-                            let mut joined = Range::empty();
-                            for &(pred, src_val) in incoming {
-                                if pred == block {
-                                    continue;
-                                }
-                                let mut src_range = self.range_assumptions.get_range(src_val);
-                                // Narrow by edge-specific conditions
-                                if let Some(conditions) = block_edge_conditions.get(&(pred, block))
-                                {
-                                    for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
-                                        let facts = learn_from_comparison(
-                                            opcode,
-                                            lhs,
-                                            rhs_const,
-                                            is_true_branch,
-                                        );
-                                        for (value, range) in facts {
-                                            if value == src_val {
-                                                src_range = match src_range.intersect(&range) {
-                                                    Some(r) => r,
-                                                    None => Range::empty(),
-                                                };
+                        if self.path_sensitive {
+                            let key = (block, param_idx);
+                            if let Some(incoming) = block_param_incoming.get(&key) {
+                                let mut joined = Range::empty();
+                                for &(pred, src_val) in incoming {
+                                    if pred == block {
+                                        continue;
+                                    }
+                                    let mut src_range = self.range_assumptions.get_range(src_val);
+                                    // Narrow by edge-specific conditions
+                                    if let Some(conditions) =
+                                        block_edge_conditions.get(&(pred, block))
+                                    {
+                                        for &(lhs, rhs_const, opcode, is_true_branch) in conditions
+                                        {
+                                            let facts = learn_from_comparison(
+                                                opcode,
+                                                lhs,
+                                                rhs_const,
+                                                is_true_branch,
+                                            );
+                                            for (value, range) in facts {
+                                                if value == src_val {
+                                                    src_range = match src_range.intersect(&range) {
+                                                        Some(r) => r,
+                                                        None => Range::empty(),
+                                                    };
+                                                }
                                             }
                                         }
                                     }
+                                    joined = joined.union(&src_range);
                                 }
-                                joined = joined.union(&src_range);
+                                if !joined.is_empty() && !joined.is_unbounded() {
+                                    self.range_assumptions.assume_range(param, joined);
+                                }
                             }
-                            if !joined.is_empty() && !joined.is_unbounded() {
-                                self.range_assumptions.assume_range(param, joined);
-                            }
-                        }
 
-                        // Singleton-range constant substitution
-                        let range = self.range_assumptions.get_range(param);
-                        if let Some(c) = range.as_singleton() {
-                            let const_inst =
-                                Instruction::with_imm(Opcode::Const, vec![], Type::I32, c);
-                            let key = (Type::I32, const_inst.clone());
-                            let const_val = if let Some(Some(existing)) = gvn_map.get(&key) {
-                                *existing
-                            } else {
-                                let const_inst_id = self.dfg.make_inst(const_inst);
-                                let cv = self.dfg.make_inst_result(const_inst_id, Type::I32);
-                                gvn_map.insert(key, Some(cv));
-                                available_block.insert(cv, block);
-                                cv
-                            };
-                            value_to_opt_value.insert(param, const_val);
+                            // Singleton-range constant substitution
+                            let range = self.range_assumptions.get_range(param);
+                            if let Some(c) = range.as_singleton() {
+                                let const_inst =
+                                    Instruction::with_imm(Opcode::Const, vec![], Type::I32, c);
+                                let key = (Type::I32, const_inst.clone());
+                                let const_val = if let Some(Some(existing)) = gvn_map.get(&key) {
+                                    *existing
+                                } else {
+                                    let const_inst_id = self.dfg.make_inst(const_inst);
+                                    let cv = self.dfg.make_inst_result(const_inst_id, Type::I32);
+                                    gvn_map.insert(key, Some(cv));
+                                    available_block.insert(cv, block);
+                                    cv
+                                };
+                                value_to_opt_value.insert(param, const_val);
+                            }
                         }
                     }
 
-                    // Inline block-param equivalence propagation
-                    for (param_idx, &param) in block_data.params.iter().enumerate() {
-                        let incoming_key = (block, param_idx);
-                        let incoming = match block_param_incoming.get(&incoming_key) {
-                            Some(s) if !s.is_empty() => s.clone(),
-                            _ => continue,
-                        };
+                    if self.path_sensitive {
+                        // Inline block-param equivalence propagation
+                        for (param_idx, &param) in block_data.params.iter().enumerate() {
+                            let incoming_key = (block, param_idx);
+                            let incoming = match block_param_incoming.get(&incoming_key) {
+                                Some(s) if !s.is_empty() => s.clone(),
+                                _ => continue,
+                            };
 
-                        // Resolve each incoming value through value_to_opt_value
-                        let resolved: Vec<(BlockId, ValueId)> = incoming
-                            .iter()
-                            .map(|&(pred, src)| {
-                                let resolved = value_to_opt_value.get(&src).copied().unwrap_or(src);
-                                (pred, resolved)
-                            })
-                            .collect();
+                            // Resolve each incoming value through value_to_opt_value
+                            let resolved: Vec<(BlockId, ValueId)> = incoming
+                                .iter()
+                                .map(|&(pred, src)| {
+                                    let resolved =
+                                        value_to_opt_value.get(&src).copied().unwrap_or(src);
+                                    (pred, resolved)
+                                })
+                                .collect();
 
-                        let non_self: Vec<(BlockId, ValueId)> = resolved
-                            .iter()
-                            .filter(|&&(_, v)| v != param)
-                            .copied()
-                            .collect();
+                            let non_self: Vec<(BlockId, ValueId)> = resolved
+                                .iter()
+                                .filter(|&&(_, v)| v != param)
+                                .copied()
+                                .collect();
 
-                        if non_self.is_empty() {
-                            continue;
-                        }
-
-                        let first_val = non_self[0].1;
-                        let mut all_agree = non_self.iter().all(|&(_, v)| v == first_val);
-
-                        if !all_agree {
-                            let first_const = self.dfg.value_imm(first_val);
-                            if let Some(c) = first_const {
-                                all_agree = non_self
-                                    .iter()
-                                    .all(|&(_, v)| self.dfg.value_imm(v) == Some(c));
+                            if non_self.is_empty() {
+                                continue;
                             }
-                        }
 
-                        if all_agree && first_val != param {
-                            let union_node = self.dfg.make_union(param, first_val);
-                            let current = value_to_opt_value.get(&param).copied().unwrap_or(param);
-                            if current == param {
-                                value_to_opt_value.insert(param, first_val);
-                                if let Some(&avail) = available_block.get(&first_val) {
-                                    available_block.insert(param, avail);
+                            let first_val = non_self[0].1;
+                            let mut all_agree = non_self.iter().all(|&(_, v)| v == first_val);
+
+                            if !all_agree {
+                                let first_const = self.dfg.value_imm(first_val);
+                                if let Some(c) = first_const {
+                                    all_agree = non_self
+                                        .iter()
+                                        .all(|&(_, v)| self.dfg.value_imm(v) == Some(c));
                                 }
                             }
-                            available_block.insert(union_node, block);
-                            self.stats.union += 1;
-                        } else if !all_agree && self.path_sensitive {
-                            for &(pred, resolved_incoming) in &resolved {
-                                if resolved_incoming == param {
-                                    continue;
+
+                            if all_agree && first_val != param {
+                                let union_node = self.dfg.make_union(param, first_val);
+                                let current =
+                                    value_to_opt_value.get(&param).copied().unwrap_or(param);
+                                if current == param {
+                                    value_to_opt_value.insert(param, first_val);
+                                    if let Some(&avail) = available_block.get(&first_val) {
+                                        available_block.insert(param, avail);
+                                    }
                                 }
-                                let assumptions = build_edge_assumptions_inline(
-                                    pred,
-                                    block,
-                                    &block_edge_conditions,
-                                );
-                                self.dfg.make_conditional_union(
-                                    param,
-                                    resolved_incoming,
-                                    assumptions,
-                                );
+                                available_block.insert(union_node, block);
+                                self.stats.union += 1;
+                            } else if !all_agree && self.path_sensitive {
+                                for &(pred, resolved_incoming) in &resolved {
+                                    if resolved_incoming == param {
+                                        continue;
+                                    }
+                                    let assumptions = build_edge_assumptions_inline(
+                                        pred,
+                                        block,
+                                        &block_edge_conditions,
+                                    );
+                                    self.dfg.make_conditional_union(
+                                        param,
+                                        resolved_incoming,
+                                        assumptions,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1184,53 +1192,58 @@ impl EgraphPass {
                         }
 
                         // Propagate ranges forward
-                        let inst_after = self.dfg.insts[&inst_id].clone();
-                        let arg_ranges: Vec<crate::range::Range> = inst_after
-                            .args
-                            .iter()
-                            .map(|&arg| self.range_assumptions.get_range(arg))
-                            .collect();
-                        let output_range = crate::range::compute_inst_range(
-                            inst_after.opcode,
-                            &arg_ranges,
-                            inst_after.immediate,
-                        );
-                        if !output_range.is_unbounded() {
-                            if let Some(&result) = self.dfg.inst_results(inst_id).first() {
-                                let opt_result =
-                                    value_to_opt_value.get(&result).copied().unwrap_or(result);
-                                self.range_assumptions.assume_range(result, output_range);
-                                self.stats.ranges_propagated += 1;
-                                if opt_result != result {
-                                    self.range_assumptions
-                                        .assume_range(opt_result, output_range);
-                                }
-                                if let Some(c) = output_range.as_singleton() {
-                                    let current =
+                        if self.path_sensitive {
+                            let inst_after = self.dfg.insts[&inst_id].clone();
+                            let arg_ranges: Vec<crate::range::Range> = inst_after
+                                .args
+                                .iter()
+                                .map(|&arg| self.range_assumptions.get_range(arg))
+                                .collect();
+                            let output_range = crate::range::compute_inst_range(
+                                inst_after.opcode,
+                                &arg_ranges,
+                                inst_after.immediate,
+                            );
+                            if !output_range.is_unbounded() {
+                                if let Some(&result) = self.dfg.inst_results(inst_id).first() {
+                                    let opt_result =
                                         value_to_opt_value.get(&result).copied().unwrap_or(result);
-                                    if current == result || current == opt_result {
-                                        let const_inst = Instruction::with_imm(
-                                            Opcode::Const,
-                                            vec![],
-                                            Type::I32,
-                                            c,
-                                        );
-                                        let key = (Type::I32, const_inst.clone());
-                                        let const_val = if let Some(Some(existing)) =
-                                            gvn_map.get(&key)
-                                        {
-                                            *existing
-                                        } else {
-                                            let const_inst_id = self.dfg.make_inst(const_inst);
-                                            let cv =
-                                                self.dfg.make_inst_result(const_inst_id, Type::I32);
-                                            gvn_map.insert(key, Some(cv));
-                                            available_block.insert(cv, block);
-                                            cv
-                                        };
-                                        let _ = self.dfg.make_union(opt_result, const_val);
-                                        value_to_opt_value.insert(result, const_val);
-                                        self.stats.union += 1;
+                                    self.range_assumptions.assume_range(result, output_range);
+                                    self.stats.ranges_propagated += 1;
+                                    if opt_result != result {
+                                        self.range_assumptions
+                                            .assume_range(opt_result, output_range);
+                                    }
+                                    if let Some(c) = output_range.as_singleton() {
+                                        let current = value_to_opt_value
+                                            .get(&result)
+                                            .copied()
+                                            .unwrap_or(result);
+                                        if current == result || current == opt_result {
+                                            let const_inst = Instruction::with_imm(
+                                                Opcode::Const,
+                                                vec![],
+                                                Type::I32,
+                                                c,
+                                            );
+                                            let key = (Type::I32, const_inst.clone());
+                                            let const_val = if let Some(Some(existing)) =
+                                                gvn_map.get(&key)
+                                            {
+                                                *existing
+                                            } else {
+                                                let const_inst_id = self.dfg.make_inst(const_inst);
+                                                let cv = self
+                                                    .dfg
+                                                    .make_inst_result(const_inst_id, Type::I32);
+                                                gvn_map.insert(key, Some(cv));
+                                                available_block.insert(cv, block);
+                                                cv
+                                            };
+                                            let _ = self.dfg.make_union(opt_result, const_val);
+                                            value_to_opt_value.insert(result, const_val);
+                                            self.stats.union += 1;
+                                        }
                                     }
                                 }
                             }
