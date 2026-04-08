@@ -402,8 +402,18 @@ block2(v12: i32):
 
 pub const TEST_CASES: &[TestCase] = PATH_SENSITIVE_TESTS;
 
-fn count_insts(layout: &Layout) -> usize {
-    layout.block_data.values().map(|b| b.insts.len()).sum()
+fn count_insts(layout: &Layout, dfg: &DataFlowGraph) -> usize {
+    use crate::elaborate::{CostModel, DefaultCostModel};
+    let model = DefaultCostModel;
+    layout
+        .block_data
+        .values()
+        .flat_map(|b| b.insts.iter())
+        .map(|iid| {
+            let opcode = dfg.insts[iid].opcode;
+            model.cost_of_opcode(opcode).0 as usize
+        })
+        .sum()
 }
 
 fn run_one(clif: &str, path_sensitive: bool) -> usize {
@@ -423,7 +433,7 @@ fn run_one(clif: &str, path_sensitive: bool) -> usize {
         .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
     println!("\nOptimized CLIF:\n{}", output);
 
-    count_insts(&pass.layout)
+    count_insts(&pass.layout, &pass.dfg)
 }
 
 /// Run the entire benchmark suite, comparing path-sensitive vs baseline.
@@ -438,8 +448,8 @@ pub fn run_benchmarks() {
     let (mut tot_in, mut tot_ps, mut tot_base) = (0usize, 0usize, 0usize);
 
     for tc in TEST_CASES {
-        let (_, layout) = parse_clif(tc.clif).expect("parse");
-        let input = count_insts(&layout);
+        let (dfg, layout) = parse_clif(tc.clif).expect("parse");
+        let input = count_insts(&layout, &dfg);
         let ps = run_one(tc.clif, true);
         let base = run_one(tc.clif, false);
         println!("{:<22} {:>8} {:>10} {:>10}", tc.name, input, ps, base);

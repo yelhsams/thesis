@@ -1219,7 +1219,7 @@ impl RewriteLibrary {
         rules.push(
             Rewrite::new("range-sdiv-pow2-to-ushr-1")
                 .match_pattern(Pattern::op(
-                    Opcode::Div,
+                    Opcode::Sdiv,
                     vec![Pattern::var("x"), Pattern::constant(2)],
                 ))
                 .produce(Pattern::op(
@@ -1233,7 +1233,7 @@ impl RewriteLibrary {
         rules.push(
             Rewrite::new("range-sdiv-pow2-to-ushr-2")
                 .match_pattern(Pattern::op(
-                    Opcode::Div,
+                    Opcode::Sdiv,
                     vec![Pattern::var("x"), Pattern::constant(4)],
                 ))
                 .produce(Pattern::op(
@@ -1247,7 +1247,7 @@ impl RewriteLibrary {
         rules.push(
             Rewrite::new("range-sdiv-pow2-to-ushr-3")
                 .match_pattern(Pattern::op(
-                    Opcode::Div,
+                    Opcode::Sdiv,
                     vec![Pattern::var("x"), Pattern::constant(8)],
                 ))
                 .produce(Pattern::op(
