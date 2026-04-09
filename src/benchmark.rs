@@ -4,6 +4,7 @@ use crate::clif_parser::parse_clif;
 use crate::egraph_pass::EgraphPass;
 use crate::support::DominatorTree;
 use crate::types::*;
+use std::time::{Duration, Instant};
 
 pub struct TestCase {
     pub name: &'static str,
@@ -376,6 +377,140 @@ block2(v12: i32):
     },
 ];
 
+/// Baseline (context-free) benchmarks — plain algebraic and folding
+/// simplifications that don't require path sensitivity.  Both
+/// `path_sensitive = true` and `false` should handle these equally.
+pub const BASELINE_TESTS: &[TestCase] = &[
+    // 1. Add-zero elimination
+    TestCase {
+        name: "add_zero",
+        clif: r#"
+function %add_zero(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = iadd.i32 v0, v1
+    v3 = iadd.i32 v1, v2
+    return v3
+}
+"#,
+    },
+    // 2. Multiply by one / zero
+    TestCase {
+        name: "mul_identity",
+        clif: r#"
+function %mul_identity(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 1
+    v2 = imul.i32 v0, v1
+    v3 = iconst.i32 0
+    v4 = imul.i32 v2, v3
+    return v4
+}
+"#,
+    },
+    // 3. Strength reduction: x * 2 → x + x
+    TestCase {
+        name: "strength_reduce_mul2",
+        clif: r#"
+function %strength_reduce_mul2(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 2
+    v2 = imul.i32 v0, v1
+    return v2
+}
+"#,
+    },
+    // 4. Double negation: ineg(ineg(x)) → x
+    TestCase {
+        name: "double_negation",
+        clif: r#"
+function %double_negation(i32) -> i32 {
+block0(v0: i32):
+    v1 = ineg.i32 v0
+    v2 = ineg.i32 v1
+    return v2
+}
+"#,
+    },
+    // 5. AND with all-ones identity: x & -1 → x
+    TestCase {
+        name: "and_allones",
+        clif: r#"
+function %and_allones(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 -1
+    v2 = band.i32 v0, v1
+    return v2
+}
+"#,
+    },
+    // 6. XOR self-cancellation: x ^ x → 0
+    TestCase {
+        name: "xor_self",
+        clif: r#"
+function %xor_self(i32) -> i32 {
+block0(v0: i32):
+    v1 = bxor.i32 v0, v0
+    return v1
+}
+"#,
+    },
+    // 7. GVN / CSE: same computation reused
+    TestCase {
+        name: "gvn_cse",
+        clif: r#"
+function %gvn_cse(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = iadd.i32 v0, v1
+    v3 = iadd.i32 v0, v1
+    v4 = iadd.i32 v2, v3
+    return v4
+}
+"#,
+    },
+    // 8. Constant folding chain
+    TestCase {
+        name: "const_fold_chain",
+        clif: r#"
+function %const_fold_chain() -> i32 {
+block0:
+    v0 = iconst.i32 10
+    v1 = iconst.i32 20
+    v2 = iadd.i32 v0, v1
+    v3 = iconst.i32 5
+    v4 = imul.i32 v2, v3
+    return v4
+}
+"#,
+    },
+    // 9. OR with zero identity + double bnot
+    TestCase {
+        name: "or_zero_double_bnot",
+        clif: r#"
+function %or_zero_double_bnot(i32) -> i32 {
+block0(v0: i32):
+    v1 = iconst.i32 0
+    v2 = bor.i32 v0, v1
+    v3 = bnot.i32 v2
+    v4 = bnot.i32 v3
+    return v4
+}
+"#,
+    },
+    // 10. Sub-self → 0 + add-zero cleanup
+    TestCase {
+        name: "sub_self_cleanup",
+        clif: r#"
+function %sub_self_cleanup(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+    v2 = isub.i32 v0, v0
+    v3 = iadd.i32 v1, v2
+    return v3
+}
+"#,
+    },
+];
+
 pub const TEST_CASES: &[TestCase] = PATH_SENSITIVE_TESTS;
 
 fn count_insts(layout: &Layout, dfg: &DataFlowGraph) -> usize {
@@ -411,6 +546,145 @@ fn run_one(clif: &str, path_sensitive: bool) -> usize {
     println!("\nOptimized CLIF:\n{}", output);
 
     count_insts(&pass.layout, &pass.dfg)
+}
+
+/// Run the full compilation pipeline (parse + domtree + egraph pass) once
+/// and return `(instruction_cost, wall_clock_time)`.  Used by the timing
+/// benchmark to compare `path_sensitive = true` vs `false`.
+fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration) {
+    let (dfg, layout) = parse_clif(clif).expect("parse");
+    let start = Instant::now();
+    let domtree = DominatorTree::from_layout(&layout, &dfg);
+    let mut pass = EgraphPass::new(dfg, layout, domtree);
+    pass.set_path_sensitive(path_sensitive);
+    pass.run();
+    let elapsed = start.elapsed();
+    let cost = count_insts(&pass.layout, &pass.dfg);
+    (cost, elapsed)
+}
+
+/// Timing benchmark: runs each suite (baseline + path-sensitive) through the
+/// compilation pipeline with `path_sensitive = true` and `false`, taking the
+/// best of several repetitions to reduce noise, and prints wall-clock
+/// comparisons.
+#[test]
+pub fn time_benchmarks() {
+    // Repetitions per configuration — take the minimum to get a stable
+    // lower-bound on wall-clock time while ignoring transient spikes.
+    const REPS: usize = 25;
+
+    fn bench_suite(name: &str, suite: &[TestCase]) -> (Duration, Duration, usize, usize) {
+        println!(
+            "\n=== {} suite ({} tests) ===\n{:<24} {:>12} {:>12} {:>10}",
+            name,
+            suite.len(),
+            "test",
+            "ps (µs)",
+            "base (µs)",
+            "speedup"
+        );
+        println!("{}", "-".repeat(62));
+
+        let mut tot_ps = Duration::ZERO;
+        let mut tot_base = Duration::ZERO;
+        let mut cost_ps = 0usize;
+        let mut cost_base = 0usize;
+
+        for tc in suite {
+            // Warm-up to prime any lazy caches / allocators.
+            let _ = time_one(tc.clif, true);
+            let _ = time_one(tc.clif, false);
+
+            let mut best_ps = Duration::MAX;
+            let mut best_base = Duration::MAX;
+            let mut last_cost_ps = 0usize;
+            let mut last_cost_base = 0usize;
+            for _ in 0..REPS {
+                let (c, t) = time_one(tc.clif, true);
+                if t < best_ps {
+                    best_ps = t;
+                }
+                last_cost_ps = c;
+                let (c, t) = time_one(tc.clif, false);
+                if t < best_base {
+                    best_base = t;
+                }
+                last_cost_base = c;
+            }
+
+            let ps_us = best_ps.as_secs_f64() * 1e6;
+            let base_us = best_base.as_secs_f64() * 1e6;
+            let speedup = if ps_us > 0.0 { base_us / ps_us } else { 0.0 };
+            println!(
+                "{:<24} {:>12.2} {:>12.2} {:>9.2}x",
+                tc.name, ps_us, base_us, speedup
+            );
+
+            tot_ps += best_ps;
+            tot_base += best_base;
+            cost_ps += last_cost_ps;
+            cost_base += last_cost_base;
+        }
+
+        println!("{}", "-".repeat(62));
+        let tot_ps_us = tot_ps.as_secs_f64() * 1e6;
+        let tot_base_us = tot_base.as_secs_f64() * 1e6;
+        let tot_speedup = if tot_ps_us > 0.0 {
+            tot_base_us / tot_ps_us
+        } else {
+            0.0
+        };
+        println!(
+            "{:<24} {:>12.2} {:>12.2} {:>9.2}x",
+            "TOTAL", tot_ps_us, tot_base_us, tot_speedup
+        );
+        println!(
+            "  final cost: ps={} baseline={} (lower = better)",
+            cost_ps, cost_base
+        );
+
+        (tot_ps, tot_base, cost_ps, cost_base)
+    }
+
+    let (base_ps, base_base, bc_ps, bc_base) = bench_suite("BASELINE", BASELINE_TESTS);
+    let (ps_ps, ps_base, pc_ps, pc_base) = bench_suite("PATH-SENSITIVE", PATH_SENSITIVE_TESTS);
+
+    println!("\n=== SUMMARY ===");
+    println!(
+        "{:<24} {:>12} {:>12} {:>10}",
+        "suite", "ps (µs)", "base (µs)", "overhead"
+    );
+    println!("{}", "-".repeat(62));
+    let fmt = |name: &str, ps: Duration, base: Duration| {
+        let ps_us = ps.as_secs_f64() * 1e6;
+        let base_us = base.as_secs_f64() * 1e6;
+        let overhead = if base_us > 0.0 {
+            100.0 * (ps_us - base_us) / base_us
+        } else {
+            0.0
+        };
+        println!(
+            "{:<24} {:>12.2} {:>12.2} {:>+9.1}%",
+            name, ps_us, base_us, overhead
+        );
+    };
+    fmt("BASELINE", base_ps, base_base);
+    fmt("PATH-SENSITIVE", ps_ps, ps_base);
+    fmt("COMBINED", base_ps + ps_ps, base_base + ps_base);
+
+    println!("\n=== COST REDUCTION ===");
+    println!(
+        "BASELINE        : ps={} base={}  (Δ={})",
+        bc_ps,
+        bc_base,
+        bc_base as i64 - bc_ps as i64
+    );
+    println!(
+        "PATH-SENSITIVE  : ps={} base={}  (Δ={})",
+        pc_ps,
+        pc_base,
+        pc_base as i64 - pc_ps as i64
+    );
 }
 
 /// Run the entire benchmark suite, comparing path-sensitive vs baseline.
