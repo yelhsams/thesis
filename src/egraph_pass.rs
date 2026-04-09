@@ -10,7 +10,7 @@ use crate::range::{learn_from_comparison, Range, RangeAssumptions};
 use crate::rewrite_integration::*;
 use crate::support::*;
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const REWRITE_LIMIT: usize = 5;
 
@@ -32,16 +32,16 @@ pub struct EgraphPass {
     rewrite_engine: RewriteEngine,
 
     /// GVN mapping from original values to optimized values
-    gvn_mapping: HashMap<ValueId, ValueId>,
+    gvn_mapping: FxHashMap<ValueId, ValueId>,
 
     pub range_assumptions: RangeAssumptions,
 
     /// Range facts per CFG edge (pred, target), populated during
     /// `remove_pure_and_optimize` and reused by the elaborator's domtree walk.
-    pub block_entry_facts: HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+    pub block_entry_facts: FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
 
     /// CFG predecessor map, populated during `remove_pure_and_optimize`.
-    pub cfg_preds: HashMap<BlockId, Vec<BlockId>>,
+    pub cfg_preds: FxHashMap<BlockId, Vec<BlockId>>,
 
     pub path_sensitive: bool,
 }
@@ -54,10 +54,10 @@ impl EgraphPass {
             domtree,
             stats: Stats::default(),
             rewrite_engine: RewriteEngine::with_standard_library(),
-            gvn_mapping: HashMap::new(),
+            gvn_mapping: FxHashMap::default(),
             range_assumptions: RangeAssumptions::new(),
-            block_entry_facts: HashMap::new(),
-            cfg_preds: HashMap::new(),
+            block_entry_facts: FxHashMap::default(),
+            cfg_preds: FxHashMap::default(),
             path_sensitive: true,
         }
     }
@@ -133,13 +133,20 @@ impl EgraphPass {
         // collapse the empty arms.
         self.global_cse_and_gcm();
 
-        // CFG cleanups (separate from aegraph construction)
-        for _ in 0..4 {
-            self.eliminate_dead_blocks();
-            self.simplify_constant_brif();
-            self.simplify_trivial_blocks();
-            self.simplify_redundant_brif();
-            self.simplify_uniform_returns();
+        // CFG cleanups (separate from aegraph construction). Each pass
+        // reports whether it made changes; we exit early once a full
+        // round leaves the function untouched. Capped at the original
+        // 5 iterations as a safety bound.
+        for _ in 0..5 {
+            let mut changed = false;
+            changed |= self.eliminate_dead_blocks();
+            changed |= self.simplify_constant_brif();
+            changed |= self.simplify_trivial_blocks();
+            changed |= self.simplify_redundant_brif();
+            changed |= self.simplify_uniform_returns();
+            if !changed {
+                break;
+            }
         }
         self.eliminate_dead_blocks();
 
@@ -153,18 +160,16 @@ impl EgraphPass {
     fn apply_gvn_to_args(&mut self) {
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
         for inst_id in all_insts {
-            let mut inst = self.dfg.insts[&inst_id].clone();
-            let mut changed = false;
-            for arg in &mut inst.args {
+            // Take args out so we don't hold a borrow on self.dfg while
+            // calling fully_resolve (which borrows self).
+            let mut args = std::mem::take(&mut self.dfg.insts.get_mut(&inst_id).unwrap().args);
+            for arg in &mut args {
                 let resolved = self.fully_resolve(*arg);
                 if resolved != *arg {
                     *arg = resolved;
-                    changed = true;
                 }
             }
-            if changed {
-                self.dfg.insts.insert(inst_id, inst);
-            }
+            self.dfg.insts.get_mut(&inst_id).unwrap().args = args;
         }
     }
 
@@ -173,7 +178,7 @@ impl EgraphPass {
         // For each block, rebuild its instruction list
         for &block_id in &self.layout.blocks.clone() {
             let block_data = self.layout.block_data.get(&block_id).unwrap();
-            let mut needed_values = HashSet::new();
+            let mut needed_values: FxHashSet<ValueId> = FxHashSet::default();
             let mut skeleton_insts = Vec::new();
 
             // First pass: collect skeleton instructions and the values they use
@@ -193,9 +198,9 @@ impl EgraphPass {
 
             // Second pass: for each needed value, find the instruction that produces it
             // We collect all pure instructions needed and their dependencies
-            let mut pure_insts_set = HashSet::new();
+            let mut pure_insts_set: FxHashSet<InstId> = FxHashSet::default();
             let mut work_queue: Vec<ValueId> = needed_values.iter().copied().collect();
-            let mut processed = HashSet::new();
+            let mut processed: FxHashSet<ValueId> = FxHashSet::default();
 
             while let Some(value) = work_queue.pop() {
                 if !processed.insert(value) {
@@ -271,9 +276,9 @@ impl EgraphPass {
     fn check_no_unions(&self) {}
 
     /// Topologically sort instructions so that definitions come before uses
-    fn topological_sort_instructions(&self, inst_set: &HashSet<InstId>) -> Vec<InstId> {
+    fn topological_sort_instructions(&self, inst_set: &FxHashSet<InstId>) -> Vec<InstId> {
         // Build a map from value to the instruction that defines it
-        let mut value_to_inst: HashMap<ValueId, InstId> = HashMap::new();
+        let mut value_to_inst: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for &inst_id in inst_set {
             if let Some(result) = self.dfg.inst_results(inst_id).first() {
                 value_to_inst.insert(*result, inst_id);
@@ -281,8 +286,8 @@ impl EgraphPass {
         }
 
         // Build dependency graph: for each instruction, which instructions must come before it?
-        let mut in_degree: HashMap<InstId, usize> = HashMap::new();
-        let mut dependents: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        let mut in_degree: FxHashMap<InstId, usize> = FxHashMap::default();
+        let mut dependents: FxHashMap<InstId, Vec<InstId>> = FxHashMap::default();
 
         for &inst_id in inst_set {
             in_degree.entry(inst_id).or_insert(0);
@@ -345,17 +350,18 @@ impl EgraphPass {
     }
 
     /// Expose the complete GVN mapping for testing purposes.
-    pub fn gvn_mapping(&self) -> &HashMap<ValueId, ValueId> {
+    pub fn gvn_mapping(&self) -> &FxHashMap<ValueId, ValueId> {
         &self.gvn_mapping
     }
 
     /// If every return instruction in the function returns the same value,
     /// and that value is available in the entry block or is a constant,
     /// replace the entire function body with `return value`.
-    fn simplify_uniform_returns(&mut self) {
+    /// Returns `true` if the function body was rewritten.
+    fn simplify_uniform_returns(&mut self) -> bool {
         let entry = match self.layout.entry_block() {
             Some(b) => b,
-            None => return,
+            None => return false,
         };
 
         let mut return_values: Vec<ValueId> = Vec::new();
@@ -373,12 +379,12 @@ impl EgraphPass {
         }
 
         if return_values.is_empty() {
-            return;
+            return false;
         }
 
         let first = return_values[0];
         if !return_values.iter().all(|&v| v == first) {
-            return;
+            return false;
         }
 
         let entry_data = self.layout.block_data.get(&entry).unwrap();
@@ -400,9 +406,9 @@ impl EgraphPass {
                 let entry_data = self.layout.block_data.get_mut(&entry).unwrap();
                 entry_data.insts = vec![const_inst_id, ret_id];
                 self.layout.blocks = vec![entry];
-                return;
+                return true;
             }
-            return;
+            return false;
         }
 
         let entry_data = self.layout.block_data.get_mut(&entry).unwrap();
@@ -412,7 +418,7 @@ impl EgraphPass {
                 let ret_inst = Instruction::new(Opcode::Return, vec![first], Type::I32);
                 let ret_id = self.dfg.make_inst(ret_inst);
 
-                let mut needed = HashSet::new();
+                let mut needed: FxHashSet<InstId> = FxHashSet::default();
                 let mut work = vec![first];
                 while let Some(v) = work.pop() {
                     if let ValueDef::Inst(iid) = self.dfg.value_def(v) {
@@ -432,12 +438,16 @@ impl EgraphPass {
                 entry_data.insts.push(ret_id);
 
                 self.layout.blocks = vec![entry];
+                return true;
             }
         }
+        false
     }
 
     /// Simplify brif instructions whose condition is a known constant.
-    fn simplify_constant_brif(&mut self) {
+    /// Returns `true` if any instruction was rewritten.
+    fn simplify_constant_brif(&mut self) -> bool {
+        let mut changed = false;
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
         for inst_id in all_insts {
             let inst = self.dfg.insts[&inst_id].clone();
@@ -457,19 +467,22 @@ impl EgraphPass {
                         BranchInfo::Jump(target),
                     );
                     self.dfg.insts.insert(inst_id, new_inst);
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
     /// Eliminate dead (unreachable) blocks.
-    fn eliminate_dead_blocks(&mut self) {
+    /// Returns `true` if any block was removed.
+    fn eliminate_dead_blocks(&mut self) -> bool {
         let entry = match self.layout.entry_block() {
             Some(b) => b,
-            None => return,
+            None => return false,
         };
 
-        let mut reachable = HashSet::new();
+        let mut reachable: FxHashSet<BlockId> = FxHashSet::default();
         let mut work = vec![entry];
         while let Some(b) = work.pop() {
             if !reachable.insert(b) {
@@ -490,11 +503,15 @@ impl EgraphPass {
             }
         }
 
+        let before = self.layout.blocks.len();
         self.layout.blocks.retain(|b| reachable.contains(b));
+        self.layout.blocks.len() != before
     }
 
     /// Simplify trivial blocks (single-instruction blocks).
-    fn simplify_trivial_blocks(&mut self) {
+    /// Returns `true` if any block was simplified.
+    fn simplify_trivial_blocks(&mut self) -> bool {
+        let mut any_changed = false;
         let mut changed = true;
         while changed {
             changed = false;
@@ -672,12 +689,16 @@ impl EgraphPass {
                     }
                 }
             }
+            any_changed |= changed;
         }
+        any_changed
     }
 
     /// Simplify redundant brif: if both branches go to the same block with the
     /// same arguments, replace with an unconditional jump.
-    fn simplify_redundant_brif(&mut self) {
+    /// Returns `true` if any instruction was rewritten.
+    fn simplify_redundant_brif(&mut self) -> bool {
+        let mut changed = false;
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
         for inst_id in all_insts {
             let inst = self.dfg.insts[&inst_id].clone();
@@ -693,10 +714,12 @@ impl EgraphPass {
                             BranchInfo::Jump(*then_b),
                         );
                         self.dfg.insts.insert(inst_id, new_inst);
+                        changed = true;
                     }
                 }
             }
         }
+        changed
     }
 
     /// Redundant phi (block-param) elimination.
@@ -706,7 +729,7 @@ impl EgraphPass {
     /// canonical value. Iterates to a fixed point.
     fn eliminate_redundant_params(&mut self) {
         // Build a local param_sources map by scanning the layout.
-        let mut param_sources: HashMap<ValueId, Vec<(BlockId, ValueId)>> = HashMap::new();
+        let mut param_sources: FxHashMap<ValueId, Vec<ValueId>> = FxHashMap::default();
         for &block_id in &self.layout.blocks {
             let block = &self.layout.block_data[&block_id];
             for &inst_id in &block.insts {
@@ -719,7 +742,7 @@ impl EgraphPass {
                                     param_sources
                                         .entry(param)
                                         .or_insert_with(Vec::new)
-                                        .push((block_id, incoming));
+                                        .push(incoming);
                                 }
                             }
                         }
@@ -739,10 +762,7 @@ impl EgraphPass {
                                 if let (Some(&param), Some(&incoming)) =
                                     (tb.params.get(i), inst.args.get(1 + i))
                                 {
-                                    param_sources
-                                        .entry(param)
-                                        .or_default()
-                                        .push((block_id, incoming));
+                                    param_sources.entry(param).or_default().push(incoming);
                                 }
                             }
                         }
@@ -751,10 +771,7 @@ impl EgraphPass {
                                 if let (Some(&param), Some(&incoming)) =
                                     (eb.params.get(i), inst.args.get(1 + then_count + i))
                                 {
-                                    param_sources
-                                        .entry(param)
-                                        .or_default()
-                                        .push((block_id, incoming));
+                                    param_sources.entry(param).or_default().push(incoming);
                                 }
                             }
                         }
@@ -764,13 +781,18 @@ impl EgraphPass {
             }
         }
 
+        // Build a worklist of candidates: block params whose gvn_mapping is
+        // self (or absent), which actually have incoming sources. Iteration
+        // runs until a fixed point; when `gvn_mapping` changes a param may
+        // become redundant that previously was not, so we requeue affected
+        // params using a simple `changed` loop.
         let mut changed = true;
         while changed {
             changed = false;
-
-            let params: Vec<ValueId> = param_sources.keys().copied().collect();
-
-            for param in params {
+            for (&param, sources) in &param_sources {
+                if sources.is_empty() {
+                    continue;
+                }
                 if self
                     .gvn_mapping
                     .get(&param)
@@ -784,38 +806,38 @@ impl EgraphPass {
                     _ => continue,
                 }
 
-                let sources = match param_sources.get(&param) {
-                    Some(s) if !s.is_empty() => s.clone(),
-                    _ => continue,
-                };
-
-                let mut non_self_canonicals: Vec<ValueId> = Vec::new();
-                let mut all_self = true;
-
-                for &(_, incoming) in &sources {
+                // Find first non-self canonical.
+                let mut first: Option<ValueId> = None;
+                let mut uniform = true;
+                for &incoming in sources {
                     let resolved = self.fully_resolve(incoming);
                     if resolved == param {
-                        // Loop-carried self-reference
-                    } else {
-                        all_self = false;
-                        non_self_canonicals.push(resolved);
+                        continue; // loop-carried self-reference
+                    }
+                    match first {
+                        None => first = Some(resolved),
+                        Some(f) if f == resolved => {}
+                        _ => {
+                            uniform = false;
+                            break;
+                        }
                     }
                 }
 
-                if all_self || non_self_canonicals.is_empty() {
+                if !uniform {
                     continue;
                 }
+                let Some(first) = first else {
+                    continue;
+                };
 
-                let first = non_self_canonicals[0];
-                if non_self_canonicals.iter().all(|&v| v == first) {
-                    let replacement_def = match self.dfg.value_defs.get(&first).copied() {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                    self.dfg.value_defs.insert(param, replacement_def);
-                    self.gvn_mapping.insert(param, first);
-                    changed = true;
-                }
+                let replacement_def = match self.dfg.value_defs.get(&first).copied() {
+                    Some(d) => d,
+                    None => continue,
+                };
+                self.dfg.value_defs.insert(param, replacement_def);
+                self.gvn_mapping.insert(param, first);
+                changed = true;
             }
         }
     }
@@ -844,12 +866,12 @@ impl EgraphPass {
     /// - Records branch conditions inline (replacing the pre-scan)
     /// - Propagates ranges, creates unions, and applies rewrites
     fn remove_pure_and_optimize(&mut self) {
-        let mut value_to_opt_value: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut value_to_opt_value: FxHashMap<ValueId, ValueId> = FxHashMap::default();
 
         let mut gvn_map: ScopedHashMap<(Type, Instruction), Option<ValueId>> =
             ScopedHashMap::with_capacity(100);
 
-        let mut available_block: HashMap<ValueId, BlockId> = HashMap::new();
+        let mut available_block: FxHashMap<ValueId, BlockId> = FxHashMap::default();
 
         let mut gvn_map_blocks: Vec<BlockId> = Vec::new();
 
@@ -858,8 +880,8 @@ impl EgraphPass {
         // value_to_opt_value at read time. This must be pre-computed because
         // CFG predecessors are not guaranteed to precede successors in a
         // domtree-preorder walk (merge blocks may be visited before siblings).
-        let mut block_param_incoming: HashMap<(BlockId, usize), Vec<(BlockId, ValueId)>> =
-            HashMap::new();
+        let mut block_param_incoming: FxHashMap<(BlockId, usize), Vec<(BlockId, ValueId)>> =
+            FxHashMap::default();
         for &blk in &self.layout.blocks {
             let bd = &self.layout.block_data[&blk];
             for &iid in &bd.insts {
@@ -899,7 +921,7 @@ impl EgraphPass {
         }
 
         // Build CFG predecessors map for sound range-fact joining at merge points.
-        let mut cfg_preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        let mut cfg_preds: FxHashMap<BlockId, Vec<BlockId>> = FxHashMap::default();
         for &blk in &self.layout.blocks {
             cfg_preds.entry(blk).or_default();
             let bd = &self.layout.block_data[&blk];
@@ -919,12 +941,12 @@ impl EgraphPass {
         }
 
         // Range facts per edge (pred, target) and edge conditions populated inline during the walk
-        let mut block_entry_facts: HashMap<(BlockId, BlockId), Vec<(ValueId, Range)>> =
-            HashMap::new();
-        let mut block_edge_conditions: HashMap<
+        let mut block_entry_facts: FxHashMap<(BlockId, BlockId), Vec<(ValueId, Range)>> =
+            FxHashMap::default();
+        let mut block_edge_conditions: FxHashMap<
             (BlockId, BlockId),
             Vec<(ValueId, Option<i64>, Opcode, bool)>,
-        > = HashMap::new();
+        > = FxHashMap::default();
 
         let root = self.layout.entry_block().unwrap();
 
@@ -934,6 +956,10 @@ impl EgraphPass {
         }
 
         let mut block_stack = vec![StackEntry::Visit(root)];
+        // Reusable scratch buffers, to avoid per-instruction / per-block
+        // allocation in the inner loops.
+        let mut arg_ranges_buf: Vec<crate::range::Range> = Vec::with_capacity(8);
+        let mut cond_values_buf: Vec<ValueId> = Vec::with_capacity(8);
 
         while let Some(entry) = block_stack.pop() {
             match entry {
@@ -964,12 +990,12 @@ impl EgraphPass {
                         // For each edge, compute the per-value intersected range
                         // (multiple facts about the same value on one edge are
                         // intersected), then union those across edges.
-                        let mut value_edge_count: HashMap<ValueId, usize> = HashMap::new();
-                        let mut value_union: HashMap<ValueId, Range> = HashMap::new();
+                        let mut value_edge_count: FxHashMap<ValueId, usize> = FxHashMap::default();
+                        let mut value_union: FxHashMap<ValueId, Range> = FxHashMap::default();
                         for pred in &preds {
                             if let Some(facts) = block_entry_facts.get(&(*pred, block)) {
                                 // Intersect all facts for the same value on this edge
-                                let mut per_edge: HashMap<ValueId, Range> = HashMap::new();
+                                let mut per_edge: FxHashMap<ValueId, Range> = FxHashMap::default();
                                 for &(value, range) in facts {
                                     per_edge
                                         .entry(value)
@@ -1009,7 +1035,8 @@ impl EgraphPass {
                         let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_preds = preds.len();
                         if num_preds > 0 {
-                            let mut nonzero_edge_count: HashMap<ValueId, usize> = HashMap::new();
+                            let mut nonzero_edge_count: FxHashMap<ValueId, usize> =
+                                FxHashMap::default();
                             for pred in &preds {
                                 if let Some(conditions) = block_edge_conditions.get(&(*pred, block))
                                 {
@@ -1167,65 +1194,87 @@ impl EgraphPass {
                     }
 
                     // Process instructions
-                    let inst_ids: Vec<_> = block_data.insts.clone();
+                    //
+                    // Hoist OptimizeCtx out of the per-instruction loop and
+                    // reuse it across the inner loop and the cond_values
+                    // second pass. Per-iteration state (`rewrite_depth` and
+                    // `subsume_values`) is reset at the top of each loop
+                    // iteration. All accesses to `self.dfg`,
+                    // `self.range_assumptions`, etc. inside the loop go
+                    // through `ctx` to keep the borrow alive.
+                    let path_sensitive = self.path_sensitive;
+                    let mut ctx = OptimizeCtx {
+                        dfg: &mut self.dfg,
+                        value_to_opt_value: &mut value_to_opt_value,
+                        gvn_map: &mut gvn_map,
+                        gvn_map_blocks: &gvn_map_blocks,
+                        available_block: &mut available_block,
+                        stats: &mut self.stats,
+                        domtree: &self.domtree,
+                        rewrite_depth: 0,
+                        subsume_values: FxHashSet::default(),
+                        rewrite_engine: &mut self.rewrite_engine,
+                        range_assumptions: &mut self.range_assumptions,
+                        path_sensitive,
+                    };
 
-                    for inst_id in inst_ids {
-                        let inst = self.dfg.insts[&inst_id].clone();
+                    for &inst_id in &block_data.insts {
+                        // Reset per-iteration state.
+                        ctx.rewrite_depth = 0;
+                        ctx.subsume_values.clear();
 
-                        let mut rewritten_inst = inst.clone();
-                        for arg in &mut rewritten_inst.args {
-                            if let Some(&opt_value) = value_to_opt_value.get(arg) {
-                                *arg = opt_value;
+                        // 1) Rewrite args in place using value_to_opt_value
+                        //    and capture the (Copy) opcode for dispatch.
+                        //    Avoids the previous double-clone of the
+                        //    instruction.
+                        let opcode = {
+                            let inst_ref = ctx.dfg.insts.get_mut(&inst_id).unwrap();
+                            for arg in &mut inst_ref.args {
+                                if let Some(&opt_value) = ctx.value_to_opt_value.get(arg) {
+                                    *arg = opt_value;
+                                }
                             }
-                        }
-                        self.dfg.insts.insert(inst_id, rewritten_inst.clone());
-
-                        let mut ctx = OptimizeCtx {
-                            dfg: &mut self.dfg,
-                            value_to_opt_value: &mut value_to_opt_value,
-                            gvn_map: &mut gvn_map,
-                            gvn_map_blocks: &gvn_map_blocks,
-                            available_block: &mut available_block,
-                            stats: &mut self.stats,
-                            domtree: &self.domtree,
-                            rewrite_depth: 0,
-                            subsume_values: HashSet::new(),
-                            rewrite_engine: &mut self.rewrite_engine,
-                            range_assumptions: &mut self.range_assumptions,
-                            path_sensitive: self.path_sensitive,
+                            inst_ref.opcode
                         };
 
-                        if rewritten_inst.opcode.is_pure() {
+                        if opcode.is_pure() {
                             ctx.insert_pure_enode(inst_id);
                         } else {
                             ctx.optimize_skeleton_inst(inst_id, block);
                         }
 
-                        // Propagate ranges forward
-                        if self.path_sensitive {
-                            let inst_after = self.dfg.insts[&inst_id].clone();
-                            let arg_ranges: Vec<crate::range::Range> = inst_after
-                                .args
-                                .iter()
-                                .map(|&arg| self.range_assumptions.get_range(arg))
-                                .collect();
+                        // Propagate ranges forward — reuse the buffer to
+                        // avoid an allocation per instruction.
+                        if path_sensitive {
+                            arg_ranges_buf.clear();
+                            let (opcode_after, immediate_after) = {
+                                let inst_ref = &ctx.dfg.insts[&inst_id];
+                                for &arg in &inst_ref.args {
+                                    arg_ranges_buf.push(ctx.range_assumptions.get_range(arg));
+                                }
+                                (inst_ref.opcode, inst_ref.immediate)
+                            };
                             let output_range = crate::range::compute_inst_range(
-                                inst_after.opcode,
-                                &arg_ranges,
-                                inst_after.immediate,
+                                opcode_after,
+                                &arg_ranges_buf,
+                                immediate_after,
                             );
                             if !output_range.is_unbounded() {
-                                if let Some(&result) = self.dfg.inst_results(inst_id).first() {
-                                    let opt_result =
-                                        value_to_opt_value.get(&result).copied().unwrap_or(result);
-                                    self.range_assumptions.assume_range(result, output_range);
-                                    self.stats.ranges_propagated += 1;
+                                if let Some(&result) = ctx.dfg.inst_results(inst_id).first() {
+                                    let opt_result = ctx
+                                        .value_to_opt_value
+                                        .get(&result)
+                                        .copied()
+                                        .unwrap_or(result);
+                                    ctx.range_assumptions.assume_range(result, output_range);
+                                    ctx.stats.ranges_propagated += 1;
                                     if opt_result != result {
-                                        self.range_assumptions
+                                        ctx.range_assumptions
                                             .assume_range(opt_result, output_range);
                                     }
                                     if let Some(c) = output_range.as_singleton() {
-                                        let current = value_to_opt_value
+                                        let current = ctx
+                                            .value_to_opt_value
                                             .get(&result)
                                             .copied()
                                             .unwrap_or(result);
@@ -1238,144 +1287,153 @@ impl EgraphPass {
                                             );
                                             let key = (Type::I32, const_inst.clone());
                                             let const_val = if let Some(Some(existing)) =
-                                                gvn_map.get(&key)
+                                                ctx.gvn_map.get(&key)
                                             {
                                                 *existing
                                             } else {
-                                                let const_inst_id = self.dfg.make_inst(const_inst);
-                                                let cv = self
+                                                let const_inst_id = ctx.dfg.make_inst(const_inst);
+                                                let cv = ctx
                                                     .dfg
                                                     .make_inst_result(const_inst_id, Type::I32);
-                                                gvn_map.insert(key, Some(cv));
-                                                available_block.insert(cv, block);
+                                                ctx.gvn_map.insert(key, Some(cv));
+                                                ctx.available_block.insert(cv, block);
                                                 cv
                                             };
-                                            let _ = self.dfg.make_union(opt_result, const_val);
-                                            value_to_opt_value.insert(result, const_val);
-                                            self.stats.union += 1;
+                                            let _ = ctx.dfg.make_union(opt_result, const_val);
+                                            ctx.value_to_opt_value.insert(result, const_val);
+                                            ctx.stats.union += 1;
                                         }
                                     }
                                 }
                             }
                         }
 
-                        // Inline branch-condition recording (replacing pre-scan).
-                        // Recorded after arg rewriting so conditions reference
-                        // optimized values. Branch conditions from dominators
-                        // are always available for dominated blocks.
-                        let inst_after = self.dfg.insts[&inst_id].clone();
-                        if self.path_sensitive && inst_after.opcode == Opcode::CondBranch {
-                            if let Some(BranchInfo::Conditional(then_b, _, else_b, _)) =
-                                &inst_after.branch_info
-                            {
-                                let then_b = *then_b;
-                                let else_b = *else_b;
-                                if !inst_after.args.is_empty() {
-                                    let cond_value = inst_after.args[0];
-                                    // True branch: condition is nonzero.
-                                    // Walk backward through band/bor/cmp to
-                                    // learn all leaf-level range facts.
+                        // Inline branch-condition recording (replacing
+                        // pre-scan). Recorded after arg rewriting so
+                        // conditions reference optimized values. Branch
+                        // conditions from dominators are always available
+                        // for dominated blocks.
+                        if path_sensitive {
+                            let cb_info = {
+                                let inst_ref = &ctx.dfg.insts[&inst_id];
+                                if inst_ref.opcode == Opcode::CondBranch {
+                                    if let Some(BranchInfo::Conditional(then_b, _, else_b, _)) =
+                                        inst_ref.branch_info
                                     {
-                                        self.range_assumptions.push_scope();
-                                        let then_facts = self
-                                            .range_assumptions
-                                            .refine_nonzero(cond_value, &self.dfg);
-                                        self.range_assumptions.pop_scope();
+                                        if !inst_ref.args.is_empty() {
+                                            Some((then_b, else_b, inst_ref.args[0]))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((then_b, else_b, cond_value)) = cb_info {
+                                // True branch: condition is nonzero. Walk
+                                // backward through band/bor/cmp to learn all
+                                // leaf-level range facts.
+                                {
+                                    ctx.range_assumptions.push_scope();
+                                    let then_facts =
+                                        ctx.range_assumptions.refine_nonzero(cond_value, &*ctx.dfg);
+                                    ctx.range_assumptions.pop_scope();
 
+                                    block_entry_facts
+                                        .entry((block, then_b))
+                                        .or_default()
+                                        .extend(then_facts.iter().cloned());
+                                    // Record leaf facts as edge conditions
+                                    // so block-param range join can narrow
+                                    // per-edge ranges.
+                                    for &(value, range) in &then_facts {
+                                        // Approximate: store as a >= min
+                                        // and < max+1 pair. The edge
+                                        // conditions use (lhs, rhs_const,
+                                        // opcode, is_true_branch) tuples.
+                                        // We record Sge for the lower bound.
+                                        block_edge_conditions
+                                            .entry((block, then_b))
+                                            .or_default()
+                                            .push((value, Some(range.min), Opcode::Sge, true));
+                                        if range.max < i64::MAX {
+                                            block_edge_conditions
+                                                .entry((block, then_b))
+                                                .or_default()
+                                                .push((
+                                                    value,
+                                                    Some(range.max + 1),
+                                                    Opcode::Slt,
+                                                    true,
+                                                ));
+                                        }
+                                    }
+                                    if then_facts.is_empty() {
+                                        // No leaf facts found — record
+                                        // top-level cond != 0 as fallback.
+                                        let ne_facts = learn_from_comparison(
+                                            Opcode::Ne,
+                                            cond_value,
+                                            Some(0),
+                                            true,
+                                        );
                                         block_entry_facts
                                             .entry((block, then_b))
                                             .or_default()
-                                            .extend(then_facts.iter().cloned());
-                                        // Record leaf facts as edge conditions
-                                        // so block-param range join can narrow
-                                        // per-edge ranges.
-                                        for &(value, range) in &then_facts {
-                                            // Approximate: store as a >= min
-                                            // and < max+1 pair. The edge
-                                            // conditions use (lhs, rhs_const,
-                                            // opcode, is_true_branch) tuples.
-                                            // We record Sge for the lower bound.
+                                            .extend(ne_facts);
+                                        block_edge_conditions
+                                            .entry((block, then_b))
+                                            .or_default()
+                                            .push((cond_value, Some(0), Opcode::Ne, true));
+                                    }
+                                }
+
+                                // Else branch: condition is zero.
+                                {
+                                    ctx.range_assumptions.push_scope();
+                                    let else_facts =
+                                        ctx.range_assumptions.refine_zero(cond_value, &*ctx.dfg);
+                                    ctx.range_assumptions.pop_scope();
+
+                                    block_entry_facts
+                                        .entry((block, else_b))
+                                        .or_default()
+                                        .extend(else_facts.iter().cloned());
+                                    for &(value, range) in &else_facts {
+                                        block_edge_conditions
+                                            .entry((block, else_b))
+                                            .or_default()
+                                            .push((value, Some(range.min), Opcode::Sge, true));
+                                        if range.max < i64::MAX {
                                             block_edge_conditions
-                                                .entry((block, then_b))
+                                                .entry((block, else_b))
                                                 .or_default()
-                                                .push((value, Some(range.min), Opcode::Sge, true));
-                                            if range.max < i64::MAX {
-                                                block_edge_conditions
-                                                    .entry((block, then_b))
-                                                    .or_default()
-                                                    .push((
-                                                        value,
-                                                        Some(range.max + 1),
-                                                        Opcode::Slt,
-                                                        true,
-                                                    ));
-                                            }
-                                        }
-                                        if then_facts.is_empty() {
-                                            // No leaf facts found — record
-                                            // top-level cond != 0 as fallback.
-                                            let ne_facts = learn_from_comparison(
-                                                Opcode::Ne,
-                                                cond_value,
-                                                Some(0),
-                                                true,
-                                            );
-                                            block_entry_facts
-                                                .entry((block, then_b))
-                                                .or_default()
-                                                .extend(ne_facts);
-                                            block_edge_conditions
-                                                .entry((block, then_b))
-                                                .or_default()
-                                                .push((cond_value, Some(0), Opcode::Ne, true));
+                                                .push((
+                                                    value,
+                                                    Some(range.max + 1),
+                                                    Opcode::Slt,
+                                                    true,
+                                                ));
                                         }
                                     }
-
-                                    // Else branch: condition is zero.
-                                    {
-                                        self.range_assumptions.push_scope();
-                                        let else_facts = self
-                                            .range_assumptions
-                                            .refine_zero(cond_value, &self.dfg);
-                                        self.range_assumptions.pop_scope();
-
+                                    if else_facts.is_empty() {
+                                        let ne_facts = learn_from_comparison(
+                                            Opcode::Ne,
+                                            cond_value,
+                                            Some(0),
+                                            false,
+                                        );
                                         block_entry_facts
                                             .entry((block, else_b))
                                             .or_default()
-                                            .extend(else_facts.iter().cloned());
-                                        for &(value, range) in &else_facts {
-                                            block_edge_conditions
-                                                .entry((block, else_b))
-                                                .or_default()
-                                                .push((value, Some(range.min), Opcode::Sge, true));
-                                            if range.max < i64::MAX {
-                                                block_edge_conditions
-                                                    .entry((block, else_b))
-                                                    .or_default()
-                                                    .push((
-                                                        value,
-                                                        Some(range.max + 1),
-                                                        Opcode::Slt,
-                                                        true,
-                                                    ));
-                                            }
-                                        }
-                                        if else_facts.is_empty() {
-                                            let ne_facts = learn_from_comparison(
-                                                Opcode::Ne,
-                                                cond_value,
-                                                Some(0),
-                                                false,
-                                            );
-                                            block_entry_facts
-                                                .entry((block, else_b))
-                                                .or_default()
-                                                .extend(ne_facts);
-                                            block_edge_conditions
-                                                .entry((block, else_b))
-                                                .or_default()
-                                                .push((cond_value, Some(0), Opcode::Ne, false));
-                                        }
+                                            .extend(ne_facts);
+                                        block_edge_conditions
+                                            .entry((block, else_b))
+                                            .or_default()
+                                            .push((cond_value, Some(0), Opcode::Ne, false));
                                     }
                                 }
                             }
@@ -1392,19 +1450,24 @@ impl EgraphPass {
                     // scope (e.g., icmp.sge x, 0 → 1 once x is known to be
                     // non-negative on this branch). Restricted to brif
                     // condition values to keep the cost bounded.
-                    if self.path_sensitive {
-                        let mut cond_values: Vec<ValueId> = Vec::new();
+                    if path_sensitive {
+                        // Reuse a stable buffer for cond_values rather than
+                        // allocating per-block. Reading inst args via the
+                        // hoisted ctx.dfg keeps borrows happy.
+                        cond_values_buf.clear();
                         for &iid in &block_data.insts {
-                            let inst = &self.dfg.insts[&iid];
+                            let inst = &ctx.dfg.insts[&iid];
                             if inst.opcode == Opcode::CondBranch {
                                 if let Some(&cond) = inst.args.first() {
-                                    cond_values.push(cond);
+                                    cond_values_buf.push(cond);
                                 }
                             }
                         }
-                        for cond in cond_values {
-                            let canonical = value_to_opt_value.get(&cond).copied().unwrap_or(cond);
-                            let defined_in_dominator = available_block
+                        for &cond in &cond_values_buf {
+                            let canonical =
+                                ctx.value_to_opt_value.get(&cond).copied().unwrap_or(cond);
+                            let defined_in_dominator = ctx
+                                .available_block
                                 .get(&canonical)
                                 .copied()
                                 .map(|b| b != block)
@@ -1412,23 +1475,15 @@ impl EgraphPass {
                             if !defined_in_dominator {
                                 continue;
                             }
-                            let mut ctx = OptimizeCtx {
-                                dfg: &mut self.dfg,
-                                value_to_opt_value: &mut value_to_opt_value,
-                                gvn_map: &mut gvn_map,
-                                gvn_map_blocks: &gvn_map_blocks,
-                                available_block: &mut available_block,
-                                stats: &mut self.stats,
-                                domtree: &self.domtree,
-                                rewrite_depth: 0,
-                                subsume_values: HashSet::new(),
-                                rewrite_engine: &mut self.rewrite_engine,
-                                range_assumptions: &mut self.range_assumptions,
-                                path_sensitive: self.path_sensitive,
-                            };
+                            ctx.rewrite_depth = 0;
+                            ctx.subsume_values.clear();
                             ctx.apply_conditional_rewrites_and_store(canonical);
                         }
                     }
+
+                    // Drop ctx so the borrows on self are released before
+                    // the next StackEntry iteration.
+                    drop(ctx);
                 }
 
                 StackEntry::Pop => {
@@ -1475,7 +1530,7 @@ impl EgraphPass {
             }
             result
         };
-        let in_layout: HashSet<BlockId> = preorder.iter().copied().collect();
+        let in_layout: FxHashSet<BlockId> = preorder.iter().copied().collect();
 
         // ----- Phase 1: global CSE -----
         //
@@ -1484,8 +1539,8 @@ impl EgraphPass {
         // type, immediate, and resolved argument list, and de-duplicates
         // against earlier (dominating) instructions.  Canonicalization of
         // inner values exposes further equivalences, hence the loop.
-        let mut value_map: HashMap<ValueId, ValueId> = HashMap::new();
-        fn resolve(vm: &HashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
+        let mut value_map: FxHashMap<ValueId, ValueId> = FxHashMap::default();
+        fn resolve(vm: &FxHashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
             let mut guard = 0usize;
             while let Some(&next) = vm.get(&v) {
                 if next == v || guard > 1024 {
@@ -1499,8 +1554,8 @@ impl EgraphPass {
 
         for _iter in 0..16 {
             let mut changed = false;
-            let mut by_key: HashMap<(Opcode, Type, Option<i64>, Vec<ValueId>), ValueId> =
-                HashMap::new();
+            let mut by_key: FxHashMap<(Opcode, Type, Option<i64>, Vec<ValueId>), ValueId> =
+                FxHashMap::default();
             for &block_id in &preorder {
                 let block_insts = self.layout.block_data[&block_id].insts.clone();
                 for inst_id in block_insts {
@@ -1585,7 +1640,7 @@ impl EgraphPass {
         // placement.  If the arg check fails, we leave the inst where it
         // is — `finalize_gcm_validity` will then clone the arg-defining
         // inst locally to restore SSA dominance.
-        let mut inst_block: HashMap<InstId, BlockId> = HashMap::new();
+        let mut inst_block: FxHashMap<InstId, BlockId> = FxHashMap::default();
         for &block_id in &preorder {
             for &iid in &self.layout.block_data[&block_id].insts {
                 inst_block.insert(iid, block_id);
@@ -1595,7 +1650,7 @@ impl EgraphPass {
         // value -> defining InstId (for pure insts currently placed in a
         // block).  Stable across the iteration since neither CSE nor GCM
         // creates new insts.
-        let mut def_of: HashMap<ValueId, InstId> = HashMap::new();
+        let mut def_of: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for (&iid, _) in &inst_block {
             for &r in self.dfg.inst_results(iid) {
                 def_of.insert(r, iid);
@@ -1610,7 +1665,7 @@ impl EgraphPass {
             PureInst(InstId),
             FixedBlock(BlockId),
         }
-        let mut users_of: HashMap<InstId, Vec<UserKind>> = HashMap::new();
+        let mut users_of: FxHashMap<InstId, Vec<UserKind>> = FxHashMap::default();
         for &block_id in &preorder {
             let block = &self.layout.block_data[&block_id];
             for &user_id in &block.insts {
@@ -1633,7 +1688,7 @@ impl EgraphPass {
         }
 
         // Initialize target = current block for each pure inst.
-        let mut target: HashMap<InstId, BlockId> = HashMap::new();
+        let mut target: FxHashMap<InstId, BlockId> = FxHashMap::default();
         for (&iid, &b) in &inst_block {
             if self.dfg.insts[&iid].opcode.is_pure() {
                 target.insert(iid, b);
@@ -1810,7 +1865,7 @@ impl EgraphPass {
 
         // ----- Phase 6: remove dead pure insts (no user in the function) -----
         loop {
-            let mut used: HashSet<ValueId> = HashSet::new();
+            let mut used: FxHashSet<ValueId> = FxHashSet::default();
             for &block_id in &preorder {
                 for &iid in &self.layout.block_data[&block_id].insts {
                     for &arg in &self.dfg.insts[&iid].args {
@@ -1851,7 +1906,7 @@ impl EgraphPass {
         if block.insts.is_empty() {
             return Vec::new();
         }
-        let inst_set: HashSet<InstId> = block.insts.iter().copied().collect();
+        let inst_set: FxHashSet<InstId> = block.insts.iter().copied().collect();
 
         // Identify the terminator (pinned to the end).
         let terminator = block
@@ -1865,15 +1920,15 @@ impl EgraphPass {
             .copied();
 
         // Value -> defining inst, restricted to this block.
-        let mut def_map: HashMap<ValueId, InstId> = HashMap::new();
+        let mut def_map: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for &iid in &block.insts {
             for &r in self.dfg.inst_results(iid) {
                 def_map.insert(r, iid);
             }
         }
 
-        let mut in_deg: HashMap<InstId, usize> = HashMap::new();
-        let mut dependents: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        let mut in_deg: FxHashMap<InstId, usize> = FxHashMap::default();
+        let mut dependents: FxHashMap<InstId, Vec<InstId>> = FxHashMap::default();
         for &iid in &block.insts {
             in_deg.insert(iid, 0);
         }
@@ -1923,14 +1978,14 @@ impl EgraphPass {
 /// Context for optimization
 struct OptimizeCtx<'a> {
     dfg: &'a mut DataFlowGraph,
-    value_to_opt_value: &'a mut HashMap<ValueId, ValueId>,
+    value_to_opt_value: &'a mut FxHashMap<ValueId, ValueId>,
     gvn_map: &'a mut ScopedHashMap<(Type, Instruction), Option<ValueId>>,
     gvn_map_blocks: &'a Vec<BlockId>,
-    available_block: &'a mut HashMap<ValueId, BlockId>,
+    available_block: &'a mut FxHashMap<ValueId, BlockId>,
     stats: &'a mut Stats,
     domtree: &'a DominatorTree,
     rewrite_depth: usize,
-    subsume_values: HashSet<ValueId>,
+    subsume_values: FxHashSet<ValueId>,
     rewrite_engine: &'a mut RewriteEngine,
     range_assumptions: &'a mut RangeAssumptions,
     path_sensitive: bool,
@@ -1981,11 +2036,22 @@ impl<'a> OptimizeCtx<'a> {
 
                 entry.insert(Some(result));
 
+                // Cache opcode before apply_rewrites_and_union mutates state.
+                let inst_opcode = inst.opcode;
+
                 // Apply rewrite rules and create unions
                 let opt_result = self.apply_rewrites_and_union(result);
 
-                // Second pass: create conditional unions for range-dependent rewrites
-                if self.path_sensitive {
+                // Second pass: create conditional unions for range-dependent
+                // rewrites.  Skip when no range-conditioned rule can match
+                // this opcode — this is the common case for most arithmetic.
+                if self.path_sensitive
+                    && (self.rewrite_engine.has_unconstrained_range_rule
+                        || self
+                            .rewrite_engine
+                            .range_rule_opcodes
+                            .contains(&inst_opcode))
+                {
                     self.apply_conditional_rewrites_and_store(result);
                 }
 
@@ -2089,10 +2155,22 @@ impl<'a> OptimizeCtx<'a> {
     ///   one range fact is branch-local.
     fn apply_conditional_rewrites_and_store(&mut self, value: ValueId) {
         // Only consider instruction-defined values.
-        let _ = match self.dfg.value_def(value) {
+        let defining_inst = match self.dfg.value_def(value) {
             ValueDef::Inst(id) => id,
             _ => return,
         };
+
+        // Fast path: no range-conditioned rules at all.
+        if self.rewrite_engine.range_rule_indices.is_empty() {
+            return;
+        }
+
+        // Filter by the defining instruction's opcode: only rules whose LHS
+        // top-level is either `Pattern::Op { opcode: <matching> }` or a
+        // non-Op variant (Or/Var/Where) can possibly match.  Rules with a
+        // concrete mismatched top-level opcode are skipped without running
+        // the pattern matcher.
+        let defining_opcode = self.dfg.insts[&defining_inst].opcode;
 
         let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
         // SAFETY: The pointee is not mutated through the raw pointer while
@@ -2100,9 +2178,21 @@ impl<'a> OptimizeCtx<'a> {
         // below; `self.dfg` is the only field mutated during the loop.
         let ra = unsafe { &*ra_ptr };
 
-        // Iterate over all rewrite rules to find ones with range-based conditions.
-        for rule in &self.rewrite_engine.library.rules.clone() {
-            // Skip rules without range-based conditions.
+        // Temporarily move `rules` out so we can iterate without cloning the
+        // entire library.  This pass is called once per pure instruction in
+        // path-sensitive mode, so the clone was a major hot spot.
+        let rules = std::mem::take(&mut self.rewrite_engine.library.rules);
+
+        // Iterate only over rules with range-based conditions, using the
+        // precomputed index list.  Skip rules whose LHS has a concrete
+        // top-level opcode that cannot possibly match this instruction.
+        for &(rule_idx, top_op) in &self.rewrite_engine.range_rule_indices {
+            if let Some(op) = top_op {
+                if op != defining_opcode {
+                    continue;
+                }
+            }
+            let rule = &rules[rule_idx];
             let range_conditions = Self::collect_range_conditions(&rule.conditions);
             if range_conditions.is_empty() {
                 continue;
@@ -2179,6 +2269,9 @@ impl<'a> OptimizeCtx<'a> {
                 .dfg
                 .make_conditional_union(value, new_value, assumption_set);
         }
+
+        // Restore the borrowed rules vector.
+        self.rewrite_engine.library.rules = rules;
     }
 
     /// Collect range-based conditions from a slice of conditions (flattening And).

@@ -8,3 +8,4 @@ name = "aegraph"
 path = "src/lib.rs"
 
 [dependencies]
+rustc-hash = "2"

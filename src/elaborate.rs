@@ -9,6 +9,7 @@
 use crate::range::RangeAssumptions;
 use crate::support::*;
 use crate::types::*;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
 /// Cost of an operation (for extraction)
@@ -91,10 +92,10 @@ pub struct Elaborator<'a> {
 
     /// Block entry facts per CFG edge, used to apply range assumptions
     /// when entering each block during the domtree walk.
-    block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+    block_entry_facts: &'a FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
 
     /// CFG predecessor map for looking up incoming edges per block.
-    cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
+    cfg_preds: &'a FxHashMap<BlockId, Vec<BlockId>>,
 
     /// Per-domtree-level sets of `ValueId`s whose `best_value_cache` entries
     /// were inserted or modified at that level. On `Pop`, these entries are
@@ -109,10 +110,10 @@ pub struct Elaborator<'a> {
 /// Empty statics used as defaults when no block_entry_facts / cfg_preds are
 /// provided (e.g. in unit tests that use `Elaborator::new`).
 static EMPTY_ENTRY_FACTS: std::sync::LazyLock<
-    HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
-> = std::sync::LazyLock::new(HashMap::new);
-static EMPTY_CFG_PREDS: std::sync::LazyLock<HashMap<BlockId, Vec<BlockId>>> =
-    std::sync::LazyLock::new(HashMap::new);
+    FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+> = std::sync::LazyLock::new(FxHashMap::default);
+static EMPTY_CFG_PREDS: std::sync::LazyLock<FxHashMap<BlockId, Vec<BlockId>>> =
+    std::sync::LazyLock::new(FxHashMap::default);
 
 impl<'a> Elaborator<'a> {
     pub fn new(
@@ -145,8 +146,8 @@ impl<'a> Elaborator<'a> {
         domtree: &'a DominatorTree,
         stats: &'a mut Stats,
         range_assumptions: &'a mut RangeAssumptions,
-        block_entry_facts: &'a HashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
-        cfg_preds: &'a HashMap<BlockId, Vec<BlockId>>,
+        block_entry_facts: &'a FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
+        cfg_preds: &'a FxHashMap<BlockId, Vec<BlockId>>,
     ) -> Self {
         Self {
             dfg,

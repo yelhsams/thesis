@@ -5,12 +5,36 @@
 
 use crate::pattern::*;
 use crate::types::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 
 /// Rewrite engine: applies pattern-based rewrites to the egraph
 pub struct RewriteEngine {
     /// The library of rewrite rules to apply
     pub library: RewriteLibrary,
+
+    /// Indices into `library.rules` of rules that contain at least one
+    /// range-based condition, paired with the LHS top-level opcode (if
+    /// the LHS is a concrete `Pattern::Op { .. }`).  Precomputed so
+    /// range-conditioned rewrites don't need to scan the full rule
+    /// library per pure instruction, and can skip rules whose LHS cannot
+    /// possibly match the current instruction's opcode.
+    pub range_rule_indices: Vec<(usize, Option<Opcode>)>,
+
+    /// Set of LHS top-level opcodes that appear in at least one
+    /// range-conditioned rule.  When a value's defining opcode is not
+    /// in this set (and no unconstrained range rules exist), we can
+    /// skip the range-conditioned rewrite pass entirely.
+    pub range_rule_opcodes: FxHashSet<Opcode>,
+    pub has_unconstrained_range_rule: bool,
+
+    /// Index of rules bucketed by the LHS's top-level opcode.  Rules
+    /// whose LHS is a concrete `Pattern::Op { opcode, .. }` are placed
+    /// in `rules_by_opcode[opcode]`; rules whose LHS has no concrete
+    /// top-level opcode (Or / Var / Where / AnyConstant / ...) go into
+    /// `unconstrained_rule_indices`, which are tried for every value.
+    pub rules_by_opcode: FxHashMap<Opcode, Vec<usize>>,
+    pub unconstrained_rule_indices: Vec<usize>,
 
     /// Statistics
     pub matches_attempted: u64,
@@ -21,8 +45,19 @@ pub struct RewriteEngine {
 impl RewriteEngine {
     /// Create a new rewrite engine with the standard library
     pub fn with_standard_library() -> Self {
+        let library = RewriteLibrary::standard();
+        let range_rule_indices = Self::compute_range_rule_indices(&library.rules);
+        let (rules_by_opcode, unconstrained_rule_indices) =
+            Self::bucket_rules_by_opcode(&library.rules);
+        let (range_rule_opcodes, has_unconstrained_range_rule) =
+            Self::compute_range_rule_opcode_set(&range_rule_indices);
         Self {
-            library: RewriteLibrary::standard(),
+            library,
+            range_rule_indices,
+            rules_by_opcode,
+            unconstrained_rule_indices,
+            range_rule_opcodes,
+            has_unconstrained_range_rule,
             matches_attempted: 0,
             matches_succeeded: 0,
             rewrites_applied: 0,
@@ -33,6 +68,11 @@ impl RewriteEngine {
     pub fn new() -> Self {
         Self {
             library: RewriteLibrary { rules: Vec::new() },
+            range_rule_indices: Vec::new(),
+            rules_by_opcode: FxHashMap::default(),
+            unconstrained_rule_indices: Vec::new(),
+            range_rule_opcodes: FxHashSet::default(),
+            has_unconstrained_range_rule: false,
             matches_attempted: 0,
             matches_succeeded: 0,
             rewrites_applied: 0,
@@ -41,7 +81,102 @@ impl RewriteEngine {
 
     /// Add a custom rule to the engine
     pub fn add_rule(&mut self, rule: Rewrite) {
+        let idx = self.library.rules.len();
+        let has_range = Self::rule_has_range_condition(&rule);
+        let top_op = Self::lhs_top_opcode(&rule.lhs);
         self.library.add_rule(rule);
+        if has_range {
+            self.range_rule_indices.push((idx, top_op));
+            match top_op {
+                Some(op) => {
+                    self.range_rule_opcodes.insert(op);
+                }
+                None => {
+                    self.has_unconstrained_range_rule = true;
+                }
+            }
+        }
+        match top_op {
+            Some(op) => {
+                self.rules_by_opcode.entry(op).or_default().push(idx);
+            }
+            None => {
+                self.unconstrained_rule_indices.push(idx);
+            }
+        }
+    }
+
+    fn compute_range_rule_opcode_set(
+        range_rule_indices: &[(usize, Option<Opcode>)],
+    ) -> (FxHashSet<Opcode>, bool) {
+        let mut set = FxHashSet::default();
+        let mut has_unconstrained = false;
+        for &(_, top) in range_rule_indices {
+            match top {
+                Some(op) => {
+                    set.insert(op);
+                }
+                None => has_unconstrained = true,
+            }
+        }
+        (set, has_unconstrained)
+    }
+
+    fn bucket_rules_by_opcode(rules: &[Rewrite]) -> (FxHashMap<Opcode, Vec<usize>>, Vec<usize>) {
+        let mut by_op: FxHashMap<Opcode, Vec<usize>> = FxHashMap::default();
+        let mut unconstrained: Vec<usize> = Vec::new();
+        for (i, r) in rules.iter().enumerate() {
+            match Self::lhs_top_opcode(&r.lhs) {
+                Some(op) => by_op.entry(op).or_default().push(i),
+                None => unconstrained.push(i),
+            }
+        }
+        (by_op, unconstrained)
+    }
+
+    fn compute_range_rule_indices(rules: &[Rewrite]) -> Vec<(usize, Option<Opcode>)> {
+        rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| Self::rule_has_range_condition(r))
+            .map(|(i, r)| (i, Self::lhs_top_opcode(&r.lhs)))
+            .collect()
+    }
+
+    /// Return the top-level opcode of an LHS pattern if it's a concrete
+    /// `Pattern::Op`, else `None` (means "may match any opcode").
+    fn lhs_top_opcode(pattern: &Pattern) -> Option<Opcode> {
+        match pattern {
+            Pattern::Op { opcode, .. } => Some(*opcode),
+            _ => None,
+        }
+    }
+
+    fn rule_has_range_condition(rule: &Rewrite) -> bool {
+        fn walk(conds: &[Condition]) -> bool {
+            for c in conds {
+                match c {
+                    Condition::InRange(..)
+                    | Condition::NonNegative(..)
+                    | Condition::Positive(..)
+                    | Condition::Negative(..)
+                    | Condition::RangeLessThan(..)
+                    | Condition::RangeGreaterThan(..)
+                    | Condition::RangeEquals(..)
+                    | Condition::Unreachable(..)
+                    | Condition::NonZero(..)
+                    | Condition::Custom { .. } => return true,
+                    Condition::And(inner) => {
+                        if walk(inner) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        walk(&rule.conditions)
     }
 
     /// Try to apply all rewrite rules to a value (without range info)
@@ -63,43 +198,71 @@ impl RewriteEngine {
     ) -> HashSet<ValueId> {
         let mut results = HashSet::new();
 
-        for rule in &self.library.rules.clone() {
-            self.matches_attempted += 1;
+        // Resolve the defining instruction's opcode so we can look up
+        // only rules that could possibly match this value.
+        let value_opcode = match dfg.value_def(value) {
+            ValueDef::Inst(iid) => Some(dfg.insts[&iid].opcode),
+            _ => None,
+        };
 
-            // LHS
+        // Temporarily move `rules` out so we can iterate over it while still
+        // mutating other fields of `self` (matches_attempted, etc.).  This
+        // avoids cloning the full rule library per call — a major hot spot
+        // for path-sensitive compilation.
+        let rules = std::mem::take(&mut self.library.rules);
+
+        // Helper closure to try a single rule; pulled out so it can be
+        // called for both the opcode-specific bucket and the
+        // "unconstrained" bucket (Or / Var / Where / AnyConstant LHSs).
+        let mut try_rule = |engine: &mut Self, rule: &Rewrite, dfg: &mut DataFlowGraph| {
+            engine.matches_attempted += 1;
             let matcher = PatternMatcher::new(dfg);
             if let Some(mut bindings) = matcher.match_pattern(&rule.lhs, value) {
-                self.matches_succeeded += 1;
+                engine.matches_succeeded += 1;
 
-                // Attach range assumptions so range-based conditions can fire
                 if let Some(ra) = range_assumptions {
                     bindings.set_range_assumptions(ra);
                 }
 
-                // Check conditions
                 if !rule.check_conditions(&bindings) {
-                    continue;
+                    return;
                 }
 
-                // RHS
                 let mut applier = PatternApplier::new(dfg);
                 if let Some(new_value) = applier.apply_pattern(&rule.rhs, &bindings) {
-                    // Don't apply if it produces the same value
                     if new_value == value {
-                        continue;
+                        return;
                     }
-
-                    // Don't apply if we already produced this value
                     if results.contains(&new_value) {
-                        continue;
+                        return;
                     }
-
-                    self.rewrites_applied += 1;
+                    engine.rewrites_applied += 1;
                     results.insert(new_value);
+                }
+            }
+        };
+
+        // Try opcode-specific rules for this value's opcode.
+        if let Some(op) = value_opcode {
+            // Clone the index list to avoid holding a borrow on
+            // `self.rules_by_opcode` while calling `try_rule`, which
+            // mutates other fields of `self`.  The indices list is small.
+            if let Some(idx_list) = self.rules_by_opcode.get(&op).cloned() {
+                for idx in idx_list {
+                    let rule = &rules[idx];
+                    try_rule(self, rule, dfg);
                 }
             }
         }
 
+        // Then try unconstrained rules (Or / Var / Where / AnyConstant).
+        let unconstrained = self.unconstrained_rule_indices.clone();
+        for idx in unconstrained {
+            let rule = &rules[idx];
+            try_rule(self, rule, dfg);
+        }
+
+        self.library.rules = rules;
         results
     }
 

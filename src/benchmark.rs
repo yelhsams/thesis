@@ -549,18 +549,21 @@ fn run_one(clif: &str, path_sensitive: bool) -> usize {
 }
 
 /// Run the full compilation pipeline (parse + domtree + egraph pass) once
-/// and return `(instruction_cost, wall_clock_time)`.  Used by the timing
-/// benchmark to compare `path_sensitive = true` vs `false`.
-fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration) {
+/// and return `(instruction_cost, wall_clock_time, run_only_time)`.  The
+/// `run_only_time` measures only `EgraphPass::run()` so we can isolate the
+/// optimization wall-clock cost from parse + domtree construction.
+fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration, Duration) {
     let (dfg, layout) = parse_clif(clif).expect("parse");
     let start = Instant::now();
     let domtree = DominatorTree::from_layout(&layout, &dfg);
     let mut pass = EgraphPass::new(dfg, layout, domtree);
     pass.set_path_sensitive(path_sensitive);
+    let run_start = Instant::now();
     pass.run();
+    let run_only = run_start.elapsed();
     let elapsed = start.elapsed();
     let cost = count_insts(&pass.layout, &pass.dfg);
-    (cost, elapsed)
+    (cost, elapsed, run_only)
 }
 
 /// Timing benchmark: runs each suite (baseline + path-sensitive) through the
@@ -575,18 +578,21 @@ pub fn time_benchmarks() {
 
     fn bench_suite(name: &str, suite: &[TestCase]) -> (Duration, Duration, usize, usize) {
         println!(
-            "\n=== {} suite ({} tests) ===\n{:<24} {:>12} {:>12} {:>10}",
+            "\n=== {} suite ({} tests) ===\n{:<24} {:>12} {:>12} {:>12} {:>12}",
             name,
             suite.len(),
             "test",
-            "ps (µs)",
-            "base (µs)",
-            "speedup"
+            "ps total µs",
+            "base total µs",
+            "ps run µs",
+            "base run µs",
         );
-        println!("{}", "-".repeat(62));
+        println!("{}", "-".repeat(80));
 
         let mut tot_ps = Duration::ZERO;
         let mut tot_base = Duration::ZERO;
+        let mut tot_ps_run = Duration::ZERO;
+        let mut tot_base_run = Duration::ZERO;
         let mut cost_ps = 0usize;
         let mut cost_base = 0usize;
 
@@ -597,53 +603,61 @@ pub fn time_benchmarks() {
 
             let mut best_ps = Duration::MAX;
             let mut best_base = Duration::MAX;
+            let mut best_ps_run = Duration::MAX;
+            let mut best_base_run = Duration::MAX;
             let mut last_cost_ps = 0usize;
             let mut last_cost_base = 0usize;
             for _ in 0..REPS {
-                let (c, t) = time_one(tc.clif, true);
+                let (c, t, run_t) = time_one(tc.clif, true);
                 if t < best_ps {
                     best_ps = t;
                 }
+                if run_t < best_ps_run {
+                    best_ps_run = run_t;
+                }
                 last_cost_ps = c;
-                let (c, t) = time_one(tc.clif, false);
+                let (c, t, run_t) = time_one(tc.clif, false);
                 if t < best_base {
                     best_base = t;
+                }
+                if run_t < best_base_run {
+                    best_base_run = run_t;
                 }
                 last_cost_base = c;
             }
 
             let ps_us = best_ps.as_secs_f64() * 1e6;
             let base_us = best_base.as_secs_f64() * 1e6;
-            let speedup = if ps_us > 0.0 { base_us / ps_us } else { 0.0 };
+            let ps_run_us = best_ps_run.as_secs_f64() * 1e6;
+            let base_run_us = best_base_run.as_secs_f64() * 1e6;
             println!(
-                "{:<24} {:>12.2} {:>12.2} {:>9.2}x",
-                tc.name, ps_us, base_us, speedup
+                "{:<24} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
+                tc.name, ps_us, base_us, ps_run_us, base_run_us
             );
 
             tot_ps += best_ps;
             tot_base += best_base;
+            tot_ps_run += best_ps_run;
+            tot_base_run += best_base_run;
             cost_ps += last_cost_ps;
             cost_base += last_cost_base;
         }
 
-        println!("{}", "-".repeat(62));
+        println!("{}", "-".repeat(80));
         let tot_ps_us = tot_ps.as_secs_f64() * 1e6;
         let tot_base_us = tot_base.as_secs_f64() * 1e6;
-        let tot_speedup = if tot_ps_us > 0.0 {
-            tot_base_us / tot_ps_us
-        } else {
-            0.0
-        };
+        let tot_ps_run_us = tot_ps_run.as_secs_f64() * 1e6;
+        let tot_base_run_us = tot_base_run.as_secs_f64() * 1e6;
         println!(
-            "{:<24} {:>12.2} {:>12.2} {:>9.2}x",
-            "TOTAL", tot_ps_us, tot_base_us, tot_speedup
+            "{:<24} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
+            "TOTAL", tot_ps_us, tot_base_us, tot_ps_run_us, tot_base_run_us
         );
         println!(
             "  final cost: ps={} baseline={} (lower = better)",
             cost_ps, cost_base
         );
 
-        (tot_ps, tot_base, cost_ps, cost_base)
+        (tot_ps_run, tot_base_run, cost_ps, cost_base)
     }
 
     let (base_ps, base_base, bc_ps, bc_base) = bench_suite("BASELINE", BASELINE_TESTS);
