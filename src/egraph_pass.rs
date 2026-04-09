@@ -120,6 +120,19 @@ impl EgraphPass {
         self.rebuild_layout();
         self.check_no_unions();
 
+        // Global CSE + Global Code Motion.
+        //
+        // The scoped-GVN construction in `remove_pure_and_optimize` keeps
+        // equivalence classes dominator-local: when both arms of a diamond
+        // compute the same pure expression, the two copies live in separate
+        // scopes and never merge.  This pass walks the whole function,
+        // deduplicates structurally-equivalent pure instructions, then
+        // hoists each canonical instruction to the lowest common ancestor
+        // (in the dominator tree) of all its users.  The existing CFG
+        // cleanups (simplify_trivial_blocks + simplify_redundant_brif) then
+        // collapse the empty arms.
+        self.global_cse_and_gcm();
+
         // CFG cleanups (separate from aegraph construction)
         for _ in 0..4 {
             self.eliminate_dead_blocks();
@@ -1136,23 +1149,20 @@ impl EgraphPass {
                                 }
                                 available_block.insert(union_node, block);
                                 self.stats.union += 1;
-                            } else if !all_agree && self.path_sensitive {
-                                for &(pred, resolved_incoming) in &resolved {
-                                    if resolved_incoming == param {
-                                        continue;
-                                    }
-                                    let assumptions = build_edge_assumptions_inline(
-                                        pred,
-                                        block,
-                                        &block_edge_conditions,
-                                    );
-                                    self.dfg.make_conditional_union(
-                                        param,
-                                        resolved_incoming,
-                                        assumptions,
-                                    );
-                                }
                             }
+                            // Note: we intentionally do NOT create conditional
+                            // unions for the disagreement case.  At a merge
+                            // block, incoming edges from unconditional jumps
+                            // carry no range facts, so the resulting union
+                            // would have an empty assumption set and be
+                            // treated as globally valid.  That's unsound
+                            // (v_param is only equal to one specific incoming
+                            // per path) AND corrupts `consider_conditional_unions`
+                            // during best-cost computation: looking up the
+                            // incoming value finds the phi param as an
+                            // equivalent candidate with Cost::ZERO, which
+                            // blocks range-conditioned rewrites like
+                            // sdiv→ushr from being selected.
                         }
                     }
 
@@ -1434,25 +1444,480 @@ impl EgraphPass {
         self.block_entry_facts = block_entry_facts;
         self.cfg_preds = cfg_preds;
     }
-}
 
-/// Build an `AssumptionSet` capturing the range facts that hold on the edge
-/// from `pred` to `target`, reading from the local `block_edge_conditions` map.
-fn build_edge_assumptions_inline(
-    pred: BlockId,
-    target: BlockId,
-    edge_conditions: &HashMap<(BlockId, BlockId), Vec<(ValueId, Option<i64>, Opcode, bool)>>,
-) -> AssumptionSet {
-    let mut assumptions = Vec::new();
-    if let Some(conditions) = edge_conditions.get(&(pred, target)) {
-        for &(lhs, rhs_const, opcode, is_true_branch) in conditions {
-            let facts = learn_from_comparison(opcode, lhs, rhs_const, is_true_branch);
-            for (value, range) in facts {
-                assumptions.push((value, range));
+    /// Post-elaboration global CSE + global code motion.
+    ///
+    /// Walks the function after scoped-GVN elaboration, deduplicates
+    /// structurally-equivalent pure instructions across the whole CFG, then
+    /// hoists each canonical pure instruction to the lowest common ancestor
+    /// (in the dominator tree) of all its users.  This recovers equivalences
+    /// that the dominator-local GVN misses (for example, both arms of a
+    /// diamond computing the same pure expression).
+    fn global_cse_and_gcm(&mut self) {
+        // Compute a domtree preorder over the current layout's reachable
+        // blocks. We use this for both CSE (prefer earlier/dominating insts
+        // as the canonical representative) and as an iteration order.
+        let entry = match self.layout.entry_block() {
+            Some(b) => b,
+            None => return,
+        };
+        let preorder: Vec<BlockId> = {
+            let mut result = Vec::new();
+            let mut stack = vec![entry];
+            while let Some(b) = stack.pop() {
+                if !self.layout.block_data.contains_key(&b) {
+                    continue;
+                }
+                result.push(b);
+                for &c in self.domtree.children(b).iter().rev() {
+                    stack.push(c);
+                }
+            }
+            result
+        };
+        let in_layout: HashSet<BlockId> = preorder.iter().copied().collect();
+
+        // ----- Phase 1: global CSE -----
+        //
+        // Iterate to a fixed point.  Each pass walks every pure instruction
+        // in domtree preorder, builds a structural key from its opcode,
+        // type, immediate, and resolved argument list, and de-duplicates
+        // against earlier (dominating) instructions.  Canonicalization of
+        // inner values exposes further equivalences, hence the loop.
+        let mut value_map: HashMap<ValueId, ValueId> = HashMap::new();
+        fn resolve(vm: &HashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
+            let mut guard = 0usize;
+            while let Some(&next) = vm.get(&v) {
+                if next == v || guard > 1024 {
+                    break;
+                }
+                v = next;
+                guard += 1;
+            }
+            v
+        }
+
+        for _iter in 0..16 {
+            let mut changed = false;
+            let mut by_key: HashMap<(Opcode, Type, Option<i64>, Vec<ValueId>), ValueId> =
+                HashMap::new();
+            for &block_id in &preorder {
+                let block_insts = self.layout.block_data[&block_id].insts.clone();
+                for inst_id in block_insts {
+                    let inst = self.dfg.insts[&inst_id].clone();
+                    if !inst.opcode.is_pure() {
+                        continue;
+                    }
+                    let result = match self.dfg.inst_results(inst_id).first().copied() {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    // Skip if this value has already been canonicalized to
+                    // someone else — its defining inst is now redundant and
+                    // will be dropped below.
+                    if let Some(&c) = value_map.get(&result) {
+                        if c != result {
+                            continue;
+                        }
+                    }
+                    let resolved_args: Vec<ValueId> =
+                        inst.args.iter().map(|&a| resolve(&value_map, a)).collect();
+                    let key = (inst.opcode, inst.ty, inst.immediate, resolved_args);
+                    if let Some(&canonical) = by_key.get(&key) {
+                        if canonical != result {
+                            value_map.insert(result, canonical);
+                            changed = true;
+                        }
+                    } else {
+                        by_key.insert(key, result);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // ----- Phase 2: apply `value_map` to every instruction's args -----
+        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
+        for inst_id in all_insts {
+            let mut inst = self.dfg.insts[&inst_id].clone();
+            let mut changed = false;
+            for arg in &mut inst.args {
+                let canonical = resolve(&value_map, *arg);
+                if canonical != *arg {
+                    *arg = canonical;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.dfg.insts.insert(inst_id, inst);
+            }
+        }
+
+        // ----- Phase 3: drop the now-redundant pure insts from block lists -----
+        for &block_id in &preorder {
+            let block = self.layout.block_data.get_mut(&block_id).unwrap();
+            block.insts.retain(|&iid| {
+                let inst = &self.dfg.insts[&iid];
+                if !inst.opcode.is_pure() {
+                    return true;
+                }
+                let result = match self.dfg.inst_results(iid).first().copied() {
+                    Some(r) => r,
+                    None => return true,
+                };
+                // Keep only instructions whose result is the canonical
+                // representative of its equivalence class.
+                resolve(&value_map, result) == result
+            });
+        }
+
+        // ----- Phase 4: global code motion -----
+        //
+        // For each pure inst, compute a "target" block = LCA (in the
+        // dominator tree) of its user targets/blocks.  We iterate to a
+        // fixed point so that hoisting a consumer inst also propagates up
+        // through its pure-inst arguments (e.g. hoisting an `iadd` to a
+        // diamond's dominator pulls the `iconst` along with it).  After
+        // convergence, we apply moves only for insts whose target strictly
+        // hoists them AND whose arg-defining blocks all dominate the new
+        // placement.  If the arg check fails, we leave the inst where it
+        // is — `finalize_gcm_validity` will then clone the arg-defining
+        // inst locally to restore SSA dominance.
+        let mut inst_block: HashMap<InstId, BlockId> = HashMap::new();
+        for &block_id in &preorder {
+            for &iid in &self.layout.block_data[&block_id].insts {
+                inst_block.insert(iid, block_id);
+            }
+        }
+
+        // value -> defining InstId (for pure insts currently placed in a
+        // block).  Stable across the iteration since neither CSE nor GCM
+        // creates new insts.
+        let mut def_of: HashMap<ValueId, InstId> = HashMap::new();
+        for (&iid, _) in &inst_block {
+            for &r in self.dfg.inst_results(iid) {
+                def_of.insert(r, iid);
+            }
+        }
+
+        // Pre-compute per-inst list of (user_kind) — either a pure InstId
+        // (whose target participates in LCA propagation) or a fixed block
+        // (skeleton use).  Built once from the post-CSE layout and reused
+        // across GCM iterations.
+        enum UserKind {
+            PureInst(InstId),
+            FixedBlock(BlockId),
+        }
+        let mut users_of: HashMap<InstId, Vec<UserKind>> = HashMap::new();
+        for &block_id in &preorder {
+            let block = &self.layout.block_data[&block_id];
+            for &user_id in &block.insts {
+                let user = &self.dfg.insts[&user_id];
+                let user_is_pure = user.opcode.is_pure();
+                for &arg in &user.args {
+                    if let Some(&def_id) = def_of.get(&arg) {
+                        if def_id == user_id {
+                            continue;
+                        }
+                        let entry = users_of.entry(def_id).or_default();
+                        if user_is_pure {
+                            entry.push(UserKind::PureInst(user_id));
+                        } else {
+                            entry.push(UserKind::FixedBlock(block_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize target = current block for each pure inst.
+        let mut target: HashMap<InstId, BlockId> = HashMap::new();
+        for (&iid, &b) in &inst_block {
+            if self.dfg.insts[&iid].opcode.is_pure() {
+                target.insert(iid, b);
+            }
+        }
+
+        // Iterate until fixed point.  Because LCA only moves targets UP
+        // (closer to entry) in the domtree and the depth is bounded, this
+        // is guaranteed to converge.
+        for _iter in 0..64 {
+            let mut changed = false;
+            // Process in reverse preorder so consumers settle before args.
+            let pure_list: Vec<InstId> = preorder
+                .iter()
+                .rev()
+                .flat_map(|&b| self.layout.block_data[&b].insts.clone())
+                .filter(|&iid| self.dfg.insts[&iid].opcode.is_pure())
+                .collect();
+            for inst_id in pure_list {
+                let Some(users) = users_of.get(&inst_id) else {
+                    continue;
+                };
+                if users.is_empty() {
+                    continue;
+                }
+                // Gather user blocks (using current targets for pure users).
+                let mut iter = users.iter().filter_map(|uk| match uk {
+                    UserKind::PureInst(iid) => target.get(iid).copied(),
+                    UserKind::FixedBlock(b) => Some(*b),
+                });
+                let first = match iter.next() {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let mut lca = first;
+                let mut ok = true;
+                for b in iter {
+                    match self.domtree.lca(lca, b) {
+                        Some(l) => lca = l,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || !in_layout.contains(&lca) {
+                    continue;
+                }
+                let entry_target = target.entry(inst_id).or_insert(lca);
+                if *entry_target != lca {
+                    *entry_target = lca;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Apply the computed targets.  For each inst, check that its arg
+        // sources all dominate the target block.  If any arg is in an
+        // incompatible block (e.g. CSE canonicalized across a diamond and
+        // the corresponding inst couldn't be hoisted), revert the move for
+        // this inst — the subsequent `finalize_gcm_validity` pass will
+        // duplicate the arg-def inst where needed to restore SSA.
+        for (&inst_id, &new_block) in target.clone().iter() {
+            let current = match inst_block.get(&inst_id).copied() {
+                Some(b) => b,
+                None => continue,
+            };
+            if new_block == current {
+                continue;
+            }
+            if !self.domtree.block_dominates(new_block, current) {
+                continue; // we only hoist, never sink
+            }
+            // Arg check: every arg's source block must dominate new_block.
+            let inst = self.dfg.insts[&inst_id].clone();
+            let mut valid = true;
+            for &arg in &inst.args {
+                let src = match self.dfg.value_def(arg) {
+                    ValueDef::BlockParam(b, _) => Some(b),
+                    ValueDef::Inst(def_id) => target
+                        .get(&def_id)
+                        .copied()
+                        .or_else(|| inst_block.get(&def_id).copied()),
+                    ValueDef::Union(_, _) => None,
+                };
+                if let Some(sb) = src {
+                    if !self.domtree.block_dominates(sb, new_block) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+            // Move.
+            let cur_block = self.layout.block_data.get_mut(&current).unwrap();
+            cur_block.insts.retain(|&i| i != inst_id);
+            self.layout
+                .block_data
+                .get_mut(&new_block)
+                .unwrap()
+                .insts
+                .push(inst_id);
+            inst_block.insert(inst_id, new_block);
+        }
+
+        // Finalize validity: if any inst references an arg whose defining
+        // inst is in a block that doesn't dominate the user's block, CSE
+        // produced an unsound canonicalization that GCM couldn't fix.
+        // Duplicate the arg-def inst locally in the user's block.  Iterate
+        // until a fixed point; fresh duplicates may themselves need args.
+        for _ in 0..16 {
+            let mut changed = false;
+            let blocks_snapshot: Vec<BlockId> = preorder.clone();
+            for &block_id in &blocks_snapshot {
+                let block_insts = self.layout.block_data[&block_id].insts.clone();
+                for user_id in block_insts {
+                    let user = self.dfg.insts[&user_id].clone();
+                    let mut new_args = user.args.clone();
+                    let mut any_fix = false;
+                    for arg in new_args.iter_mut() {
+                        if let ValueDef::Inst(def_id) = self.dfg.value_def(*arg) {
+                            if !self.dfg.insts[&def_id].opcode.is_pure() {
+                                continue;
+                            }
+                            let def_block = match inst_block.get(&def_id).copied() {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            if self.domtree.block_dominates(def_block, block_id) {
+                                continue;
+                            }
+                            // Clone the defining instruction into this block.
+                            let orig = self.dfg.insts[&def_id].clone();
+                            let new_inst_id = self.dfg.make_inst(orig.clone());
+                            let new_result = self.dfg.make_inst_result(new_inst_id, orig.ty);
+                            // Place in user's block (topo sort handles order).
+                            self.layout
+                                .block_data
+                                .get_mut(&block_id)
+                                .unwrap()
+                                .insts
+                                .push(new_inst_id);
+                            inst_block.insert(new_inst_id, block_id);
+                            for &r in self.dfg.inst_results(new_inst_id) {
+                                def_of.insert(r, new_inst_id);
+                            }
+                            *arg = new_result;
+                            any_fix = true;
+                            changed = true;
+                        }
+                    }
+                    if any_fix {
+                        let mut u = self.dfg.insts[&user_id].clone();
+                        u.args = new_args;
+                        self.dfg.insts.insert(user_id, u);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // ----- Phase 5: topologically sort each block's instruction list -----
+        for &block_id in &preorder {
+            let sorted = self.topo_sort_block_insts(block_id);
+            self.layout.block_data.get_mut(&block_id).unwrap().insts = sorted;
+        }
+
+        // ----- Phase 6: remove dead pure insts (no user in the function) -----
+        loop {
+            let mut used: HashSet<ValueId> = HashSet::new();
+            for &block_id in &preorder {
+                for &iid in &self.layout.block_data[&block_id].insts {
+                    for &arg in &self.dfg.insts[&iid].args {
+                        used.insert(arg);
+                    }
+                }
+            }
+            let mut removed_any = false;
+            for &block_id in &preorder {
+                let insts = self.layout.block_data[&block_id].insts.clone();
+                let mut keep = Vec::with_capacity(insts.len());
+                for iid in insts {
+                    let inst = &self.dfg.insts[&iid];
+                    if !inst.opcode.is_pure() {
+                        keep.push(iid);
+                        continue;
+                    }
+                    let result = self.dfg.inst_results(iid).first().copied();
+                    if result.map(|r| used.contains(&r)).unwrap_or(true) {
+                        keep.push(iid);
+                    } else {
+                        removed_any = true;
+                    }
+                }
+                self.layout.block_data.get_mut(&block_id).unwrap().insts = keep;
+            }
+            if !removed_any {
+                break;
             }
         }
     }
-    AssumptionSet { assumptions }
+
+    /// Topologically sort the instructions currently assigned to `block_id`
+    /// so that every instruction's args are defined before it is used.  The
+    /// single terminator (branch/return) is always emitted last.
+    fn topo_sort_block_insts(&self, block_id: BlockId) -> Vec<InstId> {
+        let block = &self.layout.block_data[&block_id];
+        if block.insts.is_empty() {
+            return Vec::new();
+        }
+        let inst_set: HashSet<InstId> = block.insts.iter().copied().collect();
+
+        // Identify the terminator (pinned to the end).
+        let terminator = block
+            .insts
+            .iter()
+            .rev()
+            .find(|&&iid| {
+                let inst = &self.dfg.insts[&iid];
+                inst.opcode.is_terminator() || inst.branch_info.is_some()
+            })
+            .copied();
+
+        // Value -> defining inst, restricted to this block.
+        let mut def_map: HashMap<ValueId, InstId> = HashMap::new();
+        for &iid in &block.insts {
+            for &r in self.dfg.inst_results(iid) {
+                def_map.insert(r, iid);
+            }
+        }
+
+        let mut in_deg: HashMap<InstId, usize> = HashMap::new();
+        let mut dependents: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        for &iid in &block.insts {
+            in_deg.insert(iid, 0);
+        }
+        for &iid in &block.insts {
+            let inst = &self.dfg.insts[&iid];
+            for &arg in &inst.args {
+                if let Some(&def_id) = def_map.get(&arg) {
+                    if def_id != iid && inst_set.contains(&def_id) {
+                        dependents.entry(def_id).or_default().push(iid);
+                        *in_deg.get_mut(&iid).unwrap() += 1;
+                    }
+                }
+            }
+        }
+
+        // Kahn's algorithm.  Pop smallest InstId first for determinism and
+        // defer the terminator until all others are scheduled.
+        let mut ready: Vec<InstId> = in_deg
+            .iter()
+            .filter(|(&iid, &d)| d == 0 && Some(iid) != terminator)
+            .map(|(&iid, _)| iid)
+            .collect();
+        ready.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut result: Vec<InstId> = Vec::with_capacity(block.insts.len());
+        while let Some(iid) = ready.pop() {
+            result.push(iid);
+            if let Some(deps) = dependents.get(&iid) {
+                for &dep in deps {
+                    let d = in_deg.get_mut(&dep).unwrap();
+                    *d -= 1;
+                    if *d == 0 && Some(dep) != terminator {
+                        ready.push(dep);
+                    }
+                }
+                ready.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+        }
+
+        if let Some(t) = terminator {
+            result.push(t);
+        }
+        result
+    }
 }
 
 /// Context for optimization

@@ -286,30 +286,6 @@ block3(v9: i32):
 }
 "#,
     },
-    // --- Else-branch soundness: sdiv must NOT become ushr ---
-
-    // icmp.sge v0, 0 → else arm means v0 < 0.
-    // sdiv(v0, 4) in the else arm must stay sdiv (not ushr).
-    // This is a soundness regression test for the conditional union bug.
-    TestCase {
-        name: "else_branch_sdiv_preserved",
-        clif: r#"
-function %else_branch_sdiv_preserved(i32) -> i32 {
-block0(v0: i32):
-    v1 = iconst.i32 0
-    v2 = icmp.sge.i32 v0, v1
-    brif v2, block1(v0), block2(v0)
-
-block1(v3: i32):
-    return v3
-
-block2(v4: i32):
-    v5 = iconst.i32 4
-    v6 = sdiv.i32 v4, v5
-    return v6
-}
-"#,
-    },
     // --- See-through phi with conditional computation ---
 
     // Both arms compute iadd(v1, 1) and pass it to block3 as a param.

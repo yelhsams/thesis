@@ -267,6 +267,38 @@ impl DominatorTree {
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
+
+    /// Return the immediate dominator of `block`, if any.  The entry block
+    /// has no immediate dominator and returns `None`.
+    pub fn idom_of(&self, block: BlockId) -> Option<BlockId> {
+        self.idom.get(&block).copied()
+    }
+
+    /// Compute the lowest common ancestor of `a` and `b` in the dominator
+    /// tree — the deepest block that dominates both.  Returns `None` if the
+    /// two blocks don't share a common ancestor (shouldn't happen for a
+    /// well-formed domtree with a single entry).
+    pub fn lca(&self, a: BlockId, b: BlockId) -> Option<BlockId> {
+        if self.block_dominates(a, b) {
+            return Some(a);
+        }
+        if self.block_dominates(b, a) {
+            return Some(b);
+        }
+        // Walk up from `a` until we find a block that dominates `b`.
+        let mut cur = a;
+        for _ in 0..4096 {
+            let parent = self.idom.get(&cur).copied()?;
+            if parent == cur {
+                return None;
+            }
+            if self.block_dominates(parent, b) {
+                return Some(parent);
+            }
+            cur = parent;
+        }
+        None
+    }
 }
 
 /// Scoped hash map for GVN (Global Value Numbering)
