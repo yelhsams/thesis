@@ -511,9 +511,7 @@ block0(v0: i32, v1: i32):
     },
 ];
 
-pub const TEST_CASES: &[TestCase] = PATH_SENSITIVE_TESTS;
-
-fn count_insts(layout: &Layout, dfg: &DataFlowGraph) -> usize {
+fn calc_inst_cost(layout: &Layout, dfg: &DataFlowGraph) -> usize {
     use crate::elaborate::{CostModel, DefaultCostModel};
     let model = DefaultCostModel;
     layout
@@ -545,7 +543,7 @@ fn run_one(clif: &str, path_sensitive: bool) -> usize {
         .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
     println!("\nOptimized CLIF:\n{}", output);
 
-    count_insts(&pass.layout, &pass.dfg)
+    calc_inst_cost(&pass.layout, &pass.dfg)
 }
 
 /// Run the full compilation pipeline (parse + domtree + egraph pass) once
@@ -562,7 +560,7 @@ fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration, Duration) {
     pass.run();
     let run_only = run_start.elapsed();
     let elapsed = start.elapsed();
-    let cost = count_insts(&pass.layout, &pass.dfg);
+    let cost = calc_inst_cost(&pass.layout, &pass.dfg);
     (cost, elapsed, run_only)
 }
 
@@ -701,6 +699,16 @@ pub fn time_benchmarks() {
     );
 }
 
+fn run_tests(tests: &[TestCase]) {
+    for tc in tests {
+        let (dfg, layout) = parse_clif(tc.clif).expect("parse");
+        let input = calc_inst_cost(&layout, &dfg);
+        let ps = run_one(tc.clif, true);
+        let base = run_one(tc.clif, false);
+        println!("{:<22} {:>8} {:>10} {:>10}", tc.name, input, ps, base);
+    }
+}
+
 /// Run the entire benchmark suite, comparing path-sensitive vs baseline.
 #[test]
 pub fn run_benchmarks() {
@@ -708,35 +716,7 @@ pub fn run_benchmarks() {
         "\n{:<22} {:>8} {:>10} {:>10}",
         "test", "input", "ps", "baseline"
     );
-    println!("{}", "-".repeat(54));
 
-    let (mut tot_in, mut tot_ps, mut tot_base) = (0usize, 0usize, 0usize);
-
-    for tc in TEST_CASES {
-        let (dfg, layout) = parse_clif(tc.clif).expect("parse");
-        let input = count_insts(&layout, &dfg);
-        let ps = run_one(tc.clif, true);
-        let base = run_one(tc.clif, false);
-        println!("{:<22} {:>8} {:>10} {:>10}", tc.name, input, ps, base);
-        tot_in += input;
-        tot_ps += ps;
-        tot_base += base;
-    }
-
-    println!("{}", "-".repeat(54));
-    println!(
-        "{:<22} {:>8} {:>10} {:>10}",
-        "TOTAL", tot_in, tot_ps, tot_base
-    );
-    let pct = |x: usize| 100.0 * (tot_in - x) as f64 / tot_in as f64;
-    println!(
-        "\nps reduction:       {} insts ({:.1}%)",
-        tot_in - tot_ps,
-        pct(tot_ps)
-    );
-    println!(
-        "baseline reduction: {} insts ({:.1}%)",
-        tot_in - tot_base,
-        pct(tot_base)
-    );
+    run_tests(PATH_SENSITIVE_TESTS);
+    run_tests(BASELINE_TESTS);
 }

@@ -1640,10 +1640,19 @@ impl EgraphPass {
         // placement.  If the arg check fails, we leave the inst where it
         // is — `finalize_gcm_validity` will then clone the arg-defining
         // inst locally to restore SSA dominance.
+        // `rebuild_layout` may place the same `InstId` into multiple blocks'
+        // instruction lists (any block that uses a value pulls its defining
+        // pure inst into its own list for display/elaboration purposes).
+        // For GCM we want each inst to have a single canonical "home" block,
+        // and that home must be the *dominating* placement — otherwise the
+        // move phase below would treat the inst as if it lived in a
+        // non-dominating block and uselessly migrate it, dropping the
+        // duplicate references the CFG cleanup passes rely on.  Walking in
+        // domtree preorder and using `or_insert` picks the highest block.
         let mut inst_block: FxHashMap<InstId, BlockId> = FxHashMap::default();
         for &block_id in &preorder {
             for &iid in &self.layout.block_data[&block_id].insts {
-                inst_block.insert(iid, block_id);
+                inst_block.entry(iid).or_insert(block_id);
             }
         }
 
