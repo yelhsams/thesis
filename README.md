@@ -4,12 +4,14 @@ By Ashley Sheng ('26)
 
 ## Description
 
-Prototype of a integer-scoped version of [Cranelift](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift).
+Prototype of [Cranelift's](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift) mid-end optimizer.
+
+Scoped to integer-types, and introduces context-aware (path-sensitive) mechanisms to introduce a strictly larger class of optimizations.
 
 Additions include:
-* range analysis
-* conditional unions
-* context-aware extraction/elaboration
+* Scoped range assumptions
+* Conditional unions
+* Context-aware extraction/elaboration
 
 ## How To Run Benchmarks
 ```cargo test --release time_benchmarks -- --nocapture```
