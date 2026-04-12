@@ -2,9 +2,6 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-/// Simplified dominator tree
-///
-/// should be computed from CFG, but now use simple interface.
 #[derive(Debug, Clone)]
 pub struct DominatorTree {
     /// Maps block to its immediate dominator
@@ -61,8 +58,7 @@ impl DominatorTree {
     /// Build a dominator tree from an explicit CFG.
     ///
     /// `root` is the entry block.  `edges` maps each block to its
-    /// dominator-tree *children* (not CFG successors).  This is a
-    /// convenience for tests where the dominator tree shape is known.
+    /// dominator-tree *children*
     pub fn from_cfg(root: BlockId, edges: &[(BlockId, Vec<BlockId>)]) -> Self {
         let mut tree = Self::new();
 
@@ -104,9 +100,6 @@ impl DominatorTree {
     }
 
     /// Build a proper dominator tree from the CFG defined by the layout and DFG.
-    ///
-    /// Extracts successor edges from branch instructions and computes
-    /// dominators using the iterative algorithm (Cooper-Harvey-Kennedy).
     pub fn from_layout(layout: &Layout, dfg: &DataFlowGraph) -> Self {
         let entry = match layout.entry_block() {
             Some(b) => b,
@@ -268,16 +261,13 @@ impl DominatorTree {
             .unwrap_or(&[])
     }
 
-    /// Return the immediate dominator of `block`, if any.  The entry block
-    /// has no immediate dominator and returns `None`.
+    /// Return the immediate dominator of `block`, if any.
     pub fn idom_of(&self, block: BlockId) -> Option<BlockId> {
         self.idom.get(&block).copied()
     }
 
     /// Compute the lowest common ancestor of `a` and `b` in the dominator
-    /// tree — the deepest block that dominates both.  Returns `None` if the
-    /// two blocks don't share a common ancestor (shouldn't happen for a
-    /// well-formed domtree with a single entry).
+    /// tree — the deepest block that dominates both.
     pub fn lca(&self, a: BlockId, b: BlockId) -> Option<BlockId> {
         if self.block_dominates(a, b) {
             return Some(a);
@@ -303,14 +293,7 @@ impl DominatorTree {
 
 /// Scoped hash map for GVN (Global Value Numbering)
 ///
-/// This is a hash map with scope levels. When you increment depth,
-/// you create a new scope. Values inserted at this depth are only
-/// visible at this depth and deeper. When you decrement, those
-/// values become invisible again.
-///
-/// This is crucial for the egraph pass because it allows us to
-/// do GVN that respects dominance: a value is only available
-/// in blocks it dominates.
+/// This is a hash map with scope levels.
 pub struct ScopedHashMap<K, V> {
     /// The underlying map
     map: HashMap<K, Vec<(usize, V)>>,
@@ -373,19 +356,6 @@ impl<K: Eq + Hash + Clone, V: Clone> ScopedHashMap<K, V> {
             .push((self.depth, value));
     }
 
-    /// Insert a value at a specific depth (used for LICM-style hoisting)
-    pub fn insert_at_depth(&mut self, key: K, value: V, depth: usize) {
-        assert!(
-            depth <= self.depth,
-            "Cannot insert at depth > current depth"
-        );
-        self.map
-            .entry(key)
-            .or_insert_with(Vec::new)
-            .push((depth, value));
-    }
-
-    /// Entry API for scoped hash map
     pub fn entry(&mut self, key: K) -> ScopedEntry<'_, K, V> {
         if self.get(&key).is_some() {
             ScopedEntry::Occupied(OccupiedEntry { map: self, key })
@@ -419,44 +389,5 @@ pub struct VacantEntry<'a, K, V> {
 impl<'a, K: Eq + Hash + Clone, V: Clone> VacantEntry<'a, K, V> {
     pub fn insert(self, value: V) {
         self.map.insert(self.key, value);
-    }
-}
-
-/// Simple alias map for value canonicalization
-#[derive(Debug, Clone)]
-pub struct ValueAliases {
-    /// Maps value to its canonical representative
-    /// If not present, value is its own canonical form
-    aliases: HashMap<ValueId, ValueId>,
-}
-
-impl ValueAliases {
-    pub fn new() -> Self {
-        Self {
-            aliases: HashMap::new(),
-        }
-    }
-
-    /// Find the canonical representative (non-mutating)
-    pub fn resolve(&self, mut value: ValueId) -> ValueId {
-        // Follow alias chain to canonical value
-        while let Some(&next) = self.aliases.get(&value) {
-            if next == value {
-                break; // Prevent infinite loops
-            }
-            value = next;
-        }
-        value
-    }
-
-    /// Alias one value to another (always making b canonical)
-    pub fn union(&mut self, a: ValueId, b: ValueId) {
-        let a_canonical = self.resolve(a);
-        let b_canonical = self.resolve(b);
-
-        if a_canonical != b_canonical {
-            // Make b the canonical representative
-            self.aliases.insert(a_canonical, b_canonical);
-        }
     }
 }

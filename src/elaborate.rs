@@ -4,7 +4,6 @@
 //! expressions, we need to:
 //! 1. Select the "best" form of each value
 //! 2. Place those instructions back into the CFG layout
-//! 3. Perform code motion (LICM, rematerialization, etc.)
 
 use crate::range::RangeAssumptions;
 use crate::support::*;
@@ -12,7 +11,6 @@ use crate::types::*;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 
-/// Cost of an operation (for extraction)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cost(pub u32);
 
@@ -83,11 +81,6 @@ pub struct Elaborator<'a> {
     elaborated_cache: HashMap<(ValueId, BlockId), ValueId>,
 
     /// Mutable range assumptions active at the current extraction site.
-    ///
-    /// When set, conditional unions whose `AssumptionSet` is entailed by
-    /// these assumptions are included as additional candidates during cost
-    /// computation and value elaboration. The elaborator pushes/pops scopes
-    /// as it walks the dominator tree.
     pub range_assumptions: Option<&'a mut RangeAssumptions>,
 
     /// Block entry facts per CFG edge, used to apply range assumptions
@@ -98,17 +91,12 @@ pub struct Elaborator<'a> {
     cfg_preds: &'a FxHashMap<BlockId, Vec<BlockId>>,
 
     /// Per-domtree-level sets of `ValueId`s whose `best_value_cache` entries
-    /// were inserted or modified at that level. On `Pop`, these entries are
-    /// removed so that branch-local conditional-union results don't leak to
-    /// sibling branches.
+    /// were inserted or modified at that level.
     cache_scope_stack: Vec<HashSet<ValueId>>,
 
-    /// Statistics
     stats: &'a mut Stats,
 }
 
-/// Empty statics used as defaults when no block_entry_facts / cfg_preds are
-/// provided (e.g. in unit tests that use `Elaborator::new`).
 static EMPTY_ENTRY_FACTS: std::sync::LazyLock<
     FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
 > = std::sync::LazyLock::new(FxHashMap::default);
@@ -136,11 +124,6 @@ impl<'a> Elaborator<'a> {
     }
 
     /// Create an elaborator with range assumptions for context-aware extraction.
-    ///
-    /// When range assumptions are provided, conditional unions whose
-    /// `AssumptionSet` is entailed are included as additional candidates.
-    /// The elaborator will do a domtree-preorder walk, pushing/popping
-    /// range assumption scopes and applying block entry facts at each block.
     pub fn with_range_assumptions(
         dfg: &'a mut DataFlowGraph,
         domtree: &'a DominatorTree,
@@ -165,15 +148,12 @@ impl<'a> Elaborator<'a> {
 
     /// Main elaboration entry point.
     ///
-    /// When range assumptions are available, performs a domtree-preorder walk
-    /// (Visit/Pop stack pattern) so that conditional unions are evaluated in
-    /// the correct scoped context. Otherwise falls back to layout-order
-    /// traversal.
+    /// Performs a domtree-preorder walk (Visit/Pop stack pattern) so that
+    /// conditional unions are evaluated in the correct scoped context.
     pub fn elaborate(&mut self, layout: &Layout) {
         if self.range_assumptions.is_some() {
             self.elaborate_domtree(layout);
         } else {
-            // Legacy path: no range assumptions, plain layout-order walk.
             self.compute_best_costs();
             for &block_id in &layout.blocks {
                 self.elaborate_block(block_id, layout);
