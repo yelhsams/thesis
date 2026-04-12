@@ -71,7 +71,6 @@ mod tests {
         assert!(pass.block_entry_facts.is_empty());
     }
 
-    /// Compare optimized output to expected. Always runs.
     fn helper(original_clif: &str, expected_clif: &str) {
         let (pass, sig_params) = run_pass(original_clif);
         if baseline_mode() {
@@ -83,12 +82,6 @@ mod tests {
             .display(&pass.dfg, "test", &sig_params, Some(Type::I32));
         println!("\nOptimized CLIF:\n{}", output);
         assert_eq!(normalize(&output), normalize(expected_clif), "mismatch");
-    }
-
-    /// Like `helper`, but skip the equality check in baseline mode
-    /// (the optimization being tested requires path-sensitive analysis).
-    fn helper_ps_only(original_clif: &str, expected_clif: &str) {
-        helper(original_clif, expected_clif);
     }
 
     #[test]
@@ -141,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_conditional_constant_propagation() {
-        helper_ps_only(
+        helper(
             r#"
             function %test(i32) -> i32 {
             block0(v0: i32):
@@ -208,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_conditional_union_mod_reduction() {
-        helper_ps_only(
+        helper(
             r#"function %test(i32) -> i32 {
                 block0(v0: i32):
                     v1 = iconst.i32 4
@@ -234,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_nested_band_condition_range_propagation() {
-        helper_ps_only(
+        helper(
             r#"function %test(i32) -> i32 {
                 block0(v0: i32):
                     v1 = iconst.i32 8
@@ -263,7 +256,7 @@ mod tests {
 
     #[test]
     fn test_seeing_through_blockparam_sign_bit() {
-        helper_ps_only(
+        helper(
             r#"
             function %test(i32) -> i32 {
             block0(v0: i32):
@@ -324,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_loop_invariant_blockparam() {
-        helper_ps_only(
+        helper(
             r#"
             function %test(i32) -> i32 {
             block0(v0: i32):
