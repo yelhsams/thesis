@@ -12,10 +12,7 @@ pub struct TestCase {
 }
 
 pub const PATH_SENSITIVE_TESTS: &[TestCase] = &[
-    // --- Range-conditioned rewrites (sdiv → ushr) ---
-
     // Branch guards v0 >= 0, so sdiv(v0,2) → ushr(v0,1) in the true arm.
-    // Without path sensitivity the range is unknown and sdiv stays.
     TestCase {
         name: "sdiv2_guarded_nonneg",
         clif: r#"
@@ -61,8 +58,6 @@ block3(v9: i32):
 }
 "#,
     },
-    // --- irem elimination via range ---
-
     // Guard v0 in [0,7] via ult < 8 && sge >= 0, then irem(v0, 16) == v0.
     TestCase {
         name: "irem_subsumed_by_range",
@@ -86,10 +81,7 @@ block2(v9: i32):
 }
 "#,
     },
-    // --- Comparison folding via range ---
-
-    // Guard v0 < 10 (unsigned) && v0 >= 0 (signed).  Inside, icmp.slt v0, 100
-    // is provably true → fold to 1.
+    // Guard v0 < 10 (unsigned) && v0 >= 0 (signed).
     TestCase {
         name: "cmp_fold_slt_true",
         clif: r#"
@@ -134,8 +126,6 @@ block2(v6: i32):
 }
 "#,
     },
-    // --- Conditional unions: branch-dependent equivalences ---
-
     // icmp.eq v0, 42 → in true arm, v0 == 42, so iadd(v0, 8) → 50.
     // The else arm must keep iadd untouched.
     TestCase {
@@ -179,8 +169,6 @@ block2(v6: i32):
 }
 "#,
     },
-    // --- Conditional union with asymmetric diamond + phi ---
-
     // True arm: v0 known >= 0, sdiv(v0,4) → ushr(v0,2).
     // False arm: sdiv(v0,4) stays.
     // Both feed into a phi at block3.  The conditional union lets the
@@ -209,8 +197,6 @@ block3(v9: i32):
 }
 "#,
     },
-    // --- Singleton range from equality comparison ---
-
     // icmp.eq v0, 0 → true arm: v0 == 0, so imul(v0, v1) → 0.
     TestCase {
         name: "zero_from_eq_guard",
@@ -231,11 +217,8 @@ block2(v7: i32, v8: i32):
 }
 "#,
     },
-    // --- Range propagation through block parameters ---
-
     // v0 < 4 && v0 >= 0 checked in block0.  Block1 receives v0 as a param.
     // Range [0,3] propagates through the param, so irem(param, 8) == param.
-    // Without path sensitivity the param has no range.
     TestCase {
         name: "range_through_phi",
         clif: r#"
@@ -258,11 +241,8 @@ block2(v9: i32):
 }
 "#,
     },
-    // --- Chained conditional: two successive guards ---
-
-    // First branch: v0 >= 0.  Second branch: v0 < 16.
     // Innermost block has range [0,15], so irem(v0, 32) == v0
-    // and sdiv(v0, 4) → ushr(v0, 2).  Neither fires without scoped ranges.
+    // and sdiv(v0, 4) → ushr(v0, 2).
     TestCase {
         name: "chained_guards",
         clif: r#"
@@ -287,8 +267,6 @@ block3(v9: i32):
 }
 "#,
     },
-    // --- See-through phi with conditional computation ---
-
     // Both arms compute iadd(v1, 1) and pass it to block3 as a param.
     // Agreement through block param → param == iadd(v1,1) unconditionally.
     // But additionally, the true arm has v0 != 0, which a context-sensitive
@@ -316,8 +294,6 @@ block3(v8: i32):
 }
 "#,
     },
-    // --- Redundant guard elimination ---
-
     // Two identical guards: v0 >= 0 in block0, then v0 >= 0 again in block1.
     // With scoped ranges the second comparison folds to true (iconst 1).
     TestCase {
@@ -346,8 +322,6 @@ block2(v9: i32):
 }
 "#,
     },
-    // --- Multiple range-conditioned ops in one block ---
-
     // Guard v0 in [0,15].  Then both sdiv(v0,2) → ushr and irem(v0,32) → v0
     // should fire in the same block.
     TestCase {
@@ -377,11 +351,7 @@ block2(v12: i32):
     },
 ];
 
-/// Baseline (context-free) benchmarks — plain algebraic and folding
-/// simplifications that don't require path sensitivity.  Both
-/// `path_sensitive = true` and `false` should handle these equally.
 pub const BASELINE_TESTS: &[TestCase] = &[
-    // 1. Add-zero elimination
     TestCase {
         name: "add_zero",
         clif: r#"
@@ -394,7 +364,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 2. Multiply by one / zero
     TestCase {
         name: "mul_identity",
         clif: r#"
@@ -408,7 +377,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 3. Strength reduction: x * 2 → x + x
     TestCase {
         name: "strength_reduce_mul2",
         clif: r#"
@@ -420,7 +388,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 4. Double negation: ineg(ineg(x)) → x
     TestCase {
         name: "double_negation",
         clif: r#"
@@ -432,7 +399,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 5. AND with all-ones identity: x & -1 → x
     TestCase {
         name: "and_allones",
         clif: r#"
@@ -444,7 +410,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 6. XOR self-cancellation: x ^ x → 0
     TestCase {
         name: "xor_self",
         clif: r#"
@@ -455,7 +420,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 7. GVN / CSE: same computation reused
     TestCase {
         name: "gvn_cse",
         clif: r#"
@@ -468,7 +432,6 @@ block0(v0: i32, v1: i32):
 }
 "#,
     },
-    // 8. Constant folding chain
     TestCase {
         name: "const_fold_chain",
         clif: r#"
@@ -483,7 +446,6 @@ block0:
 }
 "#,
     },
-    // 9. OR with zero identity + double bnot
     TestCase {
         name: "or_zero_double_bnot",
         clif: r#"
@@ -497,7 +459,6 @@ block0(v0: i32):
 }
 "#,
     },
-    // 10. Sub-self → 0 + add-zero cleanup
     TestCase {
         name: "sub_self_cleanup",
         clif: r#"
@@ -546,10 +507,6 @@ fn run_one(clif: &str, path_sensitive: bool) -> usize {
     calc_inst_cost(&pass.layout, &pass.dfg)
 }
 
-/// Run the full compilation pipeline (parse + domtree + egraph pass) once
-/// and return `(instruction_cost, wall_clock_time, run_only_time)`.  The
-/// `run_only_time` measures only `EgraphPass::run()` so we can isolate the
-/// optimization wall-clock cost from parse + domtree construction.
 fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration, Duration) {
     let (dfg, layout) = parse_clif(clif).expect("parse");
     let start = Instant::now();
@@ -564,14 +521,8 @@ fn time_one(clif: &str, path_sensitive: bool) -> (usize, Duration, Duration) {
     (cost, elapsed, run_only)
 }
 
-/// Timing benchmark: runs each suite (baseline + path-sensitive) through the
-/// compilation pipeline with `path_sensitive = true` and `false`, taking the
-/// best of several repetitions to reduce noise, and prints wall-clock
-/// comparisons.
 #[test]
 pub fn time_benchmarks() {
-    // Repetitions per configuration — take the minimum to get a stable
-    // lower-bound on wall-clock time while ignoring transient spikes.
     const REPS: usize = 25;
 
     fn bench_suite(name: &str, suite: &[TestCase]) -> (Duration, Duration, usize, usize) {
@@ -595,7 +546,6 @@ pub fn time_benchmarks() {
         let mut cost_base = 0usize;
 
         for tc in suite {
-            // Warm-up to prime any lazy caches / allocators.
             let _ = time_one(tc.clif, true);
             let _ = time_one(tc.clif, false);
 
@@ -709,7 +659,6 @@ fn run_tests(tests: &[TestCase]) {
     }
 }
 
-/// Run the entire benchmark suite, comparing path-sensitive vs baseline.
 #[test]
 pub fn run_benchmarks() {
     println!(
