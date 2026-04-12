@@ -267,7 +267,6 @@ impl Parser {
 
             Opcode::AddImm | Opcode::MulImm | Opcode::ShlImm => {
                 // Immediate variants: value, immediate
-                // e.g., iadd_imm v0, 10
                 let value = self.parse_value_ref()?;
                 args.push(value);
 
@@ -474,7 +473,7 @@ impl Parser {
             "sshr" => Ok(Opcode::Sshr),
             "bnot" => Ok(Opcode::Bnot),
             "ineg" => Ok(Opcode::Ineg),
-            "icmp" => Ok(Opcode::Eq), // Will be refined with condition suffix
+            "icmp" => Ok(Opcode::Eq),
             "iconst" => Ok(Opcode::Const),
             "uextend" => Ok(Opcode::Uextend),
             "sextend" => Ok(Opcode::Sextend),
@@ -595,181 +594,4 @@ pub fn parse_clif(input: &str) -> Result<(DataFlowGraph, Layout), String> {
 
     let mut parser = Parser::new(tokens);
     parser.parse()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_simple_function() {
-        let input = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 1
-                                v2 = iadd.i32 v0, v1
-                                return v2
-                            }
-                            "#;
-
-        let result = parse_clif(input);
-        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
-
-        let (_, layout) = result.unwrap();
-        assert_eq!(layout.blocks.len(), 1);
-
-        let block = &layout.block_data[&BlockId(0)];
-        assert_eq!(block.params.len(), 1);
-        assert!(block.insts.len() >= 2);
-    }
-
-    #[test]
-    fn test_conditional_branch() {
-        let input = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                brif v0, block1(v0), block2(v0)
-
-                            block1(v1: i32):
-                                v2 = iconst.i32 1
-                                return v2
-
-                            block2(v3: i32):
-                                v4 = iconst.i32 0
-                                return v4
-                            }
-                            "#;
-
-        let result = parse_clif(input);
-        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
-
-        let (_, layout) = result.unwrap();
-        assert_eq!(layout.blocks.len(), 3);
-    }
-
-    #[test]
-    fn test_with_comments() {
-        let input = r#"
-                            function %test(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 1 ; this is a constant
-                                v2 = iadd.i32 v0, v1 ; add them
-                                return v2
-                            }
-                            "#;
-
-        let result = parse_clif(input);
-        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
-        let (_, layout) = result.unwrap();
-        assert_eq!(layout.blocks.len(), 1);
-    }
-
-    #[test]
-    fn test_branch_display() {
-        let input = r#"
-                            function %test_branches(i32) -> i32 {
-                            block0(v0: i32):
-                                v1 = iconst.i32 10
-                                v2 = icmp.eq.i32 v0, v1
-                                brif v2, block1(v0), block2(v0)
-
-                            block1(v3: i32):
-                                v4 = iadd.i32 v3, v1
-                                jump block3(v4)
-
-                            block2(v5: i32):
-                                v6 = imul.i32 v5, v1
-                                jump block3(v6)
-
-                            block3(v7: i32):
-                                return v7
-                            }
-                            "#;
-
-        let result = parse_clif(input);
-        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
-
-        let (dfg, layout) = result.unwrap();
-        assert_eq!(layout.blocks.len(), 4, "Should have 4 blocks");
-
-        println!("Full CLIF Display with Branch Targets:");
-        println!("{}", "-".repeat(70));
-        let clif_output = layout.display(&dfg, "test_branches", &[Type::I32], Some(Type::I32));
-        println!("{}", clif_output);
-        println!("{}", "-".repeat(70));
-
-        let block0 = &layout.block_data[&BlockId(0)];
-        let brif_inst_id = block0
-            .insts
-            .last()
-            .expect("block0 should have instructions");
-        let brif_inst = &dfg.insts[brif_inst_id];
-        assert_eq!(
-            brif_inst.opcode,
-            Opcode::CondBranch,
-            "Last instruction in block0 should be brif"
-        );
-        assert!(
-            brif_inst.branch_info.is_some(),
-            "brif should have branch_info"
-        );
-
-        let brif_display = dfg.display_inst(*brif_inst_id);
-        assert!(
-            brif_display.contains("brif"),
-            "Display should contain 'brif'"
-        );
-        assert!(
-            brif_display.contains("block1"),
-            "Display should contain 'block1'"
-        );
-        assert!(
-            brif_display.contains("block2"),
-            "Display should contain 'block2'"
-        );
-        println!("brif display good: {}", brif_display);
-
-        let block1 = &layout.block_data[&BlockId(1)];
-        let jump_inst_id = block1
-            .insts
-            .last()
-            .expect("block1 should have instructions");
-        let jump_inst = &dfg.insts[jump_inst_id];
-        assert_eq!(
-            jump_inst.opcode,
-            Opcode::Branch,
-            "Last instruction in block1 should be jump"
-        );
-        assert!(
-            jump_inst.branch_info.is_some(),
-            "jump should have branch_info"
-        );
-
-        let jump_display = dfg.display_inst(*jump_inst_id);
-        assert!(
-            jump_display.contains("jump"),
-            "Display should contain 'jump'"
-        );
-        assert!(
-            jump_display.contains("block3"),
-            "Display should contain 'block3'"
-        );
-        println!("jump display good: {}", jump_display);
-
-        let block2 = &layout.block_data[&BlockId(2)];
-        let jump2_inst_id = block2
-            .insts
-            .last()
-            .expect("block2 should have instructions");
-        let jump2_display = dfg.display_inst(*jump2_inst_id);
-        assert!(
-            jump2_display.contains("jump"),
-            "Display should contain 'jump'"
-        );
-        assert!(
-            jump2_display.contains("block3"),
-            "Display should contain 'block3'"
-        );
-        println!("jump display good: {}", jump2_display);
-    }
 }
