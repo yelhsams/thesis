@@ -1,9 +1,5 @@
-//! Main egraph pass implementation
-//!
-//! This pass does three main things:
-//! 1. Removes pure operations from the layout (CFG)
-//! 2. Builds an egraph with GVN and applies rewrite rules
-//! 3. Elaborates (extracts) the best version back into the CFG
+//! Egraph pass: pull pure ops out of the CFG, GVN them and apply rewrites in
+//! an egraph, then elaborate the best version back into the CFG.
 
 use crate::pattern::*;
 use crate::range::{learn_from_comparison, Range, RangeAssumptions};
@@ -14,33 +10,23 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 const REWRITE_LIMIT: usize = 5;
 
-/// Main egraph pass structure
 pub struct EgraphPass {
-    /// The function's data flow graph
     pub dfg: DataFlowGraph,
-
-    /// The control flow layout
     pub layout: Layout,
-
-    /// Dominator tree for the CFG
     pub domtree: DominatorTree,
-
-    /// Statistics collected during the pass
     pub stats: Stats,
 
-    /// Pattern-based rewrite engine
     rewrite_engine: RewriteEngine,
 
-    /// GVN mapping from original values to optimized values
+    /// original value -> optimized value, populated during the egraph build.
     gvn_mapping: FxHashMap<ValueId, ValueId>,
 
     pub range_assumptions: RangeAssumptions,
 
-    /// Range facts per CFG edge (pred, target), populated during
-    /// `remove_pure_and_optimize` and reused by the elaborator's domtree walk.
+    /// Range facts per CFG edge populated during `remove_pure_and_optimize`
+    /// and used during the domtree walk
     pub block_entry_facts: FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
 
-    /// CFG predecessor map, populated during `remove_pure_and_optimize`.
     pub cfg_preds: FxHashMap<BlockId, Vec<BlockId>>,
 
     pub path_sensitive: bool,
@@ -75,26 +61,21 @@ impl EgraphPass {
         self.range_assumptions.get_range(value)
     }
 
-    /// Run the complete egraph pass
     pub fn run(&mut self) {
-        // Single-pass aegraph construction: domtree walk with inline range
-        // propagation, branch-condition learning, and conditional union creation.
+        // Single-pass aegraph build, same as Cranelift.
+        // Domtree walk which now includes inline range
+        // propagation, branch-condition learning, and conditional unions
         self.remove_pure_and_optimize();
 
-        // Safety-net redundant phi elimination (handles cross-iteration
-        // convergence the single inline pass cannot reach).
+        // Same as cranelift, phi-elimination convergence
         if self.path_sensitive {
             self.eliminate_redundant_params();
         }
 
-        // Apply GVN mapping to instruction args before elaboration so the
-        // elaborator sees the GVN-canonical values.
+        // Resolve GVN canonicals in instruction args before elaboration
         self.apply_gvn_to_args();
 
-        // Extraction + elaboration (scoped, context-aware).
-        // The elaborator walks the domtree, pushing/popping range assumption
-        // scopes so that conditional unions created during
-        // remove_pure_and_optimize are consulted in the correct branch context.
+        // scoped, context-aware extraction
         {
             if self.path_sensitive {
                 let mut elaborator = crate::elaborate::Elaborator::with_range_assumptions(
@@ -119,24 +100,8 @@ impl EgraphPass {
         }
         self.rebuild_layout();
         self.check_no_unions();
-
-        // Global CSE + Global Code Motion.
-        //
-        // The scoped-GVN construction in `remove_pure_and_optimize` keeps
-        // equivalence classes dominator-local: when both arms of a diamond
-        // compute the same pure expression, the two copies live in separate
-        // scopes and never merge.  This pass walks the whole function,
-        // deduplicates structurally-equivalent pure instructions, then
-        // hoists each canonical instruction to the lowest common ancestor
-        // (in the dominator tree) of all its users.  The existing CFG
-        // cleanups (simplify_trivial_blocks + simplify_redundant_brif) then
-        // collapse the empty arms.
         self.global_cse_and_gcm();
 
-        // CFG cleanups (separate from aegraph construction). Each pass
-        // reports whether it made changes; we exit early once a full
-        // round leaves the function untouched. Capped at the original
-        // 5 iterations as a safety bound.
         for _ in 0..5 {
             let mut changed = false;
             changed |= self.eliminate_dead_blocks();
@@ -149,19 +114,12 @@ impl EgraphPass {
             }
         }
         self.eliminate_dead_blocks();
-
-        // Print final statistics
-        // self.stats.print_summary();
-        // self.rewrite_engine.print_stats();
     }
 
-    /// Resolve GVN mappings in all instruction arguments so that the
-    /// elaborator (which is unaware of `gvn_mapping`) sees canonical values.
     fn apply_gvn_to_args(&mut self) {
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
         for inst_id in all_insts {
-            // Take args out so we don't hold a borrow on self.dfg while
-            // calling fully_resolve (which borrows self).
+            // Take args out to avoid borrowing self.dfg while calling fully_resolve.
             let mut args = std::mem::take(&mut self.dfg.insts.get_mut(&inst_id).unwrap().args);
             for arg in &mut args {
                 let resolved = self.fully_resolve(*arg);
@@ -173,31 +131,27 @@ impl EgraphPass {
         }
     }
 
-    /// Rebuild the layout to only include necessary instructions
+    /// Rebuild each block's instruction list to only include what's needed.
     fn rebuild_layout(&mut self) {
-        // For each block, rebuild its instruction list
         for &block_id in &self.layout.blocks.clone() {
             let block_data = self.layout.block_data.get(&block_id).unwrap();
             let mut needed_values: FxHashSet<ValueId> = FxHashSet::default();
             let mut skeleton_insts = Vec::new();
 
-            // First pass: collect skeleton instructions and the values they use
+            // Skeleton (impure) instructions stay; mark their args as needed.
             for &inst_id in &block_data.insts {
                 let inst = &self.dfg.insts[&inst_id];
 
                 if !inst.opcode.is_pure() {
-                    // This is a skeleton instruction - keep it
                     skeleton_insts.push(inst_id);
 
-                    // Mark all its arguments as needed
                     for &arg in &inst.args {
                         needed_values.insert(arg);
                     }
                 }
             }
 
-            // Second pass: for each needed value, find the instruction that produces it
-            // We collect all pure instructions needed and their dependencies
+            // Walk back from needed values to pull in all transitive pure deps.
             let mut pure_insts_set: FxHashSet<InstId> = FxHashSet::default();
             let mut work_queue: Vec<ValueId> = needed_values.iter().copied().collect();
             let mut processed: FxHashSet<ValueId> = FxHashSet::default();
@@ -207,15 +161,13 @@ impl EgraphPass {
                     continue;
                 }
 
-                // Find the instruction that defines this value
                 if let ValueDef::Inst(inst_id) = self.dfg.value_def(value) {
                     let inst = &self.dfg.insts[&inst_id];
 
-                    // Only add pure instructions (skeleton ones are already added)
+                    // Skeleton insts are already in; only collect pure ones.
                     if inst.opcode.is_pure() {
                         pure_insts_set.insert(inst_id);
 
-                        // This instruction's arguments are also needed
                         for &arg in &inst.args {
                             if !processed.contains(&arg) {
                                 work_queue.push(arg);
@@ -225,23 +177,18 @@ impl EgraphPass {
                 }
             }
 
-            // Third pass: topologically sort pure instructions
-            // An instruction must come after all instructions that define its arguments
+            // Pure insts in dependency order, then skeleton.
             let pure_insts_to_add = self.topological_sort_instructions(&pure_insts_set);
-
-            // Combine pure and skeleton instructions
-            // Pure instructions (in dependency order) first, then skeleton
             let mut new_insts = pure_insts_to_add;
             new_insts.extend(skeleton_insts);
 
-            // Update the block
             let block = self.layout.block_data.get_mut(&block_id).unwrap();
             block.insts = new_insts;
         }
     }
 
-    /// Verify that no `ValueDef::Union` nodes are reachable from any
-    /// instruction argument after elaboration and layout rebuild.
+    /// Sanity check: no Union nodes should be reachable from instruction
+    /// args after elaboration + layout rebuild.
     #[cfg(debug_assertions)]
     fn check_no_unions(&self) {
         for &block_id in &self.layout.blocks {
@@ -271,13 +218,11 @@ impl EgraphPass {
         }
     }
 
-    /// No-op in release builds; the debug version panics on residual unions.
     #[cfg(not(debug_assertions))]
     fn check_no_unions(&self) {}
 
-    /// Topologically sort instructions so that definitions come before uses
+    /// Topologically sort instructions so defs precede uses.
     fn topological_sort_instructions(&self, inst_set: &FxHashSet<InstId>) -> Vec<InstId> {
-        // Build a map from value to the instruction that defines it
         let mut value_to_inst: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for &inst_id in inst_set {
             if let Some(result) = self.dfg.inst_results(inst_id).first() {
@@ -285,7 +230,6 @@ impl EgraphPass {
             }
         }
 
-        // Build dependency graph: for each instruction, which instructions must come before it?
         let mut in_degree: FxHashMap<InstId, usize> = FxHashMap::default();
         let mut dependents: FxHashMap<InstId, Vec<InstId>> = FxHashMap::default();
 
@@ -295,7 +239,6 @@ impl EgraphPass {
 
             let inst = &self.dfg.insts[&inst_id];
             for &arg in &inst.args {
-                // If the argument is defined by an instruction in our set, add dependency
                 if let Some(&defining_inst) = value_to_inst.get(&arg) {
                     if inst_set.contains(&defining_inst) && defining_inst != inst_id {
                         *in_degree.entry(inst_id).or_insert(0) += 1;
@@ -308,15 +251,13 @@ impl EgraphPass {
             }
         }
 
-        // Kahn's algorithm for topological sort
+        // Kahn's algorithm. Sort the queue for deterministic output.
         let mut result = Vec::new();
         let mut queue: Vec<InstId> = in_degree
             .iter()
             .filter(|(_, &degree)| degree == 0)
             .map(|(&inst_id, _)| inst_id)
             .collect();
-
-        // Sort the initial queue by InstId for deterministic output
         queue.sort();
 
         while let Some(inst_id) = queue.pop() {
@@ -328,7 +269,7 @@ impl EgraphPass {
                         *degree -= 1;
                         if *degree == 0 {
                             queue.push(dependent);
-                            queue.sort(); // Keep sorted for determinism
+                            queue.sort();
                         }
                     }
                 }
@@ -338,26 +279,22 @@ impl EgraphPass {
         result
     }
 
-    /// Add a custom rewrite rule to the engine
     pub fn add_rewrite_rule(&mut self, rule: Rewrite) {
         self.rewrite_engine.add_rule(rule);
     }
 
-    /// Check whether `value` was remapped by GVN or redundant-phi elimination.
-    /// Returns `true` if the value has a recorded canonical replacement.
+    /// True if `value` was remapped by GVN or redundant-phi elimination.
     pub fn is_gvn_remapped(&self, value: ValueId) -> bool {
         self.gvn_mapping.contains_key(&value)
     }
 
-    /// Expose the complete GVN mapping for testing purposes.
     pub fn gvn_mapping(&self) -> &FxHashMap<ValueId, ValueId> {
         &self.gvn_mapping
     }
 
-    /// If every return instruction in the function returns the same value,
-    /// and that value is available in the entry block or is a constant,
-    /// replace the entire function body with `return value`.
-    /// Returns `true` if the function body was rewritten.
+    /// If every return in the function returns the same value (and it's
+    /// available in the entry block or is a constant), replace the body with
+    /// just `return value`. Returns true if it rewrote anything.
     fn simplify_uniform_returns(&mut self) -> bool {
         let entry = match self.layout.entry_block() {
             Some(b) => b,
@@ -444,8 +381,7 @@ impl EgraphPass {
         false
     }
 
-    /// Simplify brif instructions whose condition is a known constant.
-    /// Returns `true` if any instruction was rewritten.
+    /// Brif with a constant condition becomes an unconditional branch.
     fn simplify_constant_brif(&mut self) -> bool {
         let mut changed = false;
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
@@ -474,8 +410,7 @@ impl EgraphPass {
         changed
     }
 
-    /// Eliminate dead (unreachable) blocks.
-    /// Returns `true` if any block was removed.
+    /// Drop unreachable blocks.
     fn eliminate_dead_blocks(&mut self) -> bool {
         let entry = match self.layout.entry_block() {
             Some(b) => b,
@@ -508,8 +443,8 @@ impl EgraphPass {
         self.layout.blocks.len() != before
     }
 
-    /// Simplify trivial blocks (single-instruction blocks).
-    /// Returns `true` if any block was simplified.
+    /// Forward branches through single-instruction blocks (just a return or
+    /// just a jump).
     fn simplify_trivial_blocks(&mut self) -> bool {
         let mut any_changed = false;
         let mut changed = true;
@@ -527,7 +462,7 @@ impl EgraphPass {
                 }
                 let inst = &self.dfg.insts[&block.insts[0]];
 
-                // Case 1: Block with only a return — inline into predecessors
+                // Block with just a return — inline into predecessors.
                 if inst.opcode == Opcode::Return && !inst.args.is_empty() {
                     let ret_val = inst.args[0];
                     if Some(block_id) != self.layout.entry_block() {
@@ -593,7 +528,7 @@ impl EgraphPass {
                     continue;
                 }
 
-                // Case 2: Block with only a jump — forward predecessors
+                // Block with just a jump — forward predecessors to its target.
                 let (target, jump_args) = match &inst.branch_info {
                     Some(BranchInfo::Jump(t)) => (*t, inst.args.clone()),
                     _ => continue,
@@ -694,9 +629,8 @@ impl EgraphPass {
         any_changed
     }
 
-    /// Simplify redundant brif: if both branches go to the same block with the
-    /// same arguments, replace with an unconditional jump.
-    /// Returns `true` if any instruction was rewritten.
+    /// If both arms of a brif go to the same block with the same args, turn
+    /// it into a jump.
     fn simplify_redundant_brif(&mut self) -> bool {
         let mut changed = false;
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
@@ -722,13 +656,10 @@ impl EgraphPass {
         changed
     }
 
-    /// Redundant phi (block-param) elimination.
-    ///
-    /// Safety-net fallback: builds a fresh param→sources map from the layout,
-    /// then eliminates any block param whose every predecessor passes the same
+    /// Redundant phi elimination. Builds a fresh param→sources map from the
+    /// layout and drops any block param whose preds all pass the same
     /// canonical value. Iterates to a fixed point.
     fn eliminate_redundant_params(&mut self) {
-        // Build a local param_sources map by scanning the layout.
         let mut param_sources: FxHashMap<ValueId, Vec<ValueId>> = FxHashMap::default();
         for &block_id in &self.layout.blocks {
             let block = &self.layout.block_data[&block_id];
@@ -781,11 +712,8 @@ impl EgraphPass {
             }
         }
 
-        // Build a worklist of candidates: block params whose gvn_mapping is
-        // self (or absent), which actually have incoming sources. Iteration
-        // runs until a fixed point; when `gvn_mapping` changes a param may
-        // become redundant that previously was not, so we requeue affected
-        // params using a simple `changed` loop.
+        // Loop to fixed point — a new gvn_mapping entry can make a previously
+        // non-redundant param redundant.
         let mut changed = true;
         while changed {
             changed = false;
@@ -806,13 +734,12 @@ impl EgraphPass {
                     _ => continue,
                 }
 
-                // Find first non-self canonical.
                 let mut first: Option<ValueId> = None;
                 let mut uniform = true;
                 for &incoming in sources {
                     let resolved = self.fully_resolve(incoming);
                     if resolved == param {
-                        continue; // loop-carried self-reference
+                        continue; // self-reference from a loop
                     }
                     match first {
                         None => first = Some(resolved),
@@ -842,12 +769,8 @@ impl EgraphPass {
         }
     }
 
-    /// Follow `gvn_mapping` transitively until no further mapping exists.
-    ///
-    /// This is used inside `eliminate_redundant_params` to make replacements
-    /// made in earlier iterations visible when computing canonical values for
-    /// later ones (e.g., v2 → v0 in iteration 1 allows v8 → v0 in iteration 2).
-    /// The depth limit guards against unexpected cycles.
+    /// Follow `gvn_mapping` transitively. Depth-limited so unexpected cycles
+    /// don't loop forever.
     pub fn fully_resolve(&self, value: ValueId) -> ValueId {
         let mut current = value;
         for _ in 0..64 {
@@ -856,15 +779,14 @@ impl EgraphPass {
                 _ => return current,
             }
         }
-        current // cycle-safe fallback
+        current
     }
 
-    /// Remove pure operations from layout and build egraph
+    /// Pull pure ops out of the layout and build the egraph.
     ///
-    /// Single domtree-preorder walk that:
-    /// - Builds block-param incoming maps inline (replacing build_param_sources)
-    /// - Records branch conditions inline (replacing the pre-scan)
-    /// - Propagates ranges, creates unions, and applies rewrites
+    /// Single domtree-preorder walk that handles block-param incoming maps,
+    /// branch-condition recording, range propagation, union creation, and
+    /// rewrites all inline.
     fn remove_pure_and_optimize(&mut self) {
         let mut value_to_opt_value: FxHashMap<ValueId, ValueId> = FxHashMap::default();
 
@@ -875,11 +797,10 @@ impl EgraphPass {
 
         let mut gvn_map_blocks: Vec<BlockId> = Vec::new();
 
-        // Pre-scan: build (target_block, param_index) → (predecessor, incoming_value)
-        // from the layout. Values are original (unrewritten); resolved through
-        // value_to_opt_value at read time. This must be pre-computed because
-        // CFG predecessors are not guaranteed to precede successors in a
-        // domtree-preorder walk (merge blocks may be visited before siblings).
+        // Pre-scan (target, param_idx) → [(pred, incoming_value)]. Values are
+        // unrewritten; resolved through value_to_opt_value at read time.
+        // Must be precomputed since CFG preds aren't guaranteed to come
+        // before successors in domtree preorder (e.g. merge blocks).
         let mut block_param_incoming: FxHashMap<(BlockId, usize), Vec<(BlockId, ValueId)>> =
             FxHashMap::default();
         for &blk in &self.layout.blocks {
@@ -920,7 +841,7 @@ impl EgraphPass {
             }
         }
 
-        // Build CFG predecessors map for sound range-fact joining at merge points.
+        // CFG preds, used for sound range-fact joining at merges.
         let mut cfg_preds: FxHashMap<BlockId, Vec<BlockId>> = FxHashMap::default();
         for &blk in &self.layout.blocks {
             cfg_preds.entry(blk).or_default();
@@ -940,7 +861,7 @@ impl EgraphPass {
             }
         }
 
-        // Range facts per edge (pred, target) and edge conditions populated inline during the walk
+        // Range facts per edge, populated inline during the walk.
         let mut block_entry_facts: FxHashMap<(BlockId, BlockId), Vec<(ValueId, Range)>> =
             FxHashMap::default();
         let mut block_edge_conditions: FxHashMap<
@@ -956,8 +877,7 @@ impl EgraphPass {
         }
 
         let mut block_stack = vec![StackEntry::Visit(root)];
-        // Reusable scratch buffers, to avoid per-instruction / per-block
-        // allocation in the inner loops.
+        // Scratch buffers reused across iterations.
         let mut arg_ranges_buf: Vec<crate::range::Range> = Vec::with_capacity(8);
         let mut cond_values_buf: Vec<ValueId> = Vec::with_capacity(8);
 
@@ -965,10 +885,8 @@ impl EgraphPass {
             match entry {
                 StackEntry::Visit(block) => {
                     block_stack.push(StackEntry::Pop);
-                    // Push children in reverse order so that lower block IDs
-                    // (typically predecessors / branch targets) are visited
-                    // first. This ensures merge blocks see their predecessors'
-                    // value_to_opt_value mappings.
+                    // Reverse so lower block IDs come first, which means
+                    // merge blocks see their preds' value_to_opt_value.
                     for &child in self.domtree.children(block).iter().rev() {
                         block_stack.push(StackEntry::Visit(child));
                     }
@@ -979,22 +897,17 @@ impl EgraphPass {
 
                     let block_data = self.layout.block_data[&block].clone();
 
-                    // 1. Apply range facts from incoming edges (populated by
-                    //    predecessors that were already visited in domtree order).
-                    //    For merge blocks with multiple predecessors, we compute the
-                    //    UNION (join) of ranges per value across all edges to avoid
-                    //    unsoundly intersecting contradictory facts.
+                    // 1. Apply range facts from incoming edges. At a merge,
+                    //    intersect within an edge then union across edges —
+                    //    intersecting contradictory facts would be unsound.
                     if self.path_sensitive {
                         let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_edges = preds.len();
-                        // For each edge, compute the per-value intersected range
-                        // (multiple facts about the same value on one edge are
-                        // intersected), then union those across edges.
                         let mut value_edge_count: FxHashMap<ValueId, usize> = FxHashMap::default();
                         let mut value_union: FxHashMap<ValueId, Range> = FxHashMap::default();
                         for pred in &preds {
                             if let Some(facts) = block_entry_facts.get(&(*pred, block)) {
-                                // Intersect all facts for the same value on this edge
+                                // Intersect facts about the same value on this edge.
                                 let mut per_edge: FxHashMap<ValueId, Range> = FxHashMap::default();
                                 for &(value, range) in facts {
                                     per_edge
@@ -1007,7 +920,7 @@ impl EgraphPass {
                                         })
                                         .or_insert(range);
                                 }
-                                // Union across edges
+                                // Union across edges.
                                 for (value, range) in per_edge {
                                     *value_edge_count.entry(value).or_insert(0) += 1;
                                     value_union
@@ -1019,7 +932,7 @@ impl EgraphPass {
                                 }
                             }
                         }
-                        // Only apply facts that appear on ALL incoming edges
+                        // Only apply facts that appear on every incoming edge.
                         for (value, range) in &value_union {
                             if value_edge_count.get(value) == Some(&num_edges)
                                 && !range.is_unbounded()
@@ -1029,8 +942,7 @@ impl EgraphPass {
                         }
                     }
 
-                    // Apply nonzero marks from incoming edge conditions
-                    // Only mark nonzero if ALL predecessor edges agree.
+                    // Mark nonzero only if every incoming edge agrees.
                     if self.path_sensitive {
                         let preds = cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_preds = preds.len();
@@ -1058,13 +970,12 @@ impl EgraphPass {
                         }
                     }
 
-                    // 2. Process block params: identity-map, per-edge range join,
-                    //    singleton substitution, then see-through + conditional unions
+                    // 2. Block params: identity-map, per-edge range join,
+                    //    singleton-constant substitution.
                     for (param_idx, &param) in block_data.params.iter().enumerate() {
                         value_to_opt_value.insert(param, param);
                         available_block.insert(param, block);
 
-                        // Per-edge join-point range propagation
                         if self.path_sensitive {
                             let key = (block, param_idx);
                             if let Some(incoming) = block_param_incoming.get(&key) {
@@ -1074,7 +985,7 @@ impl EgraphPass {
                                         continue;
                                     }
                                     let mut src_range = self.range_assumptions.get_range(src_val);
-                                    // Narrow by edge-specific conditions
+                                    // Narrow by edge-specific conditions.
                                     if let Some(conditions) =
                                         block_edge_conditions.get(&(pred, block))
                                     {
@@ -1103,7 +1014,7 @@ impl EgraphPass {
                                 }
                             }
 
-                            // Singleton-range constant substitution
+                            // If the joined range is a singleton, substitute the constant.
                             let range = self.range_assumptions.get_range(param);
                             if let Some(c) = range.as_singleton() {
                                 let const_inst =
@@ -1124,7 +1035,9 @@ impl EgraphPass {
                     }
 
                     if self.path_sensitive {
-                        // Inline block-param equivalence propagation
+                        // Block-param equivalence: if every non-self incoming
+                        // is the same value (or all the same constant), make
+                        // the param an alias of it.
                         for (param_idx, &param) in block_data.params.iter().enumerate() {
                             let incoming_key = (block, param_idx);
                             let incoming = match block_param_incoming.get(&incoming_key) {
@@ -1132,7 +1045,7 @@ impl EgraphPass {
                                 _ => continue,
                             };
 
-                            // Resolve each incoming value through value_to_opt_value
+                            // Resolve each incoming through value_to_opt_value.
                             let resolved: Vec<(BlockId, ValueId)> = incoming
                                 .iter()
                                 .map(|&(pred, src)| {
@@ -1177,31 +1090,21 @@ impl EgraphPass {
                                 available_block.insert(union_node, block);
                                 self.stats.union += 1;
                             }
-                            // Note: we intentionally do NOT create conditional
-                            // unions for the disagreement case.  At a merge
-                            // block, incoming edges from unconditional jumps
-                            // carry no range facts, so the resulting union
-                            // would have an empty assumption set and be
-                            // treated as globally valid.  That's unsound
-                            // (v_param is only equal to one specific incoming
-                            // per path) AND corrupts `consider_conditional_unions`
-                            // during best-cost computation: looking up the
-                            // incoming value finds the phi param as an
-                            // equivalent candidate with Cost::ZERO, which
-                            // blocks range-conditioned rewrites like
-                            // sdiv→ushr from being selected.
+                            // No conditional union for the disagreement case:
+                            // unconditional-jump edges carry no range facts,
+                            // so the union's assumption set would be empty
+                            // and treated as globally valid. That's unsound
+                            // (v_param only equals one incoming per path) and
+                            // it tanks best-cost computation by exposing the
+                            // phi as a Cost::ZERO equivalent, blocking range-
+                            // conditioned rewrites like sdiv→ushr.
                         }
                     }
 
-                    // Process instructions
-                    //
-                    // Hoist OptimizeCtx out of the per-instruction loop and
-                    // reuse it across the inner loop and the cond_values
-                    // second pass. Per-iteration state (`rewrite_depth` and
-                    // `subsume_values`) is reset at the top of each loop
-                    // iteration. All accesses to `self.dfg`,
-                    // `self.range_assumptions`, etc. inside the loop go
-                    // through `ctx` to keep the borrow alive.
+                    // OptimizeCtx is hoisted out of the per-instruction loop
+                    // (and reused by the cond_values pass below) so we don't
+                    // re-borrow self each time. Per-iteration state on ctx
+                    // gets reset at the top of each loop iteration.
                     let path_sensitive = self.path_sensitive;
                     let mut ctx = OptimizeCtx {
                         dfg: &mut self.dfg,
@@ -1219,14 +1122,11 @@ impl EgraphPass {
                     };
 
                     for &inst_id in &block_data.insts {
-                        // Reset per-iteration state.
                         ctx.rewrite_depth = 0;
                         ctx.subsume_values.clear();
 
-                        // 1) Rewrite args in place using value_to_opt_value
-                        //    and capture the (Copy) opcode for dispatch.
-                        //    Avoids the previous double-clone of the
-                        //    instruction.
+                        // Rewrite args via value_to_opt_value and grab the
+                        // opcode for dispatch in a single pass.
                         let opcode = {
                             let inst_ref = ctx.dfg.insts.get_mut(&inst_id).unwrap();
                             for arg in &mut inst_ref.args {
@@ -1243,8 +1143,7 @@ impl EgraphPass {
                             ctx.optimize_skeleton_inst(inst_id, block);
                         }
 
-                        // Propagate ranges forward — reuse the buffer to
-                        // avoid an allocation per instruction.
+                        // Forward range propagation. Reuse the scratch buffer.
                         if path_sensitive {
                             arg_ranges_buf.clear();
                             let (opcode_after, immediate_after) = {
@@ -1308,11 +1207,8 @@ impl EgraphPass {
                             }
                         }
 
-                        // Inline branch-condition recording (replacing
-                        // pre-scan). Recorded after arg rewriting so
-                        // conditions reference optimized values. Branch
-                        // conditions from dominators are always available
-                        // for dominated blocks.
+                        // Record branch conditions inline (after arg rewriting
+                        // so they reference optimized values).
                         if path_sensitive {
                             let cb_info = {
                                 let inst_ref = &ctx.dfg.insts[&inst_id];
@@ -1333,9 +1229,8 @@ impl EgraphPass {
                                 }
                             };
                             if let Some((then_b, else_b, cond_value)) = cb_info {
-                                // True branch: condition is nonzero. Walk
-                                // backward through band/bor/cmp to learn all
-                                // leaf-level range facts.
+                                // True branch: cond is nonzero. Walk back
+                                // through and/or/cmp to learn leaf range facts.
                                 {
                                     ctx.range_assumptions.push_scope();
                                     let then_facts =
@@ -1346,15 +1241,11 @@ impl EgraphPass {
                                         .entry((block, then_b))
                                         .or_default()
                                         .extend(then_facts.iter().cloned());
-                                    // Record leaf facts as edge conditions
-                                    // so block-param range join can narrow
-                                    // per-edge ranges.
+                                    // Also record leaf facts as edge conditions
+                                    // so block-param join can narrow per-edge
+                                    // ranges. Approximated as a (Sge min,
+                                    // Slt max+1) pair.
                                     for &(value, range) in &then_facts {
-                                        // Approximate: store as a >= min
-                                        // and < max+1 pair. The edge
-                                        // conditions use (lhs, rhs_const,
-                                        // opcode, is_true_branch) tuples.
-                                        // We record Sge for the lower bound.
                                         block_edge_conditions
                                             .entry((block, then_b))
                                             .or_default()
@@ -1372,8 +1263,7 @@ impl EgraphPass {
                                         }
                                     }
                                     if then_facts.is_empty() {
-                                        // No leaf facts found — record
-                                        // top-level cond != 0 as fallback.
+                                        // Fallback: no leaves, record cond != 0.
                                         let ne_facts = learn_from_comparison(
                                             Opcode::Ne,
                                             cond_value,
@@ -1391,7 +1281,7 @@ impl EgraphPass {
                                     }
                                 }
 
-                                // Else branch: condition is zero.
+                                // Else branch: cond is zero.
                                 {
                                     ctx.range_assumptions.push_scope();
                                     let else_facts =
@@ -1440,20 +1330,12 @@ impl EgraphPass {
                         }
                     }
 
-                    // Second pass: re-evaluate branch-terminator condition
-                    // values that were GVN-mapped from a dominator block.
-                    // Range-conditioned rewrites for such values were
-                    // attempted in their defining block, where the current
-                    // block's range assumptions were not yet in scope.
-                    // Re-running apply_conditional_rewrites_and_store on them
-                    // here lets range-based folds fire under the tightened
-                    // scope (e.g., icmp.sge x, 0 → 1 once x is known to be
-                    // non-negative on this branch). Restricted to brif
-                    // condition values to keep the cost bounded.
+                    // Re-run conditional rewrites on brif condition values
+                    // that were GVN-mapped from a dominator block — their
+                    // original visit didn't have this block's tightened range
+                    // scope, so e.g. `icmp.sge x, 0 → 1` couldn't fire.
+                    // Restricted to brif conds to keep the cost bounded.
                     if path_sensitive {
-                        // Reuse a stable buffer for cond_values rather than
-                        // allocating per-block. Reading inst args via the
-                        // hoisted ctx.dfg keeps borrows happy.
                         cond_values_buf.clear();
                         for &iid in &block_data.insts {
                             let inst = &ctx.dfg.insts[&iid];
@@ -1481,8 +1363,7 @@ impl EgraphPass {
                         }
                     }
 
-                    // Drop ctx so the borrows on self are released before
-                    // the next StackEntry iteration.
+                    // Release borrows on self before the next iteration.
                     drop(ctx);
                 }
 
@@ -1493,25 +1374,20 @@ impl EgraphPass {
                 }
             }
         }
-        // Save the GVN mapping for use in extraction
+        // Hand off to the elaborator.
         self.gvn_mapping = value_to_opt_value;
-        // Save block_entry_facts and cfg_preds for the elaborator's domtree walk
         self.block_entry_facts = block_entry_facts;
         self.cfg_preds = cfg_preds;
     }
 
-    /// Post-elaboration global CSE + global code motion.
-    ///
-    /// Walks the function after scoped-GVN elaboration, deduplicates
-    /// structurally-equivalent pure instructions across the whole CFG, then
-    /// hoists each canonical pure instruction to the lowest common ancestor
-    /// (in the dominator tree) of all its users.  This recovers equivalences
-    /// that the dominator-local GVN misses (for example, both arms of a
-    /// diamond computing the same pure expression).
+    /// Global CSE + global code motion, run after scoped-GVN elaboration.
+    /// Dedupes structurally-equal pure insts across the whole CFG, then
+    /// hoists each canonical inst to the LCA of its users. Recovers
+    /// equivalences that dominator-local GVN misses (e.g. both arms of a
+    /// diamond computing the same expression).
     fn global_cse_and_gcm(&mut self) {
-        // Compute a domtree preorder over the current layout's reachable
-        // blocks. We use this for both CSE (prefer earlier/dominating insts
-        // as the canonical representative) and as an iteration order.
+        // Domtree preorder over reachable blocks. Used both for CSE
+        // canonicalization (prefer dominating defs) and as iteration order.
         let entry = match self.layout.entry_block() {
             Some(b) => b,
             None => return,
@@ -1532,13 +1408,10 @@ impl EgraphPass {
         };
         let in_layout: FxHashSet<BlockId> = preorder.iter().copied().collect();
 
-        // ----- Phase 1: global CSE -----
-        //
-        // Iterate to a fixed point.  Each pass walks every pure instruction
-        // in domtree preorder, builds a structural key from its opcode,
-        // type, immediate, and resolved argument list, and de-duplicates
-        // against earlier (dominating) instructions.  Canonicalization of
-        // inner values exposes further equivalences, hence the loop.
+        // ----- Phase 1: global CSE, looped to fixed point -----
+        // Each iteration keys pure insts by (opcode, type, imm, resolved args)
+        // and dedupes against earlier ones. Canonicalizing args exposes more
+        // equivalences, hence the loop.
         let mut value_map: FxHashMap<ValueId, ValueId> = FxHashMap::default();
         fn resolve(vm: &FxHashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
             let mut guard = 0usize;
@@ -1567,9 +1440,8 @@ impl EgraphPass {
                         Some(r) => r,
                         None => continue,
                     };
-                    // Skip if this value has already been canonicalized to
-                    // someone else — its defining inst is now redundant and
-                    // will be dropped below.
+                    // Already canonicalized to someone else — skip; its
+                    // defining inst is now redundant.
                     if let Some(&c) = value_map.get(&result) {
                         if c != result {
                             continue;
@@ -1593,7 +1465,7 @@ impl EgraphPass {
             }
         }
 
-        // ----- Phase 2: apply `value_map` to every instruction's args -----
+        // ----- Phase 2: rewrite every inst's args via value_map -----
         let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
         for inst_id in all_insts {
             let mut inst = self.dfg.insts[&inst_id].clone();
@@ -1610,7 +1482,7 @@ impl EgraphPass {
             }
         }
 
-        // ----- Phase 3: drop the now-redundant pure insts from block lists -----
+        // ----- Phase 3: drop redundant pure insts from block lists -----
         for &block_id in &preorder {
             let block = self.layout.block_data.get_mut(&block_id).unwrap();
             block.insts.retain(|&iid| {
@@ -1622,33 +1494,27 @@ impl EgraphPass {
                     Some(r) => r,
                     None => return true,
                 };
-                // Keep only instructions whose result is the canonical
-                // representative of its equivalence class.
+                // Keep only the canonical rep of each equivalence class.
                 resolve(&value_map, result) == result
             });
         }
 
         // ----- Phase 4: global code motion -----
         //
-        // For each pure inst, compute a "target" block = LCA (in the
-        // dominator tree) of its user targets/blocks.  We iterate to a
-        // fixed point so that hoisting a consumer inst also propagates up
-        // through its pure-inst arguments (e.g. hoisting an `iadd` to a
-        // diamond's dominator pulls the `iconst` along with it).  After
-        // convergence, we apply moves only for insts whose target strictly
-        // hoists them AND whose arg-defining blocks all dominate the new
-        // placement.  If the arg check fails, we leave the inst where it
-        // is — `finalize_gcm_validity` will then clone the arg-defining
-        // inst locally to restore SSA dominance.
-        // `rebuild_layout` may place the same `InstId` into multiple blocks'
-        // instruction lists (any block that uses a value pulls its defining
-        // pure inst into its own list for display/elaboration purposes).
-        // For GCM we want each inst to have a single canonical "home" block,
-        // and that home must be the *dominating* placement — otherwise the
-        // move phase below would treat the inst as if it lived in a
-        // non-dominating block and uselessly migrate it, dropping the
-        // duplicate references the CFG cleanup passes rely on.  Walking in
-        // domtree preorder and using `or_insert` picks the highest block.
+        // For each pure inst, compute target = LCA of its users' blocks in
+        // the domtree. Loop to fixed point so hoisting a consumer also pulls
+        // its pure-inst args up (hoisting an `iadd` to a diamond's dominator
+        // pulls the `iconst` along too). Then apply moves only when the
+        // target strictly hoists and every arg's def block dominates the new
+        // placement; otherwise leave it and let `finalize_gcm_validity` clone
+        // the arg locally.
+        //
+        // `rebuild_layout` can place the same InstId in multiple block lists
+        // (any block using a value pulls in its defining pure inst). For GCM
+        // we want each inst's "home" to be the dominating placement, else
+        // the move phase would shuffle it pointlessly and break the
+        // duplicate references the CFG cleanups rely on. Walking in domtree
+        // preorder + `or_insert` picks the highest block.
         let mut inst_block: FxHashMap<InstId, BlockId> = FxHashMap::default();
         for &block_id in &preorder {
             for &iid in &self.layout.block_data[&block_id].insts {
@@ -1656,9 +1522,8 @@ impl EgraphPass {
             }
         }
 
-        // value -> defining InstId (for pure insts currently placed in a
-        // block).  Stable across the iteration since neither CSE nor GCM
-        // creates new insts.
+        // value -> defining InstId. Stable across the iteration since
+        // neither CSE nor GCM creates new insts.
         let mut def_of: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for (&iid, _) in &inst_block {
             for &r in self.dfg.inst_results(iid) {
@@ -1666,10 +1531,9 @@ impl EgraphPass {
             }
         }
 
-        // Pre-compute per-inst list of (user_kind) — either a pure InstId
-        // (whose target participates in LCA propagation) or a fixed block
-        // (skeleton use).  Built once from the post-CSE layout and reused
-        // across GCM iterations.
+        // Per-inst user list: pure-inst users (whose target participates in
+        // LCA propagation) vs skeleton users pinned to a block. Built once
+        // from the post-CSE layout and reused across GCM iterations.
         enum UserKind {
             PureInst(InstId),
             FixedBlock(BlockId),
@@ -1696,7 +1560,7 @@ impl EgraphPass {
             }
         }
 
-        // Initialize target = current block for each pure inst.
+        // Start with target = current block for each pure inst.
         let mut target: FxHashMap<InstId, BlockId> = FxHashMap::default();
         for (&iid, &b) in &inst_block {
             if self.dfg.insts[&iid].opcode.is_pure() {
@@ -1704,12 +1568,11 @@ impl EgraphPass {
             }
         }
 
-        // Iterate until fixed point.  Because LCA only moves targets UP
-        // (closer to entry) in the domtree and the depth is bounded, this
-        // is guaranteed to converge.
+        // Loop to fixed point. LCA only moves targets up (closer to entry),
+        // and depth is bounded, so this terminates.
         for _iter in 0..64 {
             let mut changed = false;
-            // Process in reverse preorder so consumers settle before args.
+            // Reverse preorder: consumers settle before their args.
             let pure_list: Vec<InstId> = preorder
                 .iter()
                 .rev()
@@ -1723,7 +1586,7 @@ impl EgraphPass {
                 if users.is_empty() {
                     continue;
                 }
-                // Gather user blocks (using current targets for pure users).
+                // User blocks (using current targets for pure users).
                 let mut iter = users.iter().filter_map(|uk| match uk {
                     UserKind::PureInst(iid) => target.get(iid).copied(),
                     UserKind::FixedBlock(b) => Some(*b),
@@ -1757,12 +1620,10 @@ impl EgraphPass {
             }
         }
 
-        // Apply the computed targets.  For each inst, check that its arg
-        // sources all dominate the target block.  If any arg is in an
-        // incompatible block (e.g. CSE canonicalized across a diamond and
-        // the corresponding inst couldn't be hoisted), revert the move for
-        // this inst — the subsequent `finalize_gcm_validity` pass will
-        // duplicate the arg-def inst where needed to restore SSA.
+        // Apply targets. For each inst, every arg's source block must
+        // dominate the target. If not (e.g. CSE canonicalized across a
+        // diamond and the arg couldn't be hoisted), skip the move — the
+        // duplication pass below will handle it.
         for (&inst_id, &new_block) in target.clone().iter() {
             let current = match inst_block.get(&inst_id).copied() {
                 Some(b) => b,
@@ -1772,9 +1633,8 @@ impl EgraphPass {
                 continue;
             }
             if !self.domtree.block_dominates(new_block, current) {
-                continue; // we only hoist, never sink
+                continue; // hoist only, never sink
             }
-            // Arg check: every arg's source block must dominate new_block.
             let inst = self.dfg.insts[&inst_id].clone();
             let mut valid = true;
             for &arg in &inst.args {
@@ -1796,7 +1656,6 @@ impl EgraphPass {
             if !valid {
                 continue;
             }
-            // Move.
             let cur_block = self.layout.block_data.get_mut(&current).unwrap();
             cur_block.insts.retain(|&i| i != inst_id);
             self.layout
@@ -1808,11 +1667,10 @@ impl EgraphPass {
             inst_block.insert(inst_id, new_block);
         }
 
-        // Finalize validity: if any inst references an arg whose defining
-        // inst is in a block that doesn't dominate the user's block, CSE
-        // produced an unsound canonicalization that GCM couldn't fix.
-        // Duplicate the arg-def inst locally in the user's block.  Iterate
-        // until a fixed point; fresh duplicates may themselves need args.
+        // Restore SSA dominance: if any arg's defining inst is in a non-
+        // dominating block (because CSE merged across a diamond and GCM
+        // couldn't hoist it), clone the def into the user's block. Iterate
+        // since fresh duplicates may have the same problem.
         for _ in 0..16 {
             let mut changed = false;
             let blocks_snapshot: Vec<BlockId> = preorder.clone();
@@ -1834,11 +1692,10 @@ impl EgraphPass {
                             if self.domtree.block_dominates(def_block, block_id) {
                                 continue;
                             }
-                            // Clone the defining instruction into this block.
+                            // Clone the def into this block. Topo sort fixes order.
                             let orig = self.dfg.insts[&def_id].clone();
                             let new_inst_id = self.dfg.make_inst(orig.clone());
                             let new_result = self.dfg.make_inst_result(new_inst_id, orig.ty);
-                            // Place in user's block (topo sort handles order).
                             self.layout
                                 .block_data
                                 .get_mut(&block_id)
@@ -1866,13 +1723,13 @@ impl EgraphPass {
             }
         }
 
-        // ----- Phase 5: topologically sort each block's instruction list -----
+        // ----- Phase 5: topo-sort each block's inst list -----
         for &block_id in &preorder {
             let sorted = self.topo_sort_block_insts(block_id);
             self.layout.block_data.get_mut(&block_id).unwrap().insts = sorted;
         }
 
-        // ----- Phase 6: remove dead pure insts (no user in the function) -----
+        // ----- Phase 6: drop pure insts with no users -----
         loop {
             let mut used: FxHashSet<ValueId> = FxHashSet::default();
             for &block_id in &preorder {
@@ -1907,9 +1764,8 @@ impl EgraphPass {
         }
     }
 
-    /// Topologically sort the instructions currently assigned to `block_id`
-    /// so that every instruction's args are defined before it is used.  The
-    /// single terminator (branch/return) is always emitted last.
+    /// Topo-sort the insts in a block so defs come before uses. Terminator
+    /// is pinned last.
     fn topo_sort_block_insts(&self, block_id: BlockId) -> Vec<InstId> {
         let block = &self.layout.block_data[&block_id];
         if block.insts.is_empty() {
@@ -1917,7 +1773,6 @@ impl EgraphPass {
         }
         let inst_set: FxHashSet<InstId> = block.insts.iter().copied().collect();
 
-        // Identify the terminator (pinned to the end).
         let terminator = block
             .insts
             .iter()
@@ -1928,7 +1783,6 @@ impl EgraphPass {
             })
             .copied();
 
-        // Value -> defining inst, restricted to this block.
         let mut def_map: FxHashMap<ValueId, InstId> = FxHashMap::default();
         for &iid in &block.insts {
             for &r in self.dfg.inst_results(iid) {
@@ -1953,8 +1807,8 @@ impl EgraphPass {
             }
         }
 
-        // Kahn's algorithm.  Pop smallest InstId first for determinism and
-        // defer the terminator until all others are scheduled.
+        // Kahn's algorithm. Pop smallest InstId first for determinism and
+        // defer the terminator until everything else is scheduled.
         let mut ready: Vec<InstId> = in_deg
             .iter()
             .filter(|(&iid, &d)| d == 0 && Some(iid) != terminator)
@@ -1984,7 +1838,7 @@ impl EgraphPass {
     }
 }
 
-/// Context for optimization
+/// Shared mutable context for the per-instruction optimization loop.
 struct OptimizeCtx<'a> {
     dfg: &'a mut DataFlowGraph,
     value_to_opt_value: &'a mut FxHashMap<ValueId, ValueId>,
@@ -2001,12 +1855,8 @@ struct OptimizeCtx<'a> {
 }
 
 impl<'a> OptimizeCtx<'a> {
-    /// Insert a pure enode (instruction) into the egraph
-    ///
-    /// This is the core of the egraph construction:
-    /// 1. Check GVN map - if instruction already exists, reuse it
-    /// 2. If new, insert it and apply optimization rules
-    /// 3. Create unions for equivalent forms
+    /// Insert a pure inst into the egraph: GVN-dedupe, then apply rewrites
+    /// and create unions for any equivalent forms.
     fn insert_pure_enode(&mut self, inst_id: InstId) -> ValueId {
         self.stats.pure_inst += 1;
 
@@ -2018,7 +1868,6 @@ impl<'a> OptimizeCtx<'a> {
 
         match self.gvn_map.entry(key) {
             ScopedEntry::Occupied(entry) => {
-                // Found existing instruction
                 self.stats.pure_inst_deduped += 1;
 
                 if let Some(existing_value) = entry.get() {
@@ -2031,13 +1880,12 @@ impl<'a> OptimizeCtx<'a> {
                     return *existing_value;
                 }
 
-                // Shouldn't reach here, but handle gracefully
+                // Shouldn't reach here, but be safe.
                 self.value_to_opt_value.insert(result, result);
                 result
             }
 
             ScopedEntry::Vacant(entry) => {
-                // New instruction - insert it
                 self.stats.pure_inst_insert_new += 1;
 
                 self.value_to_opt_value.insert(result, result);
@@ -2045,15 +1893,13 @@ impl<'a> OptimizeCtx<'a> {
 
                 entry.insert(Some(result));
 
-                // Cache opcode before apply_rewrites_and_union mutates state.
+                // Cache opcode; apply_rewrites_and_union mutates state.
                 let inst_opcode = inst.opcode;
 
-                // Apply rewrite rules and create unions
                 let opt_result = self.apply_rewrites_and_union(result);
 
-                // Second pass: create conditional unions for range-dependent
-                // rewrites.  Skip when no range-conditioned rule can match
-                // this opcode — this is the common case for most arithmetic.
+                // Second pass for range-conditioned rewrites. Skip if no
+                // range-conditioned rule can possibly match this opcode.
                 if self.path_sensitive
                     && (self.rewrite_engine.has_unconstrained_range_rule
                         || self
@@ -2069,9 +1915,7 @@ impl<'a> OptimizeCtx<'a> {
         }
     }
 
-    /// Apply rewrite rules and create union nodes
-    ///
-    /// This is the key integration point with the pattern-based rewrite system.
+    /// Apply rewrite rules and create union nodes for the results.
     fn apply_rewrites_and_union(&mut self, value: ValueId) -> ValueId {
         if self.rewrite_depth >= REWRITE_LIMIT {
             self.stats.rewrite_depth_limit += 1;
@@ -2083,13 +1927,12 @@ impl<'a> OptimizeCtx<'a> {
 
         let mut union_value = value;
 
-        // Range-conditioned rewrites are handled by
-        // apply_conditional_rewrites_and_store, which decides whether to
-        // create an unconditional or conditional union based on whether
-        // the range facts are globally provable or branch-local.
-        // Passing range assumptions here would create permanent
-        // ValueDef::Union nodes from branch-local facts, which is unsound
-        // because the extractor follows unions without range guards.
+        // Range-conditioned rewrites are handled separately in
+        // apply_conditional_rewrites_and_store, which picks unconditional vs
+        // conditional unions based on whether the facts are globally provable.
+        // Passing range assumptions here would unsoundly create unconditional
+        // unions from branch-local facts (the extractor follows unions
+        // without checking range guards).
         let rewrites = self
             .rewrite_engine
             .apply_rewrites_with_ranges(self.dfg, value, None);
@@ -2097,9 +1940,8 @@ impl<'a> OptimizeCtx<'a> {
         for rewritten in rewrites {
             self.stats.rewrite_rule_results += 1;
 
-            // Recursively optimize the rewritten value
+            // Recursively optimize the rewritten value.
             let opt_value = if let ValueDef::Inst(rewritten_inst) = self.dfg.value_def(rewritten) {
-                // Check if we should process this rewrite
                 if self.subsume_values.contains(&rewritten) {
                     self.stats.pure_inst_subsume += 1;
                     rewritten
@@ -2111,9 +1953,9 @@ impl<'a> OptimizeCtx<'a> {
                 rewritten
             };
 
-            // If the rewritten value is simpler (constant or block param), update
-            // value_to_opt_value so that subsequent instruction arg rewrites see the
-            // simplified form rather than the union node.
+            // If the rewritten value is simpler (constant or block param),
+            // update value_to_opt_value so later arg rewrites see it instead
+            // of the union node.
             if opt_value != value {
                 let is_simpler = match self.dfg.value_defs.get(&opt_value).copied() {
                     Some(ValueDef::Inst(iid)) => self.dfg.insts[&iid].opcode == Opcode::Const,
@@ -2125,11 +1967,10 @@ impl<'a> OptimizeCtx<'a> {
                 }
             }
 
-            // Create union between original and rewritten
             let new_union = self.dfg.make_union(union_value, opt_value);
             self.stats.union += 1;
 
-            // Merge availability: use the block that dominates both
+            // Availability is the block that dominates both.
             let avail = self.merge_availability(union_value, opt_value);
             self.available_block.insert(new_union, avail);
 
@@ -2140,61 +1981,44 @@ impl<'a> OptimizeCtx<'a> {
         union_value
     }
 
-    /// Returns `true` if the tightest known range for `value` in the current
-    /// scope is strictly tighter than it would be in the root scope (depth 0).
-    ///
-    /// This distinguishes branch-local assumptions (pushed by dominator-tree
-    /// traversal through conditional branches) from globally provable facts.
+    /// True when the current range for `value` is tighter than the root
+    /// scope's — i.e., it relies on a branch-local assumption.
     fn is_branch_local(&self, value: ValueId, range: &Range) -> bool {
         if self.range_assumptions.depth() == 0 {
             return false;
         }
         let root = self.range_assumptions.root_range(value);
-        // The current range is branch-local if it is strictly contained in
-        // the root range (i.e., the root range alone does not prove this fact).
         !(root.min >= range.min && root.max <= range.max)
     }
 
-    /// Handle ALL range-conditioned rewrites.  For each rewrite rule whose
-    /// range-based conditions are currently satisfied, this method creates:
-    ///
-    /// - An **unconditional** union (via `make_union`) when every range fact
-    ///   is globally provable (root scope suffices).
-    /// - A **conditional** union (via `make_conditional_union`) when at least
-    ///   one range fact is branch-local.
+    /// Drive every range-conditioned rewrite. For each rule whose range
+    /// conditions hold, create an unconditional union if the facts are
+    /// globally provable, or a conditional union (guarded by the branch-
+    /// local facts) otherwise.
     fn apply_conditional_rewrites_and_store(&mut self, value: ValueId) {
-        // Only consider instruction-defined values.
         let defining_inst = match self.dfg.value_def(value) {
             ValueDef::Inst(id) => id,
             _ => return,
         };
 
-        // Fast path: no range-conditioned rules at all.
         if self.rewrite_engine.range_rule_indices.is_empty() {
             return;
         }
 
-        // Filter by the defining instruction's opcode: only rules whose LHS
-        // top-level is either `Pattern::Op { opcode: <matching> }` or a
-        // non-Op variant (Or/Var/Where) can possibly match.  Rules with a
-        // concrete mismatched top-level opcode are skipped without running
-        // the pattern matcher.
+        // Filter by the defining opcode: rules with a concrete mismatched
+        // top-level opcode can't match, skip them without running the matcher.
         let defining_opcode = self.dfg.insts[&defining_inst].opcode;
 
         let ra_ptr = &*self.range_assumptions as *const RangeAssumptions;
-        // SAFETY: The pointee is not mutated through the raw pointer while
-        // this shared reference is live.  We only read range assumptions
-        // below; `self.dfg` is the only field mutated during the loop.
+        // SAFETY: only `self.dfg` is mutated below; the pointee is not
+        // touched through this pointer while the shared ref is live.
         let ra = unsafe { &*ra_ptr };
 
-        // Temporarily move `rules` out so we can iterate without cloning the
-        // entire library.  This pass is called once per pure instruction in
-        // path-sensitive mode, so the clone was a major hot spot.
+        // Move `rules` out so we can iterate without cloning the whole
+        // library — this is called per pure inst in path-sensitive mode and
+        // the clone was a major hotspot.
         let rules = std::mem::take(&mut self.rewrite_engine.library.rules);
 
-        // Iterate only over rules with range-based conditions, using the
-        // precomputed index list.  Skip rules whose LHS has a concrete
-        // top-level opcode that cannot possibly match this instruction.
         for &(rule_idx, top_op) in &self.rewrite_engine.range_rule_indices {
             if let Some(op) = top_op {
                 if op != defining_opcode {
@@ -2207,7 +2031,6 @@ impl<'a> OptimizeCtx<'a> {
                 continue;
             }
 
-            // Try to match the LHS pattern.
             let matcher = PatternMatcher::new(self.dfg);
             let mut bindings = match matcher.match_pattern(&rule.lhs, value) {
                 Some(b) => b,
@@ -2215,12 +2038,11 @@ impl<'a> OptimizeCtx<'a> {
             };
             bindings.set_range_assumptions(ra);
 
-            // Check that all conditions hold.
             if !rule.check_conditions(&bindings) {
                 continue;
             }
 
-            // Determine which range facts are branch-local.
+            // Split range facts into branch-local vs globally provable.
             let mut branch_local_facts: Vec<(ValueId, Range)> = Vec::new();
             let mut all_global = true;
 
@@ -2234,7 +2056,6 @@ impl<'a> OptimizeCtx<'a> {
                 }
             }
 
-            // Apply the RHS to produce the rewritten value.
             let mut applier = PatternApplier::new(self.dfg);
             let new_value = match applier.apply_pattern(&rule.rhs, &bindings) {
                 Some(v) if v != value => v,
@@ -2242,12 +2063,11 @@ impl<'a> OptimizeCtx<'a> {
             };
 
             if all_global {
-                // All range facts are globally provable — safe to create an
-                // unconditional union.
+                // Safe to create an unconditional union.
                 let union_node = self.dfg.make_union(value, new_value);
                 self.stats.union += 1;
 
-                // Propagate simpler-value information so the extractor sees it.
+                // Surface simpler results so the extractor sees them.
                 let is_simpler = match self.dfg.value_defs.get(&new_value).copied() {
                     Some(ValueDef::Inst(iid)) => self.dfg.insts[&iid].opcode == Opcode::Const,
                     Some(ValueDef::BlockParam(_, _)) => true,
@@ -2257,7 +2077,6 @@ impl<'a> OptimizeCtx<'a> {
                     self.value_to_opt_value.insert(value, new_value);
                 }
 
-                // Ensure new_value has an availability entry before merging.
                 if !self.available_block.contains_key(&new_value) {
                     if let Some(&blk) = self.available_block.get(&value) {
                         self.available_block.insert(new_value, blk);
@@ -2268,8 +2087,7 @@ impl<'a> OptimizeCtx<'a> {
                 continue;
             }
 
-            // Some facts are branch-local — create a conditional union guarded
-            // by the branch-local assumptions.
+            // Branch-local facts — guard the union with them.
             let assumption_set = AssumptionSet {
                 assumptions: branch_local_facts,
             };
@@ -2279,11 +2097,10 @@ impl<'a> OptimizeCtx<'a> {
                 .make_conditional_union(value, new_value, assumption_set);
         }
 
-        // Restore the borrowed rules vector.
         self.rewrite_engine.library.rules = rules;
     }
 
-    /// Collect range-based conditions from a slice of conditions (flattening And).
+    /// Flatten And-nested range conditions into a single list.
     fn collect_range_conditions(conditions: &[Condition]) -> Vec<Condition> {
         let mut result = Vec::new();
         for cond in conditions {
@@ -2303,14 +2120,12 @@ impl<'a> OptimizeCtx<'a> {
                 Condition::And(inner) => {
                     result.extend(Self::collect_range_conditions(inner));
                 }
-                _ => {}
             }
         }
         result
     }
 
-    /// Extract the `(ValueId, required Range)` from a range-based condition,
-    /// using the bindings to resolve the variable to a concrete ValueId.
+    /// Extract the (ValueId, required Range) implied by a range condition.
     fn condition_to_range_fact(cond: &Condition, bindings: &Bindings) -> Option<(ValueId, Range)> {
         match cond {
             Condition::InRange(var, min, max) => {
@@ -2345,8 +2160,7 @@ impl<'a> OptimizeCtx<'a> {
         }
     }
 
-    /// Resolve a value through value_to_opt_value and then check if it's a constant.
-    /// Returns Some(const_val) if the value maps to a known constant.
+    /// Resolve through value_to_opt_value and return the constant if any.
     fn resolve_to_const(&self, value: ValueId) -> Option<i64> {
         let opt = *self.value_to_opt_value.get(&value).unwrap_or(&value);
         match self.dfg.value_defs.get(&opt).copied() {
@@ -2361,25 +2175,22 @@ impl<'a> OptimizeCtx<'a> {
         }
     }
 
-    /// Optimize a skeleton instruction
-    ///
-    /// These instructions stay in the layout but can still benefit from:
-    /// - GVN (if idempotent)
-    /// - Alias analysis (for loads/stores)
+    /// Skeleton (impure) inst optimizations: dead-branch elimination plus
+    /// GVN for mergeable opcodes. These stay in the layout.
     fn optimize_skeleton_inst(&mut self, inst_id: InstId, block: BlockId) {
         self.stats.skeleton_inst += 1;
 
         let inst = self.dfg.insts[&inst_id].clone();
 
-        // Dead branch elimination: if a CondBranch condition is a known constant,
-        // convert it to an unconditional Branch.
+        // CondBranch with a known-constant condition becomes an
+        // unconditional Branch.
         if inst.opcode == Opcode::CondBranch {
             if let Some(BranchInfo::Conditional(then_block, then_count, else_block, else_count)) =
                 inst.branch_info.clone()
             {
                 if let Some(cond_val) = inst.args.first().copied() {
                     let const_val = self.resolve_to_const(cond_val).or_else(|| {
-                        // Also check range: if range is [1,1] or [0,0]
+                        // Also accept a singleton range as a constant.
                         let r = self.range_assumptions.get_range(cond_val);
                         if r.min == r.max {
                             Some(r.min)
@@ -2407,7 +2218,6 @@ impl<'a> OptimizeCtx<'a> {
                             BranchInfo::Jump(target),
                         );
                         self.dfg.insts.insert(inst_id, new_inst);
-                        // Map any results to themselves
                         for &result in self.dfg.inst_results(inst_id) {
                             self.value_to_opt_value.insert(result, result);
                             self.available_block.insert(result, block);
@@ -2418,14 +2228,13 @@ impl<'a> OptimizeCtx<'a> {
             }
         }
 
-        // Try to GVN if the operation is idempotent
+        // GVN idempotent skeleton ops.
         if inst.opcode.is_mergeable() {
             let key = (inst.ty, inst.clone());
 
             match self.gvn_map.entry(key) {
                 ScopedEntry::Occupied(entry) => {
                     if let Some(existing_value) = entry.get() {
-                        // get value of the existing instruction
                         if let ValueDef::Inst(existing_inst_id) =
                             self.dfg.value_def(*existing_value)
                         {
@@ -2440,13 +2249,11 @@ impl<'a> OptimizeCtx<'a> {
                                 }
 
                                 return;
-                            } else {
                             }
                         }
                     }
                 }
                 ScopedEntry::Vacant(entry) => {
-                    // New instruction
                     let result = self.dfg.first_result(inst_id);
                     self.value_to_opt_value.insert(result, result);
                     self.available_block.insert(result, block);
@@ -2454,7 +2261,7 @@ impl<'a> OptimizeCtx<'a> {
                 }
             }
         } else {
-            // Non-mergeable skeleton instruction - just map results to themselves
+            // Non-mergeable: identity-map the results.
             for &result in self.dfg.inst_results(inst_id) {
                 self.value_to_opt_value.insert(result, result);
                 self.available_block.insert(result, block);
@@ -2462,14 +2269,11 @@ impl<'a> OptimizeCtx<'a> {
         }
     }
 
-    /// Compute where a pure instruction becomes available
-    ///
-    /// A pure instruction is available at the highest (closest to entry)
-    /// block where all its arguments are available.
+    /// Block where a pure inst becomes available — the deepest
+    /// (furthest-from-entry) block where every arg is available.
     fn get_available_block(&self, inst_id: InstId) -> BlockId {
         let inst = &self.dfg.insts[&inst_id];
 
-        // Find the deepest (furthest from entry) available block among all args
         inst.args
             .iter()
             .filter_map(|&arg| self.available_block.get(&arg).copied())
@@ -2481,14 +2285,12 @@ impl<'a> OptimizeCtx<'a> {
                 }
             })
             .unwrap_or_else(|| {
-                // No args, so available at entry
+                // No args: available at entry.
                 *self.gvn_map_blocks.first().unwrap()
             })
     }
 
-    /// Merge availability of two values (for union nodes)
-    ///
-    /// The union is available at whichever block dominates the other
+    /// Block where a union becomes available — whichever side dominates.
     fn merge_availability(&self, a: ValueId, b: ValueId) -> BlockId {
         let a_block = self.available_block[&a];
         let b_block = self.available_block[&b];
