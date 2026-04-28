@@ -406,12 +406,11 @@ impl RangeAssumptions {
             .unwrap_or(false)
     }
 
-    /// Given that `value` is known to be nonzero, walk backward through the
-    /// DFG and record range facts.  Returns all leaf-level facts discovered.
+    /// `value` is known to be nonzero, so collect leaf-level facts from
+    /// the DFG and record them as range facts.
     ///
     /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, true)
     /// - band(a, b): both operands nonzero, so recurse into each
-    /// - bor(a, b): only the result is nonzero, just mark_nonzero
     /// - Otherwise: mark_nonzero
     pub fn refine_nonzero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
         self.refine_nonzero_inner(value, dfg, 0)
@@ -444,14 +443,12 @@ impl RangeAssumptions {
                 }
                 self.mark_nonzero(value);
             } else if inst.opcode == Opcode::And && inst.args.len() == 2 {
-                // band(a, b) nonzero → both a and b are nonzero
                 let args = inst.args.clone();
                 for &operand in &args {
                     let sub_facts = self.refine_nonzero_inner(operand, dfg, depth + 1);
                     facts.extend(sub_facts);
                 }
             } else if inst.opcode == Opcode::Or && inst.args.len() == 2 {
-                // bor(a, b) nonzero → at least one is nonzero, can't say which
                 self.mark_nonzero(value);
             } else {
                 self.mark_nonzero(value);
@@ -463,12 +460,11 @@ impl RangeAssumptions {
         facts
     }
 
-    /// Given that `value` is known to be zero, walk backward through the DFG
-    /// and record range facts.  Returns all leaf-level facts discovered.
+    /// `value` is known to be zero, so collect leaf-level facts from
+    /// the DFG and record them as range facts.
     ///
     /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, false)
     /// - bor(a, b): both operands zero then recurse into each
-    /// - band(a, b): at least one is zero, can't say which
     /// - Otherwise: assume_range(value, singleton(0))
     pub fn refine_zero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
         self.refine_zero_inner(value, dfg, 0)
