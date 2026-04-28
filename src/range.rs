@@ -150,9 +150,6 @@ impl Range {
         self.max < value || self.min > value
     }
 
-    // --- Range arithmetic (transfer functions) ---
-
-    /// Compute the range of (self + other), saturating on overflow.
     pub fn add(&self, other: &Range) -> Range {
         Range {
             min: self.min.saturating_add(other.min),
@@ -160,7 +157,6 @@ impl Range {
         }
     }
 
-    /// Compute the range of (self - other), saturating on overflow.
     pub fn sub(&self, other: &Range) -> Range {
         Range {
             min: self.min.saturating_sub(other.max),
@@ -168,7 +164,6 @@ impl Range {
         }
     }
 
-    /// Compute the range of (self * other), saturating on overflow.
     pub fn mul(&self, other: &Range) -> Range {
         let products = [
             self.min.saturating_mul(other.min),
@@ -182,12 +177,9 @@ impl Range {
         }
     }
 
-    /// Compute the range of a bitwise AND. Conservative: if both non-negative,
-    /// result is in [0, min(self.max, other.max)].
+    /// Compute the range of a bitwise AND
     pub fn bitand(&self, other: &Range) -> Range {
         if self.is_non_negative() && other.is_non_negative() {
-            // When one operand is a singleton and the other range is small,
-            // enumerate for an exact result.
             if self.is_singleton() && (other.max - other.min) <= 64 {
                 let c = self.min;
                 let mut min_r = i64::MAX;
@@ -208,10 +200,9 @@ impl Range {
         }
     }
 
-    /// Compute the range of a bitwise OR. Conservative.
+    /// Compute the range of a bitwise OR
     pub fn bitor(&self, other: &Range) -> Range {
         if self.is_non_negative() && other.is_non_negative() {
-            // Upper bound: next power of two above max of both, minus 1
             let upper = self.max.max(other.max) as u64;
             let bound = upper
                 .checked_next_power_of_two()
@@ -224,16 +215,13 @@ impl Range {
         }
     }
 
-    /// Compute the range of a negation (-self).
     pub fn neg(&self) -> Range {
-        // -[a, b] = [-b, -a], with saturation for i64::MIN
         Range {
             min: 0i64.saturating_sub(self.max),
             max: 0i64.saturating_sub(self.min),
         }
     }
 
-    /// Compute the range of a left shift by a constant amount.
     pub fn shl_const(&self, amount: i64) -> Range {
         if amount < 0 || amount >= 63 {
             return Range::unbounded();
@@ -244,7 +232,6 @@ impl Range {
         }
     }
 
-    /// Compute the range of an arithmetic right shift by a constant.
     pub fn sshr_const(&self, amount: i64) -> Range {
         if amount < 0 || amount >= 63 {
             return Range::unbounded();
@@ -282,13 +269,10 @@ impl std::fmt::Display for Range {
 #[derive(Debug, Clone)]
 pub struct RangeAssumptions {
     scopes: Vec<HashMap<ValueId, Range>>,
-    /// Parallel scope stack tracking values known to be nonzero.
-    /// Cloned on push_scope, popped on pop_scope.
     nonzero_scopes: Vec<HashSet<ValueId>>,
 }
 
 impl RangeAssumptions {
-    /// Create a new empty assumptions store with one root scope.
     pub fn new() -> Self {
         Self {
             scopes: vec![HashMap::new()],
@@ -350,7 +334,6 @@ impl RangeAssumptions {
         self.assume_range(value, Range::positive());
     }
 
-    /// Get the current (tightest known) range for a value.
     pub fn get_range(&self, value: ValueId) -> Range {
         self.scopes
             .last()
@@ -360,11 +343,7 @@ impl RangeAssumptions {
             .unwrap_or(Range::unbounded())
     }
 
-    /// Query the range for a value in the root scope (depth 0).
-    ///
-    /// This returns what is known about `value` without any branch-local
-    /// assumptions. Useful for distinguishing globally-provable facts from
-    /// context-dependent ones.
+    /// Query the range for a value in the root scope (depth 0)
     pub fn root_range(&self, value: ValueId) -> Range {
         self.scopes
             .first()
@@ -410,15 +389,12 @@ impl RangeAssumptions {
         self.get_range(value).is_empty()
     }
 
-    /// Mark a value as definitely nonzero in the current scope.
     pub fn mark_nonzero(&mut self, value: ValueId) {
         if let Some(nz) = self.nonzero_scopes.last_mut() {
             nz.insert(value);
         }
     }
 
-    /// Check if a value is known to be nonzero (either its range excludes 0,
-    /// or it was explicitly marked via `mark_nonzero`).
     pub fn is_nonzero(&self, value: ValueId) -> bool {
         let range = self.get_range(value);
         if !range.contains(0) {
@@ -434,8 +410,8 @@ impl RangeAssumptions {
     /// DFG and record range facts.  Returns all leaf-level facts discovered.
     ///
     /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, true)
-    /// - band(a, b): both operands nonzero → recurse into each
-    /// - bor(a, b): only the result is nonzero → mark_nonzero
+    /// - band(a, b): both operands nonzero, so recurse into each
+    /// - bor(a, b): only the result is nonzero, just mark_nonzero
     /// - Otherwise: mark_nonzero
     pub fn refine_nonzero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
         self.refine_nonzero_inner(value, dfg, 0)
@@ -491,7 +467,7 @@ impl RangeAssumptions {
     /// and record range facts.  Returns all leaf-level facts discovered.
     ///
     /// - Comparison: learn_from_comparison(opcode, lhs, rhs_const, false)
-    /// - bor(a, b): both operands zero → recurse into each
+    /// - bor(a, b): both operands zero then recurse into each
     /// - band(a, b): at least one is zero, can't say which
     /// - Otherwise: assume_range(value, singleton(0))
     pub fn refine_zero(&mut self, value: ValueId, dfg: &DataFlowGraph) -> Vec<(ValueId, Range)> {
@@ -525,14 +501,12 @@ impl RangeAssumptions {
                 }
                 self.assume_range(value, Range::singleton(0));
             } else if inst.opcode == Opcode::Or && inst.args.len() == 2 {
-                // bor(a, b) == 0 → both a and b are zero
                 let args = inst.args.clone();
                 for &operand in &args {
                     let sub_facts = self.refine_zero_inner(operand, dfg, depth + 1);
                     facts.extend(sub_facts);
                 }
             } else if inst.opcode == Opcode::And && inst.args.len() == 2 {
-                // band(a, b) == 0 → at least one is zero, can't say which
                 self.assume_range(value, Range::singleton(0));
             } else {
                 self.assume_range(value, Range::singleton(0));
@@ -574,10 +548,6 @@ pub struct RangeAssumptionsStats {
     pub unique_values: usize,
 }
 
-/// Compute the output range of an instruction given the ranges of its inputs.
-///
-/// This is the core transfer function that propagates range information
-/// forward through arithmetic and logical operations.
 pub fn compute_inst_range(
     opcode: crate::types::Opcode,
     arg_ranges: &[Range],
@@ -666,7 +636,6 @@ pub fn compute_inst_range(
             }
         }
 
-        // Comparisons always produce 0 or 1
         Opcode::Eq
         | Opcode::Ne
         | Opcode::Slt
@@ -678,8 +647,6 @@ pub fn compute_inst_range(
         | Opcode::Ugt
         | Opcode::Uge => Range::new(0, 1),
 
-        // Division: conservative, but if divisor is a known positive constant
-        // and dividend is non-negative, we can narrow the range.
         Opcode::Div => {
             if arg_ranges.len() == 2 {
                 if let Some(divisor) = arg_ranges[1].as_singleton() {
@@ -698,18 +665,14 @@ pub fn compute_inst_range(
             }
         }
 
-        // --- New opcodes ---
         Opcode::Iabs => {
             if arg_ranges.len() == 1 {
                 let r = &arg_ranges[0];
                 if r.min >= 0 {
-                    // Already non-negative
                     Range::new(r.min, r.max)
                 } else if r.max < 0 {
-                    // Entirely negative: |[a,b]| = [-b, -a]
                     Range::new(0i64.saturating_sub(r.max), 0i64.saturating_sub(r.min))
                 } else {
-                    // Straddles zero
                     Range::new(0, std::cmp::max(0i64.saturating_sub(r.min), r.max))
                 }
             } else {
