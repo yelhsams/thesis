@@ -58,13 +58,12 @@ impl DominatorTree {
     /// Build a dominator tree from an explicit CFG.
     ///
     /// `root` is the entry block.  `edges` maps each block to its
-    /// dominator-tree *children*
+    /// dominator-tree children
     pub fn from_cfg(root: BlockId, edges: &[(BlockId, Vec<BlockId>)]) -> Self {
         let mut tree = Self::new();
 
         let children_map: HashMap<BlockId, Vec<BlockId>> = edges.iter().cloned().collect();
 
-        // Build idom + children from the explicit tree edges
         fn walk(
             block: BlockId,
             parent: Option<BlockId>,
@@ -261,13 +260,13 @@ impl DominatorTree {
             .unwrap_or(&[])
     }
 
-    /// Return the immediate dominator of `block`, if any.
+    /// Return the immediate dominator
     pub fn idom_of(&self, block: BlockId) -> Option<BlockId> {
         self.idom.get(&block).copied()
     }
 
     /// Compute the lowest common ancestor of `a` and `b` in the dominator
-    /// tree — the deepest block that dominates both.
+    /// tree
     pub fn lca(&self, a: BlockId, b: BlockId) -> Option<BlockId> {
         if self.block_dominates(a, b) {
             return Some(a);
@@ -292,8 +291,6 @@ impl DominatorTree {
 }
 
 /// Scoped hash map for GVN (Global Value Numbering)
-///
-/// This is a hash map with scope levels.
 pub struct ScopedHashMap<K, V> {
     /// The underlying map
     map: HashMap<K, Vec<(usize, V)>>,
