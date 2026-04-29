@@ -1,9 +1,5 @@
-//! Elaboration: Extract the best version from the egraph
-//!
-//! After building the egraph with union nodes representing equivalent
-//! expressions, we need to:
-//! 1. Select the "best" form of each value
-//! 2. Place those instructions back into the CFG layout
+//! Elaboration: pull the best version of each value out of the egraph and
+//! put it back into the CFG layout.
 
 use crate::range::RangeAssumptions;
 use crate::support::*;
@@ -71,28 +67,26 @@ pub struct Elaborator<'a> {
     domtree: &'a DominatorTree,
     cost_model: DefaultCostModel,
 
-    /// Cache: value -> (best_cost, best_defining_inst)
+    /// value -> (best_cost, best_defining_inst)
     best_value_cache: HashMap<ValueId, (Cost, Option<InstId>)>,
 
-    /// Memoization: (value, block) -> elaborated value in that block
+    /// (value, block) -> elaborated value in that block
     elaborated_cache: HashMap<(ValueId, BlockId), ValueId>,
 
-    /// Mutable range assumptions active at the current extraction site.
+    /// Range assumptions active at the current extraction site.
     pub range_assumptions: Option<&'a mut RangeAssumptions>,
 
-    /// Block entry facts per CFG edge, used to apply range assumptions
-    /// when entering each block during the domtree walk.
+    /// Range facts per CFG edge, applied when entering each block.
     block_entry_facts: &'a FxHashMap<(BlockId, BlockId), Vec<(ValueId, crate::range::Range)>>,
 
-    /// CFG predecessor map for looking up incoming edges per block.
     cfg_preds: &'a FxHashMap<BlockId, Vec<BlockId>>,
 
-    /// Per-domtree-level sets of `ValueId`s whose `best_value_cache` entries
-    /// were inserted or modified at that level.
+    /// Tracks which `best_value_cache` entries were touched at each domtree
+    /// level so we can roll them back on Pop.
     cache_scope_stack: Vec<HashSet<ValueId>>,
 
-    /// Blocks visited during the domtree walk. Dead arms of folded brifs
-    /// are skipped, so unreachable blocks never appear here.
+    /// Blocks visited during the domtree walk. This is to remove
+    /// unreachable blocks later
     pub visited_blocks: HashSet<BlockId>,
 
     stats: &'a mut Stats,
@@ -125,7 +119,6 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Create an elaborator with range assumptions for context-aware extraction.
     pub fn with_range_assumptions(
         dfg: &'a mut DataFlowGraph,
         domtree: &'a DominatorTree,
@@ -149,7 +142,6 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Main elaboration entry point.
     pub fn elaborate(&mut self, layout: &Layout) {
         use crate::range::Range;
 
@@ -165,8 +157,7 @@ impl<'a> Elaborator<'a> {
 
         let mut block_stack = vec![StackEntry::Visit(root)];
 
-        // Compute best costs once before traversal; subsequent cache misses
-        // after Pop-driven invalidation are handled lazily by compute_best_cost.
+        // Seed the cost cache up front; Pop invalidations get re-filled lazily.
         self.compute_best_costs();
 
         while let Some(entry) = block_stack.pop() {
@@ -178,7 +169,6 @@ impl<'a> Elaborator<'a> {
                     if let Some(ra) = self.range_assumptions.as_deref_mut() {
                         ra.push_scope();
 
-                        // Apply block entry facts.
                         let preds = self.cfg_preds.get(&block).cloned().unwrap_or_default();
                         let num_edges = preds.len();
                         if num_edges > 0 {
@@ -220,18 +210,12 @@ impl<'a> Elaborator<'a> {
                         }
                     }
 
-                    // Push a new cache-scope.
                     self.cache_scope_stack.push(HashSet::new());
 
-                    // Elaborate block instructions
                     self.elaborate_block(block, layout);
 
-                    // Fold a constant or redundant brif into a jump and learn
-                    // which arm (if any) is dead. Dead arms are not pushed
-                    // onto the walk stack, so their blocks are never visited.
                     let dead_arm = self.fold_terminator(block, layout);
 
-                    // Push live domtree children in reverse for preorder.
                     for &child in self.domtree.children(block).iter().rev() {
                         if Some(child) == dead_arm {
                             continue;
@@ -255,7 +239,6 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Compute the best cost for each value by exploring the egraph
     fn compute_best_costs(&mut self) {
         let values: Vec<_> = self.dfg.value_defs.keys().copied().collect();
 
@@ -264,7 +247,6 @@ impl<'a> Elaborator<'a> {
         }
     }
 
-    /// Recursively compute the best cost for a value.
     fn compute_best_cost(&mut self, value: ValueId) -> Cost {
         if let Some(&(cost, _)) = self.best_value_cache.get(&value) {
             return cost;
@@ -388,7 +370,6 @@ impl<'a> Elaborator<'a> {
                 BranchInfo::Jump(target),
             );
             self.dfg.insts.insert(term_id, new_inst);
-            // Don't claim a dead arm if it's still the live target.
             return if dead != target { Some(dead) } else { None };
         }
 
@@ -498,12 +479,6 @@ impl<'a> Elaborator<'a> {
         }
 
         best.map(|(_, v)| self.elaborate_value_in_block(v, block_id))
-    }
-
-    pub fn get_best_inst(&self, value: ValueId) -> Option<InstId> {
-        self.best_value_cache
-            .get(&value)
-            .and_then(|(_, inst)| *inst)
     }
 
     pub fn rewrite_args(&mut self, layout: &Layout) {
