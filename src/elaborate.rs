@@ -91,6 +91,10 @@ pub struct Elaborator<'a> {
     /// were inserted or modified at that level.
     cache_scope_stack: Vec<HashSet<ValueId>>,
 
+    /// Blocks visited during the domtree walk. Dead arms of folded brifs
+    /// are skipped, so unreachable blocks never appear here.
+    pub visited_blocks: HashSet<BlockId>,
+
     stats: &'a mut Stats,
 }
 
@@ -116,6 +120,7 @@ impl<'a> Elaborator<'a> {
             block_entry_facts: &EMPTY_ENTRY_FACTS,
             cfg_preds: &EMPTY_CFG_PREDS,
             cache_scope_stack: Vec::new(),
+            visited_blocks: HashSet::new(),
             stats,
         }
     }
@@ -139,6 +144,7 @@ impl<'a> Elaborator<'a> {
             block_entry_facts,
             cfg_preds,
             cache_scope_stack: Vec::new(),
+            visited_blocks: HashSet::new(),
             stats,
         }
     }
@@ -167,10 +173,7 @@ impl<'a> Elaborator<'a> {
             match entry {
                 StackEntry::Visit(block) => {
                     block_stack.push(StackEntry::Pop);
-                    // Push domtree children in reverse order for correct preorder
-                    for &child in self.domtree.children(block).iter().rev() {
-                        block_stack.push(StackEntry::Visit(child));
-                    }
+                    self.visited_blocks.insert(block);
 
                     if let Some(ra) = self.range_assumptions.as_deref_mut() {
                         ra.push_scope();
@@ -222,6 +225,19 @@ impl<'a> Elaborator<'a> {
 
                     // Elaborate block instructions
                     self.elaborate_block(block, layout);
+
+                    // Fold a constant or redundant brif into a jump and learn
+                    // which arm (if any) is dead. Dead arms are not pushed
+                    // onto the walk stack, so their blocks are never visited.
+                    let dead_arm = self.fold_terminator(block, layout);
+
+                    // Push live domtree children in reverse for preorder.
+                    for &child in self.domtree.children(block).iter().rev() {
+                        if Some(child) == dead_arm {
+                            continue;
+                        }
+                        block_stack.push(StackEntry::Visit(child));
+                    }
                 }
 
                 StackEntry::Pop => {
@@ -334,6 +350,62 @@ impl<'a> Elaborator<'a> {
         for &inst_id in &block.insts {
             self.elaborate_inst_args(inst_id, block_id);
         }
+    }
+
+    fn fold_terminator(&mut self, block: BlockId, layout: &Layout) -> Option<BlockId> {
+        let term_id = layout
+            .block_data
+            .get(&block)
+            .and_then(|b| b.insts.last().copied())?;
+        let inst = self.dfg.insts.get(&term_id)?.clone();
+
+        let (then_b, tc, else_b, ec) = match inst.branch_info {
+            Some(BranchInfo::Conditional(t, tc, e, ec)) => (t, tc, e, ec),
+            _ => return None,
+        };
+
+        if inst.args.is_empty() {
+            return None;
+        }
+        let cond = inst.args[0];
+        let elaborated_cond = self
+            .elaborated_cache
+            .get(&(cond, block))
+            .copied()
+            .unwrap_or(cond);
+
+        if let Some(c) = self.dfg.value_imm(elaborated_cond) {
+            let (target, count, offset, dead) = if c != 0 {
+                (then_b, tc, 1usize, else_b)
+            } else {
+                (else_b, ec, 1 + tc, then_b)
+            };
+            let new_args: Vec<ValueId> = inst.args[offset..offset + count].to_vec();
+            let new_inst = Instruction::with_branch(
+                Opcode::Branch,
+                new_args,
+                inst.ty,
+                BranchInfo::Jump(target),
+            );
+            self.dfg.insts.insert(term_id, new_inst);
+            // Don't claim a dead arm if it's still the live target.
+            return if dead != target { Some(dead) } else { None };
+        }
+
+        if then_b == else_b && tc == ec {
+            let then_args: Vec<ValueId> = (0..tc).map(|i| inst.args[1 + i]).collect();
+            let else_args: Vec<ValueId> = (0..ec).map(|i| inst.args[1 + tc + i]).collect();
+            if then_args == else_args {
+                let new_inst = Instruction::with_branch(
+                    Opcode::Branch,
+                    then_args,
+                    inst.ty,
+                    BranchInfo::Jump(then_b),
+                );
+                self.dfg.insts.insert(term_id, new_inst);
+            }
+        }
+        None
     }
 
     fn elaborate_inst_args(&mut self, inst_id: InstId, block_id: BlockId) {

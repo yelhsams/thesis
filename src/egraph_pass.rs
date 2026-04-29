@@ -75,45 +75,57 @@ impl EgraphPass {
         // Resolve GVN canonicals in instruction args before elaboration
         self.apply_gvn_to_args();
 
-        // scoped, context-aware extraction
-        {
-            if self.path_sensitive {
-                let mut elaborator = crate::elaborate::Elaborator::with_range_assumptions(
-                    &mut self.dfg,
-                    &self.domtree,
-                    &mut self.stats,
-                    &mut self.range_assumptions,
-                    &self.block_entry_facts,
-                    &self.cfg_preds,
-                );
-                elaborator.elaborate(&self.layout);
-                elaborator.rewrite_args(&self.layout);
-            } else {
-                let mut elaborator = crate::elaborate::Elaborator::new(
-                    &mut self.dfg,
-                    &self.domtree,
-                    &mut self.stats,
-                );
-                elaborator.elaborate(&self.layout);
-                elaborator.rewrite_args(&self.layout);
-            }
-        }
+        // scoped, context-aware extraction.
+        let visited = if self.path_sensitive {
+            let mut elaborator = crate::elaborate::Elaborator::with_range_assumptions(
+                &mut self.dfg,
+                &self.domtree,
+                &mut self.stats,
+                &mut self.range_assumptions,
+                &self.block_entry_facts,
+                &self.cfg_preds,
+            );
+            elaborator.elaborate(&self.layout);
+            elaborator.rewrite_args(&self.layout);
+            std::mem::take(&mut elaborator.visited_blocks)
+        } else {
+            let mut elaborator =
+                crate::elaborate::Elaborator::new(&mut self.dfg, &self.domtree, &mut self.stats);
+            elaborator.elaborate(&self.layout);
+            elaborator.rewrite_args(&self.layout);
+            std::mem::take(&mut elaborator.visited_blocks)
+        };
+        self.layout.blocks.retain(|b| visited.contains(b));
+
         self.rebuild_layout();
         self.check_no_unions();
-        self.global_cse_and_gcm();
 
-        for _ in 0..5 {
-            let mut changed = false;
-            changed |= self.eliminate_dead_blocks();
-            changed |= self.simplify_constant_brif();
-            changed |= self.simplify_trivial_blocks();
-            changed |= self.simplify_redundant_brif();
-            changed |= self.simplify_uniform_returns();
-            if !changed {
-                break;
+        self.simplify_trivial_blocks();
+        self.simplify_uniform_returns();
+
+        // Remove blocks unreachable due to early returns
+        if let Some(entry) = self.layout.entry_block() {
+            let mut reachable: FxHashSet<BlockId> = FxHashSet::default();
+            let mut work = vec![entry];
+            while let Some(b) = work.pop() {
+                if !reachable.insert(b) {
+                    continue;
+                }
+                if let Some(block) = self.layout.block_data.get(&b) {
+                    for &inst_id in &block.insts {
+                        match &self.dfg.insts[&inst_id].branch_info {
+                            Some(BranchInfo::Jump(t)) => work.push(*t),
+                            Some(BranchInfo::Conditional(t, _, e, _)) => {
+                                work.push(*t);
+                                work.push(*e);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
+            self.layout.blocks.retain(|b| reachable.contains(b));
         }
-        self.eliminate_dead_blocks();
     }
 
     fn apply_gvn_to_args(&mut self) {
@@ -381,68 +393,6 @@ impl EgraphPass {
         false
     }
 
-    /// Brif with a constant condition becomes an unconditional branch.
-    fn simplify_constant_brif(&mut self) -> bool {
-        let mut changed = false;
-        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
-        for inst_id in all_insts {
-            let inst = self.dfg.insts[&inst_id].clone();
-            if let Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) = &inst.branch_info {
-                let cond = inst.args[0];
-                if let Some(val) = self.dfg.value_imm(cond) {
-                    let (target, count, offset) = if val != 0 {
-                        (*then_b, *tc, 1usize)
-                    } else {
-                        (*else_b, *ec, 1 + tc)
-                    };
-                    let new_args: Vec<ValueId> = inst.args[offset..offset + count].to_vec();
-                    let new_inst = Instruction::with_branch(
-                        Opcode::Branch,
-                        new_args,
-                        inst.ty,
-                        BranchInfo::Jump(target),
-                    );
-                    self.dfg.insts.insert(inst_id, new_inst);
-                    changed = true;
-                }
-            }
-        }
-        changed
-    }
-
-    /// Drop unreachable blocks.
-    fn eliminate_dead_blocks(&mut self) -> bool {
-        let entry = match self.layout.entry_block() {
-            Some(b) => b,
-            None => return false,
-        };
-
-        let mut reachable: FxHashSet<BlockId> = FxHashSet::default();
-        let mut work = vec![entry];
-        while let Some(b) = work.pop() {
-            if !reachable.insert(b) {
-                continue;
-            }
-            if let Some(block) = self.layout.block_data.get(&b) {
-                for &inst_id in &block.insts {
-                    let inst = &self.dfg.insts[&inst_id];
-                    match &inst.branch_info {
-                        Some(BranchInfo::Jump(t)) => work.push(*t),
-                        Some(BranchInfo::Conditional(t, _, e, _)) => {
-                            work.push(*t);
-                            work.push(*e);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        let before = self.layout.blocks.len();
-        self.layout.blocks.retain(|b| reachable.contains(b));
-        self.layout.blocks.len() != before
-    }
-
     /// Forward branches through single-instruction blocks (just a return or
     /// just a jump).
     fn simplify_trivial_blocks(&mut self) -> bool {
@@ -627,33 +577,6 @@ impl EgraphPass {
             any_changed |= changed;
         }
         any_changed
-    }
-
-    /// If both arms of a brif go to the same block with the same args, turn
-    /// it into a jump.
-    fn simplify_redundant_brif(&mut self) -> bool {
-        let mut changed = false;
-        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
-        for inst_id in all_insts {
-            let inst = self.dfg.insts[&inst_id].clone();
-            if let Some(BranchInfo::Conditional(then_b, tc, else_b, ec)) = &inst.branch_info {
-                if then_b == else_b && tc == ec {
-                    let then_args: Vec<ValueId> = (0..*tc).map(|i| inst.args[1 + i]).collect();
-                    let else_args: Vec<ValueId> = (0..*ec).map(|i| inst.args[1 + tc + i]).collect();
-                    if then_args == else_args {
-                        let new_inst = Instruction::with_branch(
-                            Opcode::Branch,
-                            then_args,
-                            inst.ty,
-                            BranchInfo::Jump(*then_b),
-                        );
-                        self.dfg.insts.insert(inst_id, new_inst);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        changed
     }
 
     /// Redundant phi elimination. Builds a fresh param→sources map from the
@@ -1379,463 +1302,6 @@ impl EgraphPass {
         self.block_entry_facts = block_entry_facts;
         self.cfg_preds = cfg_preds;
     }
-
-    /// Global CSE + global code motion, run after scoped-GVN elaboration.
-    /// Dedupes structurally-equal pure insts across the whole CFG, then
-    /// hoists each canonical inst to the LCA of its users. Recovers
-    /// equivalences that dominator-local GVN misses (e.g. both arms of a
-    /// diamond computing the same expression).
-    fn global_cse_and_gcm(&mut self) {
-        // Domtree preorder over reachable blocks. Used both for CSE
-        // canonicalization (prefer dominating defs) and as iteration order.
-        let entry = match self.layout.entry_block() {
-            Some(b) => b,
-            None => return,
-        };
-        let preorder: Vec<BlockId> = {
-            let mut result = Vec::new();
-            let mut stack = vec![entry];
-            while let Some(b) = stack.pop() {
-                if !self.layout.block_data.contains_key(&b) {
-                    continue;
-                }
-                result.push(b);
-                for &c in self.domtree.children(b).iter().rev() {
-                    stack.push(c);
-                }
-            }
-            result
-        };
-        let in_layout: FxHashSet<BlockId> = preorder.iter().copied().collect();
-
-        // ----- Phase 1: global CSE, looped to fixed point -----
-        // Each iteration keys pure insts by (opcode, type, imm, resolved args)
-        // and dedupes against earlier ones. Canonicalizing args exposes more
-        // equivalences, hence the loop.
-        let mut value_map: FxHashMap<ValueId, ValueId> = FxHashMap::default();
-        fn resolve(vm: &FxHashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
-            let mut guard = 0usize;
-            while let Some(&next) = vm.get(&v) {
-                if next == v || guard > 1024 {
-                    break;
-                }
-                v = next;
-                guard += 1;
-            }
-            v
-        }
-
-        for _iter in 0..16 {
-            let mut changed = false;
-            let mut by_key: FxHashMap<(Opcode, Type, Option<i64>, Vec<ValueId>), ValueId> =
-                FxHashMap::default();
-            for &block_id in &preorder {
-                let block_insts = self.layout.block_data[&block_id].insts.clone();
-                for inst_id in block_insts {
-                    let inst = self.dfg.insts[&inst_id].clone();
-                    if !inst.opcode.is_pure() {
-                        continue;
-                    }
-                    let result = match self.dfg.inst_results(inst_id).first().copied() {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    // Already canonicalized to someone else — skip; its
-                    // defining inst is now redundant.
-                    if let Some(&c) = value_map.get(&result) {
-                        if c != result {
-                            continue;
-                        }
-                    }
-                    let resolved_args: Vec<ValueId> =
-                        inst.args.iter().map(|&a| resolve(&value_map, a)).collect();
-                    let key = (inst.opcode, inst.ty, inst.immediate, resolved_args);
-                    if let Some(&canonical) = by_key.get(&key) {
-                        if canonical != result {
-                            value_map.insert(result, canonical);
-                            changed = true;
-                        }
-                    } else {
-                        by_key.insert(key, result);
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // ----- Phase 2: rewrite every inst's args via value_map -----
-        let all_insts: Vec<InstId> = self.dfg.insts.keys().copied().collect();
-        for inst_id in all_insts {
-            let mut inst = self.dfg.insts[&inst_id].clone();
-            let mut changed = false;
-            for arg in &mut inst.args {
-                let canonical = resolve(&value_map, *arg);
-                if canonical != *arg {
-                    *arg = canonical;
-                    changed = true;
-                }
-            }
-            if changed {
-                self.dfg.insts.insert(inst_id, inst);
-            }
-        }
-
-        // ----- Phase 3: drop redundant pure insts from block lists -----
-        for &block_id in &preorder {
-            let block = self.layout.block_data.get_mut(&block_id).unwrap();
-            block.insts.retain(|&iid| {
-                let inst = &self.dfg.insts[&iid];
-                if !inst.opcode.is_pure() {
-                    return true;
-                }
-                let result = match self.dfg.inst_results(iid).first().copied() {
-                    Some(r) => r,
-                    None => return true,
-                };
-                // Keep only the canonical rep of each equivalence class.
-                resolve(&value_map, result) == result
-            });
-        }
-
-        // ----- Phase 4: global code motion -----
-        //
-        // For each pure inst, compute target = LCA of its users' blocks in
-        // the domtree. Loop to fixed point so hoisting a consumer also pulls
-        // its pure-inst args up (hoisting an `iadd` to a diamond's dominator
-        // pulls the `iconst` along too). Then apply moves only when the
-        // target strictly hoists and every arg's def block dominates the new
-        // placement; otherwise leave it and let `finalize_gcm_validity` clone
-        // the arg locally.
-        //
-        // `rebuild_layout` can place the same InstId in multiple block lists
-        // (any block using a value pulls in its defining pure inst). For GCM
-        // we want each inst's "home" to be the dominating placement, else
-        // the move phase would shuffle it pointlessly and break the
-        // duplicate references the CFG cleanups rely on. Walking in domtree
-        // preorder + `or_insert` picks the highest block.
-        let mut inst_block: FxHashMap<InstId, BlockId> = FxHashMap::default();
-        for &block_id in &preorder {
-            for &iid in &self.layout.block_data[&block_id].insts {
-                inst_block.entry(iid).or_insert(block_id);
-            }
-        }
-
-        // value -> defining InstId. Stable across the iteration since
-        // neither CSE nor GCM creates new insts.
-        let mut def_of: FxHashMap<ValueId, InstId> = FxHashMap::default();
-        for (&iid, _) in &inst_block {
-            for &r in self.dfg.inst_results(iid) {
-                def_of.insert(r, iid);
-            }
-        }
-
-        // Per-inst user list: pure-inst users (whose target participates in
-        // LCA propagation) vs skeleton users pinned to a block. Built once
-        // from the post-CSE layout and reused across GCM iterations.
-        enum UserKind {
-            PureInst(InstId),
-            FixedBlock(BlockId),
-        }
-        let mut users_of: FxHashMap<InstId, Vec<UserKind>> = FxHashMap::default();
-        for &block_id in &preorder {
-            let block = &self.layout.block_data[&block_id];
-            for &user_id in &block.insts {
-                let user = &self.dfg.insts[&user_id];
-                let user_is_pure = user.opcode.is_pure();
-                for &arg in &user.args {
-                    if let Some(&def_id) = def_of.get(&arg) {
-                        if def_id == user_id {
-                            continue;
-                        }
-                        let entry = users_of.entry(def_id).or_default();
-                        if user_is_pure {
-                            entry.push(UserKind::PureInst(user_id));
-                        } else {
-                            entry.push(UserKind::FixedBlock(block_id));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Start with target = current block for each pure inst.
-        let mut target: FxHashMap<InstId, BlockId> = FxHashMap::default();
-        for (&iid, &b) in &inst_block {
-            if self.dfg.insts[&iid].opcode.is_pure() {
-                target.insert(iid, b);
-            }
-        }
-
-        // Loop to fixed point. LCA only moves targets up (closer to entry),
-        // and depth is bounded, so this terminates.
-        for _iter in 0..64 {
-            let mut changed = false;
-            // Reverse preorder: consumers settle before their args.
-            let pure_list: Vec<InstId> = preorder
-                .iter()
-                .rev()
-                .flat_map(|&b| self.layout.block_data[&b].insts.clone())
-                .filter(|&iid| self.dfg.insts[&iid].opcode.is_pure())
-                .collect();
-            for inst_id in pure_list {
-                let Some(users) = users_of.get(&inst_id) else {
-                    continue;
-                };
-                if users.is_empty() {
-                    continue;
-                }
-                // User blocks (using current targets for pure users).
-                let mut iter = users.iter().filter_map(|uk| match uk {
-                    UserKind::PureInst(iid) => target.get(iid).copied(),
-                    UserKind::FixedBlock(b) => Some(*b),
-                });
-                let first = match iter.next() {
-                    Some(b) => b,
-                    None => continue,
-                };
-                let mut lca = first;
-                let mut ok = true;
-                for b in iter {
-                    match self.domtree.lca(lca, b) {
-                        Some(l) => lca = l,
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if !ok || !in_layout.contains(&lca) {
-                    continue;
-                }
-                let entry_target = target.entry(inst_id).or_insert(lca);
-                if *entry_target != lca {
-                    *entry_target = lca;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // Apply targets. For each inst, every arg's source block must
-        // dominate the target. If not (e.g. CSE canonicalized across a
-        // diamond and the arg couldn't be hoisted), skip the move — the
-        // duplication pass below will handle it.
-        for (&inst_id, &new_block) in target.clone().iter() {
-            let current = match inst_block.get(&inst_id).copied() {
-                Some(b) => b,
-                None => continue,
-            };
-            if new_block == current {
-                continue;
-            }
-            if !self.domtree.block_dominates(new_block, current) {
-                continue; // hoist only, never sink
-            }
-            let inst = self.dfg.insts[&inst_id].clone();
-            let mut valid = true;
-            for &arg in &inst.args {
-                let src = match self.dfg.value_def(arg) {
-                    ValueDef::BlockParam(b, _) => Some(b),
-                    ValueDef::Inst(def_id) => target
-                        .get(&def_id)
-                        .copied()
-                        .or_else(|| inst_block.get(&def_id).copied()),
-                    ValueDef::Union(_, _) => None,
-                };
-                if let Some(sb) = src {
-                    if !self.domtree.block_dominates(sb, new_block) {
-                        valid = false;
-                        break;
-                    }
-                }
-            }
-            if !valid {
-                continue;
-            }
-            let cur_block = self.layout.block_data.get_mut(&current).unwrap();
-            cur_block.insts.retain(|&i| i != inst_id);
-            self.layout
-                .block_data
-                .get_mut(&new_block)
-                .unwrap()
-                .insts
-                .push(inst_id);
-            inst_block.insert(inst_id, new_block);
-        }
-
-        // Restore SSA dominance: if any arg's defining inst is in a non-
-        // dominating block (because CSE merged across a diamond and GCM
-        // couldn't hoist it), clone the def into the user's block. Iterate
-        // since fresh duplicates may have the same problem.
-        for _ in 0..16 {
-            let mut changed = false;
-            let blocks_snapshot: Vec<BlockId> = preorder.clone();
-            for &block_id in &blocks_snapshot {
-                let block_insts = self.layout.block_data[&block_id].insts.clone();
-                for user_id in block_insts {
-                    let user = self.dfg.insts[&user_id].clone();
-                    let mut new_args = user.args.clone();
-                    let mut any_fix = false;
-                    for arg in new_args.iter_mut() {
-                        if let ValueDef::Inst(def_id) = self.dfg.value_def(*arg) {
-                            if !self.dfg.insts[&def_id].opcode.is_pure() {
-                                continue;
-                            }
-                            let def_block = match inst_block.get(&def_id).copied() {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if self.domtree.block_dominates(def_block, block_id) {
-                                continue;
-                            }
-                            // Clone the def into this block. Topo sort fixes order.
-                            let orig = self.dfg.insts[&def_id].clone();
-                            let new_inst_id = self.dfg.make_inst(orig.clone());
-                            let new_result = self.dfg.make_inst_result(new_inst_id, orig.ty);
-                            self.layout
-                                .block_data
-                                .get_mut(&block_id)
-                                .unwrap()
-                                .insts
-                                .push(new_inst_id);
-                            inst_block.insert(new_inst_id, block_id);
-                            for &r in self.dfg.inst_results(new_inst_id) {
-                                def_of.insert(r, new_inst_id);
-                            }
-                            *arg = new_result;
-                            any_fix = true;
-                            changed = true;
-                        }
-                    }
-                    if any_fix {
-                        let mut u = self.dfg.insts[&user_id].clone();
-                        u.args = new_args;
-                        self.dfg.insts.insert(user_id, u);
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        // ----- Phase 5: topo-sort each block's inst list -----
-        for &block_id in &preorder {
-            let sorted = self.topo_sort_block_insts(block_id);
-            self.layout.block_data.get_mut(&block_id).unwrap().insts = sorted;
-        }
-
-        // ----- Phase 6: drop pure insts with no users -----
-        loop {
-            let mut used: FxHashSet<ValueId> = FxHashSet::default();
-            for &block_id in &preorder {
-                for &iid in &self.layout.block_data[&block_id].insts {
-                    for &arg in &self.dfg.insts[&iid].args {
-                        used.insert(arg);
-                    }
-                }
-            }
-            let mut removed_any = false;
-            for &block_id in &preorder {
-                let insts = self.layout.block_data[&block_id].insts.clone();
-                let mut keep = Vec::with_capacity(insts.len());
-                for iid in insts {
-                    let inst = &self.dfg.insts[&iid];
-                    if !inst.opcode.is_pure() {
-                        keep.push(iid);
-                        continue;
-                    }
-                    let result = self.dfg.inst_results(iid).first().copied();
-                    if result.map(|r| used.contains(&r)).unwrap_or(true) {
-                        keep.push(iid);
-                    } else {
-                        removed_any = true;
-                    }
-                }
-                self.layout.block_data.get_mut(&block_id).unwrap().insts = keep;
-            }
-            if !removed_any {
-                break;
-            }
-        }
-    }
-
-    /// Topo-sort the insts in a block so defs come before uses. Terminator
-    /// is pinned last.
-    fn topo_sort_block_insts(&self, block_id: BlockId) -> Vec<InstId> {
-        let block = &self.layout.block_data[&block_id];
-        if block.insts.is_empty() {
-            return Vec::new();
-        }
-        let inst_set: FxHashSet<InstId> = block.insts.iter().copied().collect();
-
-        let terminator = block
-            .insts
-            .iter()
-            .rev()
-            .find(|&&iid| {
-                let inst = &self.dfg.insts[&iid];
-                inst.opcode.is_terminator() || inst.branch_info.is_some()
-            })
-            .copied();
-
-        let mut def_map: FxHashMap<ValueId, InstId> = FxHashMap::default();
-        for &iid in &block.insts {
-            for &r in self.dfg.inst_results(iid) {
-                def_map.insert(r, iid);
-            }
-        }
-
-        let mut in_deg: FxHashMap<InstId, usize> = FxHashMap::default();
-        let mut dependents: FxHashMap<InstId, Vec<InstId>> = FxHashMap::default();
-        for &iid in &block.insts {
-            in_deg.insert(iid, 0);
-        }
-        for &iid in &block.insts {
-            let inst = &self.dfg.insts[&iid];
-            for &arg in &inst.args {
-                if let Some(&def_id) = def_map.get(&arg) {
-                    if def_id != iid && inst_set.contains(&def_id) {
-                        dependents.entry(def_id).or_default().push(iid);
-                        *in_deg.get_mut(&iid).unwrap() += 1;
-                    }
-                }
-            }
-        }
-
-        // Kahn's algorithm. Pop smallest InstId first for determinism and
-        // defer the terminator until everything else is scheduled.
-        let mut ready: Vec<InstId> = in_deg
-            .iter()
-            .filter(|(&iid, &d)| d == 0 && Some(iid) != terminator)
-            .map(|(&iid, _)| iid)
-            .collect();
-        ready.sort_by(|a, b| b.0.cmp(&a.0));
-
-        let mut result: Vec<InstId> = Vec::with_capacity(block.insts.len());
-        while let Some(iid) = ready.pop() {
-            result.push(iid);
-            if let Some(deps) = dependents.get(&iid) {
-                for &dep in deps {
-                    let d = in_deg.get_mut(&dep).unwrap();
-                    *d -= 1;
-                    if *d == 0 && Some(dep) != terminator {
-                        ready.push(dep);
-                    }
-                }
-                ready.sort_by(|a, b| b.0.cmp(&a.0));
-            }
-        }
-
-        if let Some(t) = terminator {
-            result.push(t);
-        }
-        result
-    }
 }
 
 /// Shared mutable context for the per-instruction optimization loop.
@@ -2120,6 +1586,7 @@ impl<'a> OptimizeCtx<'a> {
                 Condition::And(inner) => {
                     result.extend(Self::collect_range_conditions(inner));
                 }
+                _ => {}
             }
         }
         result
@@ -2160,73 +1627,12 @@ impl<'a> OptimizeCtx<'a> {
         }
     }
 
-    /// Resolve through value_to_opt_value and return the constant if any.
-    fn resolve_to_const(&self, value: ValueId) -> Option<i64> {
-        let opt = *self.value_to_opt_value.get(&value).unwrap_or(&value);
-        match self.dfg.value_defs.get(&opt).copied() {
-            Some(ValueDef::Inst(iid)) => {
-                let inst = &self.dfg.insts[&iid];
-                if inst.opcode == Opcode::Const {
-                    return inst.immediate;
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Skeleton (impure) inst optimizations: dead-branch elimination plus
-    /// GVN for mergeable opcodes. These stay in the layout.
+    /// Skeleton (impure) inst optimizations: GVN for mergeable opcodes.
+    /// These stay in the layout.
     fn optimize_skeleton_inst(&mut self, inst_id: InstId, block: BlockId) {
         self.stats.skeleton_inst += 1;
 
         let inst = self.dfg.insts[&inst_id].clone();
-
-        // CondBranch with a known-constant condition becomes an
-        // unconditional Branch.
-        if inst.opcode == Opcode::CondBranch {
-            if let Some(BranchInfo::Conditional(then_block, then_count, else_block, else_count)) =
-                inst.branch_info.clone()
-            {
-                if let Some(cond_val) = inst.args.first().copied() {
-                    let const_val = self.resolve_to_const(cond_val).or_else(|| {
-                        // Also accept a singleton range as a constant.
-                        let r = self.range_assumptions.get_range(cond_val);
-                        if r.min == r.max {
-                            Some(r.min)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(cv) = const_val {
-                        let (target, arg_count, arg_offset) = if cv != 0 {
-                            (then_block, then_count, 1usize)
-                        } else {
-                            (else_block, else_count, 1 + then_count)
-                        };
-                        let new_args: Vec<ValueId> = inst
-                            .args
-                            .iter()
-                            .skip(arg_offset)
-                            .take(arg_count)
-                            .copied()
-                            .collect();
-                        let new_inst = Instruction::with_branch(
-                            Opcode::Branch,
-                            new_args,
-                            inst.ty,
-                            BranchInfo::Jump(target),
-                        );
-                        self.dfg.insts.insert(inst_id, new_inst);
-                        for &result in self.dfg.inst_results(inst_id) {
-                            self.value_to_opt_value.insert(result, result);
-                            self.available_block.insert(result, block);
-                        }
-                        return;
-                    }
-                }
-            }
-        }
 
         // GVN idempotent skeleton ops.
         if inst.opcode.is_mergeable() {
