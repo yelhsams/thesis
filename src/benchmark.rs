@@ -12,7 +12,8 @@ pub struct TestCase {
 }
 
 pub const PATH_SENSITIVE_TESTS: &[TestCase] = &[
-    // Branch guards v0 >= 0, so sdiv(v0,2) → ushr(v0,1) in the true arm.
+    // Branch checks v0 >= 0.
+    // True arm should use sdiv(v0,2) -> ushr(v0,1) to simplify
     TestCase {
         name: "sdiv2_guarded_nonneg",
         clif: r#"
@@ -32,8 +33,8 @@ block2(v6: i32):
 }
 "#,
     },
-    // Two nested guards: v0 >= 0 then v0 < 100.
-    // Inner block can fold sdiv(v0,8) → ushr(v0,3) because range [0,99].
+    // Two nested guards v0 >= 0 then v0 < 100.
+    // Inner block can fold sdiv(v0,8) -> ushr(v0,3) because range [0,99].
     TestCase {
         name: "sdiv8_nested_guard",
         clif: r#"
@@ -105,7 +106,8 @@ block2(v9: i32):
 }
 "#,
     },
-    // Guard v0 >= 50.  Inside, icmp.slt v0, 10 is provably false → fold to 0.
+    // Guard v0 >= 50.
+    // True arm, icmp.slt v0, 10 (v0 < 10) is provably false -> fold to 0.
     TestCase {
         name: "cmp_fold_slt_false",
         clif: r#"
@@ -126,7 +128,7 @@ block2(v6: i32):
 }
 "#,
     },
-    // icmp.eq v0, 42 → in true arm, v0 == 42, so iadd(v0, 8) → 50.
+    // icmp.eq v0, 42 -> in true arm, v0 == 42, so iadd(v0, 8) -> 50.
     // The else arm must keep iadd untouched.
     TestCase {
         name: "const_subst_eq_branch",
@@ -149,7 +151,7 @@ block2(v6: i32):
 }
 "#,
     },
-    // brif v0 → in true arm v0 is nonzero, so isub(v0,v0)=0 and
+    // brif v0 -> in true arm v0 is nonzero, so isub(v0,v0)=0 and
     // iadd(v0,0)=v0, imul(v0,v1) stays. Else arm v0==0 so imul(0,v1)=0.
     // Without path sensitivity neither arm simplifies through the phi.
     TestCase {
@@ -171,7 +173,7 @@ block2(v6: i32):
     },
     // True arm: v0 known >= 0, sdiv(v0,4) → ushr(v0,2).
     // False arm: sdiv(v0,4) stays.
-    // Both feed into a phi at block3.  The conditional union lets the
+    // Both feed into a phi at block3. The conditional union lets the
     // extractor pick ushr on the true path only.
     TestCase {
         name: "sdiv_conditional_diamond",
@@ -197,7 +199,7 @@ block3(v9: i32):
 }
 "#,
     },
-    // icmp.eq v0, 0 → true arm: v0 == 0, so imul(v0, v1) → 0.
+    // icmp.eq v0, 0 -> true arm: v0 == 0, so imul(v0, v1) -> 0.
     TestCase {
         name: "zero_from_eq_guard",
         clif: r#"
@@ -242,7 +244,7 @@ block2(v9: i32):
 "#,
     },
     // Innermost block has range [0,15], so irem(v0, 32) == v0
-    // and sdiv(v0, 4) → ushr(v0, 2).
+    // and sdiv(v0, 4) -> ushr(v0, 2).
     TestCase {
         name: "chained_guards",
         clif: r#"
@@ -268,10 +270,7 @@ block3(v9: i32):
 "#,
     },
     // Both arms compute iadd(v1, 1) and pass it to block3 as a param.
-    // Agreement through block param → param == iadd(v1,1) unconditionally.
-    // But additionally, the true arm has v0 != 0, which a context-sensitive
-    // pass could exploit if block3 used v0.  Here we just test the phi fold
-    // is path-aware: the extraction must follow the unconditional union.
+    // Phi fold must be path-aware in order to fold to one block.
     TestCase {
         name: "phi_agreement_computed",
         clif: r#"
@@ -322,7 +321,7 @@ block2(v9: i32):
 }
 "#,
     },
-    // Guard v0 in [0,15].  Then both sdiv(v0,2) → ushr and irem(v0,32) → v0
+    // Guard v0 in [0,15].  Then both sdiv(v0,2) -> ushr and irem(v0,32) -> v0
     // should fire in the same block.
     TestCase {
         name: "multi_range_ops",
